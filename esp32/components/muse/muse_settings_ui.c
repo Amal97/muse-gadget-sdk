@@ -91,6 +91,9 @@ static char s_join_ssid[MUSE_SSID_MAX + 1];
 
 /* Hatch page. */
 static lv_obj_t *s_hatch_status, *s_hatch_token;
+#if CONFIG_MUSE_OPENCLAW
+static lv_obj_t *s_openclaw_url, *s_openclaw_token;
+#endif
 #if !CONFIG_MUSE_OPENAI
 static lv_obj_t *s_hatch_host, *s_hatch_vm;
 static lv_obj_t *s_link_status, *s_link_reset_lbl;
@@ -885,6 +888,46 @@ static void on_openai_clear(lv_event_t *e)
     (void)e;
     muse_openai_clear_history();
 }
+#if CONFIG_MUSE_OPENCLAW
+static void on_openclaw_url_done(const char *text)
+{
+    if (muse_settings_set_openclaw_url(text) != ESP_OK) {
+        muse_state_set_caption("OPENCLAW HTTPS URL NOT SAVED");
+    }
+}
+
+static void on_openclaw_url(lv_event_t *e)
+{
+    (void)e;
+    char url[MUSE_OPENCLAW_URL_MAX + 1];
+    muse_settings_openclaw(url, NULL);
+    open_text("OpenClaw HTTPS URL", url, false, MUSE_OPENCLAW_URL_MAX,
+              "Empty uses direct OpenAI chat", on_openclaw_url_done, s_hatch);
+}
+
+static void on_openclaw_token_done(const char *text)
+{
+    if (text[0] && muse_settings_set_openclaw_token(text) != ESP_OK) {
+        muse_state_set_caption("OPENCLAW TOKEN NOT SAVED");
+    }
+}
+
+static void on_openclaw_token(lv_event_t *e)
+{
+    (void)e;
+    open_text("Bridge token", "", true, MUSE_TOKEN_MAX,
+              "Empty keeps the current one", on_openclaw_token_done, s_hatch);
+}
+
+static void on_openclaw_forget(lv_event_t *e)
+{
+    (void)e;
+    if (muse_settings_set_openclaw_url("") != ESP_OK ||
+        muse_settings_set_openclaw_token("") != ESP_OK) {
+        muse_state_set_caption("OPENCLAW SETTINGS NOT REMOVED");
+    }
+}
+#endif
 #endif
 
 static void on_hatch_test(lv_event_t *e)
@@ -919,6 +962,14 @@ static void build_hatch_page(lv_obj_t *tile)
     button(list, "Test API key", COLOR_ACCENT, on_hatch_test, NULL);
     button(list, "New conversation", COLOR_ACCENT, on_openai_clear, NULL);
     button(list, "Remove API key", COLOR_DANGER, on_openai_forget, NULL);
+#if CONFIG_MUSE_OPENCLAW
+    row(list, NULL, "Chat backend", &s_openclaw_url, on_openclaw_url, NULL);
+    row(list, NULL, "Bridge token", &s_openclaw_token, on_openclaw_token, NULL);
+    button(list, "Use direct OpenAI chat", COLOR_ACCENT, on_openclaw_forget, NULL);
+    note(list, "OpenClaw sends chat to your computer; OpenAI still handles voice. "
+               "The computer must be awake. Set up its trusted HTTPS bridge over USB. "
+               "Both keys are stored on this device without encryption.");
+#endif
     note(list, "Hold the talk button, then release. Audio and text go to OpenAI. "
                "API usage is billed. The voice is AI-generated. "
                "The key is stored on this device without encryption.");
@@ -971,6 +1022,10 @@ static void tick_hatch(void)
 #endif
     snprintf(buf, sizeof(buf), n ? "Set (%u chars)" : "Not set", (unsigned)n);
     set_text(s_hatch_token, buf);
+#if CONFIG_MUSE_OPENCLAW
+    set_text(s_openclaw_url, muse_settings_openclaw_enabled() ? "OpenClaw" : "OpenAI");
+    set_text(s_openclaw_token, muse_settings_openclaw_token_set() ? "Set" : "Not set");
+#endif
 }
 
 /* ---------- Bluetooth ---------- */

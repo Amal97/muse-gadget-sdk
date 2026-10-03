@@ -79,6 +79,9 @@ class OpenAIBackendTest(unittest.TestCase):
     def test_clearing_active_voice_wakes_waiter_and_next_turn_recovers(self) -> None:
         self.run_case(8)
 
+    def test_openclaw_routes_only_chat_with_separate_credentials_and_no_failure_fallback(self) -> None:
+        self.run_case(9)
+
 
 class FakeBoard:
     def __init__(self, device: dict) -> None:

@@ -230,6 +230,152 @@ This mode does not provide Muse tools, home-device control, app pairing,
 continuous realtime conversation, or OTA updates. Audio and text are sent
 to OpenAI; the AI models do not run locally.
 
+### Optional OpenClaw chat on your computer
+
+Keep the same Muse avatar, screen, captions, settings and push-to-talk controls,
+but use OpenClaw for text conversations. OpenAI still transcribes recordings
+and generates speech. This does not require a Muse account, and is not a
+replacement Arduino firmware for a generic ESP32 board.
+
+The included Python-standard-library HTTPS bridge exposes **only** the chat
+endpoint, authenticates the device with its own token, and forwards to a
+loopback-only OpenClaw gateway. By default it requires a dedicated `esp32`
+agent with `tools.deny: ["*"]`. Clients cannot select your main agent or
+access other gateway endpoints. Computer-control tools require the explicit
+opt-in described below. OpenClaw's operator gateway token stays on the computer.
+Do not expose either service to the internet or enable router port forwarding.
+
+1. Install/onboard [OpenClaw](https://docs.openclaw.ai/start/getting-started)
+   on your computer and configure a billed model provider. Preserve existing
+   agents and credentials. Enable
+   `gateway.http.endpoints.chatCompletions.enabled`, keep `gateway.bind` set
+   to `loopback`, and use `gateway.auth.mode: "token"` with a token in the
+   local configuration. Create an `esp32` agent with a separate workspace
+   and a model such as `openai/gpt-4o-mini`, then set its `tools.deny` to
+   `["*"]`. On OpenClaw 2026.2.9 the agents are in `agents.list`; find the
+   new agent's index before setting `agents.list.INDEX.tools`.
+   Start/restart the gateway after changing configuration.
+2. Prepare a private bridge identity:
+
+   ```sh
+   python3 tools/muse/openclaw_bridge.py prepare
+   ```
+
+   This requires `openssl`, saves state in `~/.openclaw/muse-esp32`, and
+   does not print tokens. Keep the existing CA when rerunning setup.
+3. Build a separate firmware directory, embedding **only the public CA**:
+
+   ```sh
+   mkdir -p build-openclaw-waveshare-s3-175c
+   printf 'CONFIG_MUSE_OPENCLAW_CA_CERT="%s"\n' \
+     "$HOME/.openclaw/muse-esp32/ca.pem" \
+     > build-openclaw-waveshare-s3-175c/sdkconfig.local
+   idf.py -B build-openclaw-waveshare-s3-175c -DIDF_TARGET=esp32s3 \
+     -DSDKCONFIG=build-openclaw-waveshare-s3-175c/sdkconfig \
+     -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-waveshare-s3-175c;devices/sdkconfig.openai;devices/sdkconfig.openclaw;build-openclaw-waveshare-s3-175c/sdkconfig.local" \
+     build
+   idf.py -B build-openclaw-waveshare-s3-175c -p PORT flash
+   ```
+
+   For the 1.75 board, replace `waveshare-s3-175c` with `waveshare-s3-175`.
+   Never commit bridge tokens, private keys, or local build configuration.
+   The embedded CA and the fixed certificate identity `muse-openclaw.local`
+   are both verified, even when connecting to a numeric LAN IP. Certificate
+   date checks remain enabled; no insecure TLS fallback is used.
+4. Run the bridge on your computer's private LAN address:
+
+   ```sh
+   python3 tools/muse/openclaw_bridge.py serve --bind COMPUTER-IP
+   ```
+
+   The default bind is loopback, which is useful for local tests but is not
+   reachable from the ESP32. Allow the bridge port (8765) through your local
+   firewall only on trusted networks. Reserve the computer's LAN address
+   in your router, or update the bridge bind and board URL when it changes.
+5. With the existing OpenAI key and Wi-Fi saved on the board, provision
+   the separate bridge token privately over USB:
+
+   ```sh
+   python tools/muse/openclaw_setup.py --port PORT \
+     --url https://COMPUTER-IP:8765/v1/chat/completions --test
+   ```
+
+   `--test` generates a short, billed model reply through the actual ESP32
+   connection. **Test API key** on the screen still tests OpenAI only.
+   USB status reports `provider: "openai"` for the voice pipeline and
+   `chat_provider: "openclaw"` for conversations.
+
+Your computer must remain awake and reachable on the same network. There
+is no automatic fallback to OpenAI chat when OpenClaw fails: failures are
+displayed explicitly. **Settings > OpenAI > Use direct OpenAI chat** or
+`openclaw_setup.py --port PORT --disable` explicitly removes the bridge
+settings and returns to the original standalone behavior.
+
+The OpenAI key and bridge token remain unencrypted in device NVS. Audio
+goes to OpenAI; conversation text goes through the computer to OpenClaw's
+configured provider. OpenClaw may save transcripts/session files on the
+computer. The firmware sends its bounded history with each turn and the
+bridge creates an independent OpenClaw session, so **New conversation**
+clears active device context, not previously saved computer logs. Existing
+OpenClaw tools are unavailable in the default chat-only configuration.
+Provider availability, billing, and regional restrictions still apply.
+The generated server certificate expires after 825 days; renew it using
+the existing CA before expiry. Replacing the CA requires rebuilding and
+reflashing the board.
+
+Host coverage includes `python3 -m unittest tests/test_muse_openai.py
+tests/test_muse_openclaw.py`.
+
+#### Opting into computer control
+
+**This grants the device remote control of your computer, not just chat.**
+Voice is not speaker authentication: anyone who can use the gadget or its
+bridge token can send requests. Tool results may include computer data that
+is sent to OpenClaw's configured model provider. Unrestricted execution can
+modify or delete files, run programs, access your user account's data, and
+change other OpenClaw settings. Keep the bridge private and protect the device.
+
+To opt in, configure **only the dedicated `esp32` agent** with
+`tools.profile: "full"` and remove its `tools.deny: ["*"]`. Set its sandbox
+mode to `off` for host access. Then run the bridge with:
+
+```sh
+python3 tools/muse/openclaw_bridge.py serve --bind COMPUTER-IP \
+  --allow-computer-control
+```
+
+Add that same flag to any bridge login-service configuration and restart
+both services after policy changes. Without the flag, the bridge refuses
+to serve an agent with computer-control tools, including after a live
+configuration change.
+
+Shell commands can retain OpenClaw's approval requirements. If you
+deliberately want **unrestricted execution without approval prompts**, set
+that agent's `tools.exec` to
+`{"host":"gateway","security":"full","ask":"off"}` and set **only its**
+host exec-approvals entry to
+`{"security":"full","ask":"off","askFallback":"full"}`. Use
+`openclaw approvals get/set` to preserve the existing approval file and
+other agents' policies. Do not change global defaults or the main agent.
+
+The firmware's OpenClaw prompt permits available tools and requires tool
+results before claiming an action succeeded. It requests the managed
+`openclaw` browser profile instead of assuming a browser relay is attached.
+If your existing browser configuration uses `attachOnly`, start a separate
+browser instance with that profile's debugging port and user-data directory
+(and arrange login startup if desired); keep the debugging endpoint on
+loopback. Do not turn off attach-only globally or reuse your everyday
+browser profile merely to enable the gadget.
+macOS privacy prompts, installed applications, browser availability, and
+your account's filesystem/admin permissions still apply; this does not
+grant root access or bypass macOS protections. Long actions are still
+subject to the device's existing request timeouts.
+
+To revoke computer control, restore the ESP32 agent's `tools.deny: ["*"]`,
+remove `--allow-computer-control` from the bridge service, and restart it.
+Restore that agent's previous exec-approval policy as well. Use the
+on-screen direct-OpenAI option to disconnect the board from OpenClaw entirely.
+
 The USB console also accepts `>openai.key=KEY`, `>openai.test`,
 `>openai.clear`, and the existing Wi-Fi setup commands. Key values are never
 echoed in logs or status. `tools/muse/chat.py --port PORT "message"` can test

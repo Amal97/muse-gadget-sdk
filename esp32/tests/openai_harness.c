@@ -32,6 +32,7 @@
 #define CONFIG_MUSE_OPENAI_TRANSCRIPTION_MODEL "gpt-4o-mini-transcribe"
 #define CONFIG_MUSE_OPENAI_SPEECH_MODEL "gpt-4o-mini-tts"
 #define CONFIG_MUSE_OPENAI_VOICE "coral"
+#define CONFIG_MUSE_OPENCLAW 1
 #define pdTRUE 1
 #define pdPASS 1
 #define portMAX_DELAY 0
@@ -97,6 +98,14 @@ bool muse_wifi_connected(void) { return wifi_on; }
 bool muse_settings_speaker_on(void) { return speaker_on; }
 size_t muse_settings_openai_key_len(void) { return 8; }
 void muse_settings_openai_key(char *out) { strcpy(out, "test-key"); }
+static bool use_openclaw, bridge_token_set = true;
+bool muse_settings_openclaw_enabled(void) { return use_openclaw; }
+bool muse_settings_openclaw_token_set(void) { return bridge_token_set; }
+void muse_settings_openclaw(char *url, char *token)
+{
+    if (url) strcpy(url, "https://192.168.1.72:8765/v1/chat/completions");
+    if (token) strcpy(token, bridge_token_set ? "bridge-key" : "");
+}
 muse_mode_t muse_state_mode(float *seconds) { (void)seconds; return MUSE_MODE_IDLE; }
 static unsigned console_errors, console_done, console_sent;
 void muse_hatch_console(const char *type, const char *text, const char *fields, ...)
@@ -133,6 +142,7 @@ static unsigned fixture_count, client_count, closed_count, read_count;
 static bool cancel_on_read, incomplete, fail_open;
 static char paths[8][160];
 const char openai_test_root[] asm("_binary_openai_root_pem_start") = "public test root";
+const char openclaw_test_root[] asm("_binary_openclaw_root_start") = "public bridge root";
 const char *esp_err_to_name(int error) { (void)error; return "test"; }
 esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *config)
 {
@@ -141,16 +151,24 @@ esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *co
     memset(client, 0, sizeof(*client));
     client->config = *config;
     client->fixture = fixtures[client_count];
-    assert(config->cert_pem == openai_test_root && config->disable_auto_redirect);
-    assert(!strncmp(config->url, "https://api.openai.com/v1/", 26));
+    assert(config->disable_auto_redirect);
+    if (!strncmp(config->url, "https://api.openai.com/v1/", 26)) {
+        assert(config->cert_pem == openai_test_root && !config->common_name);
+    } else {
+        assert(!strcmp(config->url, "https://192.168.1.72:8765/v1/chat/completions"));
+        assert(config->cert_pem == openclaw_test_root);
+        assert(!strcmp(config->common_name, "muse-openclaw.local"));
+    }
     strlcpy(paths[client_count], config->url, sizeof(paths[0]));
     client_count++;
     return client;
 }
 int esp_http_client_set_header(esp_http_client_handle_t client, const char *key, const char *value)
 {
-    (void)client;
-    if (!strcmp(key, "Authorization")) assert(!strcmp(value, "Bearer test-key"));
+    if (!strcmp(key, "Authorization")) {
+        assert(!strcmp(value, client->config.cert_pem == openclaw_test_root ?
+                       "Bearer bridge-key" : "Bearer test-key"));
+    }
     return 0;
 }
 static int esp_http_client_open(esp_http_client_handle_t client, int size)
@@ -442,6 +460,46 @@ static void clear_active_voice(void)
     worker(NULL);
     assert(client_count == 3);
 }
+static void hybrid_pipeline(void)
+{
+    use_openclaw = true;
+    good_fixtures();
+    record_note();
+    worker(NULL);
+    assert(client_count == 3 && closed_count == 3);
+    assert(clients[0].config.cert_pem == openai_test_root);
+    assert(clients[1].config.cert_pem == openclaw_test_root);
+    assert(clients[2].config.cert_pem == openai_test_root);
+    cJSON *body = cJSON_Parse(clients[1].upload);
+    assert(!strcmp(cJSON_GetObjectItem(body, "model")->valuestring, "openclaw:esp32"));
+    const char *prompt = cJSON_GetObjectItem(
+        cJSON_GetArrayItem(cJSON_GetObjectItem(body, "messages"), 0), "content")->valuestring;
+    assert(strstr(prompt, "Use available tools") && strstr(prompt, "tool result confirms success"));
+    assert(!strstr(prompt, "Do not claim to control devices"));
+    cJSON_Delete(body);
+    muse_hatch_turn_cancel();
+    reset_transport();
+    fixture(answer, strlen(answer), 401, "application/json");
+    muse_hatch_text_turn(strdup("Hello"));
+    worker(NULL);
+    muse_hatch_status_t status;
+    muse_hatch_status(&status);
+    assert(status.state == MUSE_HATCH_UNREACHABLE);
+    assert(!strcmp(status.detail, "OPENCLAW BRIDGE TOKEN INVALID"));
+    assert(client_count == 1 && console_errors == 1 && console_done == 0);
+    reset_transport();
+    bridge_token_set = false;
+    assert(!muse_hatch_ready());
+    muse_hatch_status(&status);
+    assert(status.state == MUSE_HATCH_NOT_SET);
+    bridge_token_set = true;
+    use_openclaw = false;
+    muse_hatch_config_changed();
+    good_fixtures();
+    record_note();
+    worker(NULL);
+    assert(client_count == 3 && clients[1].config.cert_pem == openai_test_root);
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -456,6 +514,7 @@ int main(int argc, char **argv)
     case 6: codec_boundaries(); break;
     case 7: bounded_history(); break;
     case 8: clear_active_voice(); break;
+    case 9: hybrid_pipeline(); break;
     default: return 2;
     }
     muse_hatch_turn_cancel();

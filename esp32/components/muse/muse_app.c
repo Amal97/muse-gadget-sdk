@@ -52,6 +52,7 @@ static void on_setting(muse_setting_t what)
         break;
     case MUSE_SETTING_HATCH:
     case MUSE_SETTING_OPENAI:
+    case MUSE_SETTING_OPENCLAW:
         muse_hatch_config_changed();
         break;
     default:

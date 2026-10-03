@@ -111,6 +111,15 @@ idf_component_register(
     PRIV_REQUIRES ${muse_priv_requires}
 )
 
+if(CONFIG_MUSE_OPENCLAW)
+    if(NOT IS_ABSOLUTE "${CONFIG_MUSE_OPENCLAW_CA_CERT}" OR
+       NOT EXISTS "${CONFIG_MUSE_OPENCLAW_CA_CERT}")
+        message(FATAL_ERROR "OpenClaw requires an absolute path to the bridge's public CA certificate")
+    endif()
+    target_add_binary_data(${COMPONENT_LIB} "${CONFIG_MUSE_OPENCLAW_CA_CERT}" TEXT
+        RENAME_TO "openclaw_root")
+endif()
+
 if(CONFIG_MUSE_ENABLED)
     # LVGL spins forever on a failed assert unless LV_ASSERT_HANDLER is set,
     # which its Kconfig can't do. Abort, so the panic handler prints a backtrace

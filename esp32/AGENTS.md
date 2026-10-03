@@ -99,6 +99,36 @@ is not proof of working API access: test with the user's configured key and
 Wi-Fi. If unavailable, explicitly report that live OpenAI access is unverified.
 Host coverage: `python3 -m unittest tests/test_muse_openai.py`.
 
+#### OpenClaw hybrid
+
+Load `devices/sdkconfig.openclaw` after `devices/sdkconfig.openai` and
+an ignored local overlay setting `CONFIG_MUSE_OPENCLAW_CA_CERT` to the
+absolute path of the bridge's public `ca.pem`. Use a separate
+`build-openclaw-<profile>` directory. Never embed or commit a private key.
+See `README.md` for setup and exact commands.
+
+`tools/muse/openclaw_bridge.py` is a narrow authenticated HTTPS chat relay
+to the existing loopback-only OpenClaw gateway. By default it requires a
+dedicated `esp32` agent that denies all tools. Computer control requires
+explicit user approval, that agent's `full` tool profile, and the bridge's
+`--allow-computer-control` flag. If the user requests no shell approval
+prompts, configure only that agent's gateway exec and host exec-approval
+policy (`security: "full"`, `ask: "off"`); preserve other agents/defaults.
+Do not change the user's main agent or expose the operator gateway to the LAN. Device and gateway
+tokens are separate. The firmware continues to use OpenAI for STT/TTS.
+Provision over USB with `tools/muse/openclaw_setup.py`; URL/token settings
+live in NVS (`oc_url`, `oc_token`) and are not build-time secrets.
+
+Verify `device.chat_provider == "openclaw"` and run a real typed turn
+through the board to verify TLS, bridge authentication, model access and
+agent routing. The on-screen API-key test checks OpenAI, not OpenClaw.
+For computer-control mode, verify an actual harmless tool action through
+the board and independently check its result; a model's claim is not proof.
+Do not test on personal files, expose secrets, or grant root/TCC permissions.
+Retest direct OpenAI behavior with the bridge disabled. No automatic
+failure fallback is permitted. Host tests:
+`python3 -m unittest tests/test_muse_openai.py tests/test_muse_openclaw.py`.
+
 ### DevKitC-1 (default)
 
 ```sh

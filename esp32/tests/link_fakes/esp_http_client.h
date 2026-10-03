@@ -67,6 +67,7 @@ typedef struct {
     void *user_data;
     void *crt_bundle_attach;
     const char *cert_pem;
+    const char *common_name;
     bool disable_auto_redirect;
     bool keep_alive_enable;
     int max_redirection_count;

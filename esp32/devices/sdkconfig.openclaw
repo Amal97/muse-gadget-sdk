@@ -1,0 +1,2 @@
+# Load after sdkconfig.openai and before your ignored local CA-path overlay.
+CONFIG_MUSE_OPENCLAW=y

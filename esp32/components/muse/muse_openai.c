@@ -37,6 +37,9 @@
 
 static const char *TAG = "muse_openai";
 extern const char openai_root_pem[] asm("_binary_openai_root_pem_start");
+#if CONFIG_MUSE_OPENCLAW
+extern const char openclaw_root_pem[] asm("_binary_openclaw_root_start");
+#endif
 static SemaphoreHandle_t s_data;
 static QueueHandle_t s_jobs, s_events;
 static int16_t *s_record, *s_audio;
@@ -108,8 +111,27 @@ static void emit(const job_t *job, muse_hatch_ev_t type, const char *text)
     }
 }
 
-static void http_error(int status, char *why, size_t cap)
+static bool openclaw_chat(void)
 {
+#if CONFIG_MUSE_OPENCLAW
+    return muse_settings_openclaw_enabled();
+#else
+    return false;
+#endif
+}
+
+static void request_error(bool openclaw, const char *detail, char *why, size_t cap)
+{
+    snprintf(why, cap, "%s %s", openclaw ? "OPENCLAW" : "OPENAI", detail);
+}
+
+static void http_error(int status, bool openclaw, char *why, size_t cap)
+{
+    if (openclaw) {
+        if (status == 401) request_error(true, "BRIDGE TOKEN INVALID", why, cap);
+        else snprintf(why, cap, "OPENCLAW HTTP %d", status);
+        return;
+    }
     switch (status) {
     case 401: strlcpy(why, "OPENAI KEY INVALID", cap); break;
     case 403: strlcpy(why, "OPENAI ACCESS DENIED", cap); break;
@@ -149,13 +171,13 @@ static esp_err_t on_http_event(esp_http_client_event_t *event)
     return ESP_OK;
 }
 
-/* Requests never follow redirects: the Authorization header stays on api.openai.com. */
+/* Redirects are disabled so credentials never leave their intended endpoint. */
 static bool request(const job_t *job, const char *path, esp_http_client_method_t method,
                     const char *content_type, const part_t *parts, size_t part_count,
-                    char *json, size_t json_cap, bool speech, char *why, size_t why_cap)
+                    char *json, size_t json_cap, bool speech, bool openclaw, char *why, size_t why_cap)
 {
     bool ok = false;
-    char url[160];
+    char url[MUSE_OPENCLAW_URL_MAX + 1];
     snprintf(url, sizeof(url), "https://api.openai.com/v1/%s", path);
     char *auth = malloc(MUSE_TOKEN_MAX + 8);
     if (!auth) {
@@ -164,11 +186,26 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
     }
     memcpy(auth, "Bearer ", 7);
     muse_settings_openai_key(auth + 7);
+    const char *certificate = openai_root_pem, *common_name = NULL;
+#if CONFIG_MUSE_OPENCLAW
+    if (openclaw) {
+        muse_settings_openclaw(url, auth + 7);
+        certificate = openclaw_root_pem;
+        common_name = "muse-openclaw.local";
+        if (!url[0] || !auth[7]) {
+            mbedtls_platform_zeroize(auth, MUSE_TOKEN_MAX + 8);
+            free(auth);
+            request_error(true, "BRIDGE NOT CONFIGURED", why, why_cap);
+            return false;
+        }
+    }
+#endif
     char response_type[64] = "";
     esp_http_client_config_t config = {
         .url = url,
         .method = method,
-        .cert_pem = openai_root_pem,
+        .cert_pem = certificate,
+        .common_name = common_name,
         .timeout_ms = 30000,
         .buffer_size = 2048,
         .buffer_size_tx = 2048,
@@ -186,13 +223,13 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
     int64_t deadline = esp_timer_get_time() + REQUEST_US;
     if (err == ESP_OK && current(job->generation)) err = esp_http_client_open(client, (int)total);
     if (err != ESP_OK || !current(job->generation)) {
-        strlcpy(why, "OPENAI HTTPS CONNECT FAILED", why_cap);
+        request_error(openclaw, "HTTPS CONNECT FAILED", why, why_cap);
         if (client && current(job->generation)) {
             int tls_error = 0, flags = 0;
             esp_http_client_get_and_clear_last_tls_error(client, &tls_error, &flags);
             ESP_LOGW(TAG, "TLS error %d, certificate flags 0x%x, UTC %lld",
                      tls_error, flags, (long long)time(NULL));
-            if (flags) strlcpy(why, "OPENAI CERTIFICATE CHECK FAILED", why_cap);
+            if (flags) request_error(openclaw, "CERTIFICATE CHECK FAILED", why, why_cap);
         }
         goto cleanup;
     }
@@ -203,7 +240,7 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
             size_t chunk = remaining > 4096 ? 4096 : remaining;
             int n = esp_http_client_write(client, data, (int)chunk);
             if (n <= 0 || esp_timer_get_time() >= deadline) {
-                strlcpy(why, "OPENAI UPLOAD FAILED", why_cap);
+                request_error(openclaw, "UPLOAD FAILED", why, why_cap);
                 goto cleanup;
             }
             remaining -= (size_t)n;
@@ -212,12 +249,12 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
         if (!current(job->generation)) goto cleanup;
     }
     if (esp_http_client_fetch_headers(client) < 0) {
-        strlcpy(why, "OPENAI RESPONSE TIMEOUT", why_cap);
+        request_error(openclaw, "RESPONSE TIMEOUT", why, why_cap);
         goto cleanup;
     }
     int status = esp_http_client_get_status_code(client);
     if (status < 200 || status >= 300) {
-        http_error(status, why, why_cap);
+        http_error(status, openclaw, why, why_cap);
         goto cleanup;
     }
     if (speech && strncasecmp(response_type, "audio/pcm", 9)
@@ -231,12 +268,12 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
     while (current(job->generation)) {
         int n = esp_http_client_read(client, (char *)buf, sizeof(buf));
         if (n < 0 || esp_timer_get_time() >= deadline) {
-            strlcpy(why, "OPENAI DOWNLOAD FAILED", why_cap);
+            request_error(openclaw, "DOWNLOAD FAILED", why, why_cap);
             goto cleanup;
         }
         if (!n) {
             if (!esp_http_client_is_complete_data_received(client)) {
-                strlcpy(why, "OPENAI RESPONSE INCOMPLETE", why_cap);
+                request_error(openclaw, "RESPONSE INCOMPLETE", why, why_cap);
                 goto cleanup;
             }
             break;
@@ -258,7 +295,7 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
             }
         } else {
             if (used + (size_t)n >= json_cap) {
-                strlcpy(why, "OPENAI RESPONSE TOO LARGE", why_cap);
+                request_error(openclaw, "RESPONSE TOO LARGE", why, why_cap);
                 goto cleanup;
             }
             memcpy(json + used, buf, (size_t)n);
@@ -282,7 +319,8 @@ cleanup:
     return ok;
 }
 
-static char *json_request(const job_t *job, const char *path, cJSON *body, bool speech, char *why, size_t cap)
+static char *json_request(const job_t *job, const char *path, cJSON *body, bool speech,
+                          bool openclaw, char *why, size_t cap)
 {
     char *encoded = body ? cJSON_PrintUnformatted(body) : NULL;
     char *response = heap_caps_malloc(JSON_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -294,7 +332,7 @@ static char *json_request(const job_t *job, const char *path, cJSON *body, bool 
     }
     part_t part = { encoded, strlen(encoded) };
     bool ok = request(job, path, HTTP_METHOD_POST, "application/json", &part, 1,
-                      response, JSON_CAP, speech, why, cap);
+                      response, JSON_CAP, speech, openclaw, why, cap);
     free(encoded);
     if (!ok) {
         free(response);
@@ -329,7 +367,7 @@ static char *transcribe(const job_t *job, char *why, size_t cap)
     }
     bool ok = request(job, "audio/transcriptions", HTTP_METHOD_POST,
                       "multipart/form-data; boundary=muse-openai-voice", parts, 4,
-                      response, JSON_CAP, false, why, cap);
+                      response, JSON_CAP, false, false, why, cap);
     cJSON *root = ok ? cJSON_Parse(response) : NULL;
     cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
     char *result = NULL;
@@ -360,11 +398,18 @@ static bool add_message(cJSON *messages, const char *role, const char *text)
 
 static char *complete(const job_t *job, const char *text, cJSON *history, char *why, size_t cap)
 {
+    bool openclaw = openclaw_chat();
     cJSON *body = cJSON_CreateObject();
     cJSON *messages = body ? cJSON_AddArrayToObject(body, "messages") : NULL;
-    bool ok = messages && cJSON_AddStringToObject(body, "model", CONFIG_MUSE_OPENAI_CHAT_MODEL)
+    bool ok = messages && cJSON_AddStringToObject(body, "model", openclaw ? "openclaw:esp32" : CONFIG_MUSE_OPENAI_CHAT_MODEL)
               && cJSON_AddNumberToObject(body, "max_completion_tokens", 240)
               && add_message(messages, "system",
+                             openclaw ?
+                             "You are a friendly voice companion connected to OpenClaw. "
+                             "Use available tools when asked to perform an action. Only claim an action "
+                             "succeeded when its tool result confirms success. For browser actions, "
+                             "use the openclaw profile. Reply in plain text without emoji, "
+                             "in at most three short sentences." :
                              "You are a friendly standalone voice companion. Reply in plain text, "
                              "in at most three short sentences. Do not claim to control devices.");
     for (int i = 0; ok && i < cJSON_GetArraySize(history); i++) {
@@ -375,7 +420,7 @@ static char *complete(const job_t *job, const char *text, cJSON *history, char *
         }
     }
     ok = ok && add_message(messages, "user", text);
-    char *response = ok ? json_request(job, "chat/completions", body, false, why, cap) : NULL;
+    char *response = ok ? json_request(job, "chat/completions", body, false, openclaw, why, cap) : NULL;
     cJSON_Delete(body);
     if (!ok) strlcpy(why, "NO MEMORY FOR CHAT", cap);
     if (!response) return NULL;
@@ -386,9 +431,9 @@ static char *complete(const job_t *job, const char *text, cJSON *history, char *
     cJSON *finish = cJSON_GetObjectItemCaseSensitive(choice, "finish_reason");
     char *result = NULL;
     if (!cJSON_IsString(content) || !content->valuestring[0] || strlen(content->valuestring) >= TEXT_CAP) {
-        strlcpy(why, "OPENAI REPLY INVALID OR TOO LONG", cap);
+        request_error(openclaw, "REPLY INVALID OR TOO LONG", why, cap);
     } else if (cJSON_IsString(finish) && !strcmp(finish->valuestring, "length")) {
-        strlcpy(why, "OPENAI REPLY HIT TOKEN LIMIT", cap);
+        request_error(openclaw, "REPLY HIT TOKEN LIMIT", why, cap);
     } else {
         result = strdup(content->valuestring);
         if (!result) strlcpy(why, "NO MEMORY FOR REPLY", cap);
@@ -405,7 +450,7 @@ static bool speak(const job_t *job, const char *text, char *why, size_t cap)
               && cJSON_AddStringToObject(body, "voice", CONFIG_MUSE_OPENAI_VOICE)
               && cJSON_AddStringToObject(body, "input", text)
               && cJSON_AddStringToObject(body, "response_format", "pcm");
-    char *response = ok ? json_request(job, "audio/speech", body, true, why, cap) : NULL;
+    char *response = ok ? json_request(job, "audio/speech", body, true, false, why, cap) : NULL;
     cJSON_Delete(body);
     if (!ok) strlcpy(why, "NO MEMORY FOR SPEECH", cap);
     ok = response != NULL;
@@ -441,7 +486,8 @@ static void worker(void *arg)
         if (job.kind == JOB_TEXT) {
             muse_hatch_console("sent", NULL, "\"bytes\":%u", (unsigned)strlen(job.text));
         }
-        report(MUSE_HATCH_TESTING, "Contacting OpenAI...");
+        report(MUSE_HATCH_TESTING, openclaw_chat() && job.kind != JOB_TEST ?
+               "OpenClaw + OpenAI voice..." : "Contacting OpenAI...");
         if (!muse_wifi_connected()) {
             strlcpy(why, "NO WI-FI", sizeof(why));
             goto failed;
@@ -466,7 +512,7 @@ static void worker(void *arg)
             }
             snprintf(path, sizeof(path), "models/%s", CONFIG_MUSE_OPENAI_CHAT_MODEL);
             bool accepted = request(&job, path, HTTP_METHOD_GET, NULL, NULL, 0, response,
-                                    JSON_CAP, false, why, sizeof(why));
+                                    JSON_CAP, false, false, why, sizeof(why));
             free(response);
             if (!accepted) goto failed;
             report(MUSE_HATCH_REACHABLE, "API key accepted");
@@ -547,6 +593,9 @@ void muse_hatch_status(muse_hatch_status_t *out)
     } else if (!muse_wifi_connected()) {
         out->state = MUSE_HATCH_OFFLINE;
         strlcpy(out->detail, "Set up Wi-Fi in Settings", sizeof(out->detail));
+    } else if (openclaw_chat() && !muse_settings_openclaw_token_set()) {
+        out->state = MUSE_HATCH_NOT_SET;
+        strlcpy(out->detail, "Set OpenClaw bridge token over USB", sizeof(out->detail));
     }
 }
 
@@ -565,7 +614,8 @@ const char *muse_hatch_state_name(muse_hatch_state_t state)
 
 bool muse_hatch_ready(void)
 {
-    return s_jobs && muse_settings_openai_key_len() && muse_wifi_connected() && !atomic_load(&s_busy);
+    return s_jobs && muse_settings_openai_key_len() && muse_wifi_connected() &&
+           (!openclaw_chat() || muse_settings_openclaw_token_set()) && !atomic_load(&s_busy);
 }
 
 static bool begin_job(void)

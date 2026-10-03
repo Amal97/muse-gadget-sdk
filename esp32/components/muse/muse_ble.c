@@ -98,11 +98,20 @@ static int build_status(char *out, size_t len)
 #if CONFIG_MUSE_OPENAI
     char detail_e[97];
     json_str(detail_e, sizeof(detail_e), h.detail);
+    bool openclaw = false;
+    const char *openclaw_supported = "false";
+#if CONFIG_MUSE_OPENCLAW
+    openclaw = muse_settings_openclaw_enabled();
+    openclaw_supported = "true";
+#endif
     return snprintf(out, len,
                     "{\"name\":\"%s\",\"fw\":\"%s\",\"provider\":\"openai\","
+                    "\"chat_provider\":\"%s\",\"openclaw\":{\"supported\":%s,\"token_set\":%s},"
                     "\"wifi\":{\"on\":%s,\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d},"
                     "\"openai\":{\"key_set\":%s,\"state\":\"%s\",\"detail\":\"%s\"},\"last\":\"%s\"}",
                     s_name, esp_app_get_description()->version,
+                    openclaw ? "openclaw" : "openai", openclaw_supported,
+                    muse_settings_openclaw_token_set() ? "true" : "false",
                     muse_settings_wifi_on() ? "true" : "false", wifi_state_name(w.state), ssid_e, w.ip, w.rssi,
                     muse_settings_openai_key_len() ? "true" : "false", muse_hatch_state_name(h.state), detail_e, last_e);
 #else
@@ -173,6 +182,12 @@ static void run_command(char *cmd)
         muse_hatch_test();
     } else if (!strcmp(cmd, "openai.clear")) {
         muse_openai_clear_history();
+#if CONFIG_MUSE_OPENCLAW
+    } else if (!strcmp(cmd, "openclaw.url")) {
+        if (muse_settings_set_openclaw_url(v) != ESP_OK) res = "error: HTTPS URL not saved";
+    } else if (!strcmp(cmd, "openclaw.token")) {
+        if (muse_settings_set_openclaw_token(v) != ESP_OK) res = "error: bridge token not saved";
+#endif
 #endif
     } else if (!strcmp(cmd, "hatch.host")) {
         muse_settings_set_hatch_host(v);
@@ -202,7 +217,7 @@ static void run_command(char *cmd)
 
     /* Never echo secrets back. */
     bool secret = !strcmp(cmd, "wifi.pass") || !strncmp(cmd, "hatch.token", 11)
-                  || !strcmp(cmd, "openai.key");
+                  || !strcmp(cmd, "openai.key") || !strcmp(cmd, "openclaw.token");
     snprintf(s_last, sizeof(s_last), "%s: %s", cmd, res);
     ESP_LOGI(TAG, "cmd %s%s%s -> %s", cmd, secret ? "" : "=", secret ? "" : v, res);
     muse_state_poke();

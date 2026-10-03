@@ -444,6 +444,12 @@ static const char *not_ready_reason(void)
     switch (st.state) {
     case MUSE_HATCH_NOT_SET:
 #if CONFIG_MUSE_OPENAI
+#if CONFIG_MUSE_OPENCLAW
+        if (muse_settings_openai_key_len() && muse_settings_openclaw_enabled() &&
+            !muse_settings_openclaw_token_set()) {
+            return "SET OPENCLAW BRIDGE TOKEN";
+        }
+#endif
         return "SET OPENAI API KEY IN SETTINGS";
 #else
         return "SET UP MUSE FIRST";
@@ -451,6 +457,9 @@ static const char *not_ready_reason(void)
     case MUSE_HATCH_OFFLINE: return "NO WI-FI";
     default:
 #if CONFIG_MUSE_OPENAI
+#if CONFIG_MUSE_OPENCLAW
+        if (muse_settings_openclaw_enabled()) return "ASSISTANT BUSY - TRY AGAIN";
+#endif
         return "OPENAI BUSY - TRY AGAIN";
 #else
         return "CAN'T REACH MUSE";

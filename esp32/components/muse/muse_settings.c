@@ -17,6 +17,7 @@
 #include "muse_settings.h"
 
 #include <string.h>
+#include <stdlib.h>
 
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
@@ -45,6 +46,8 @@ static struct {
     char vm[MUSE_VM_MAX + 1];
     char token[MUSE_TOKEN_MAX + 1];
     char openai_key[MUSE_TOKEN_MAX + 1];
+    char openclaw_url[MUSE_OPENCLAW_URL_MAX + 1];
+    char openclaw_token[MUSE_TOKEN_MAX + 1];
 } s = {
     .volume = 70,
     .speaker_on = true,
@@ -134,6 +137,8 @@ esp_err_t muse_settings_init(void)
     load_str("vm", s.vm, sizeof(s.vm));
     load_str("token", s.token, sizeof(s.token));
     load_str("openai_key", s.openai_key, sizeof(s.openai_key));
+    load_str("oc_url", s.openclaw_url, sizeof(s.openclaw_url));
+    load_str("oc_token", s.openclaw_token, sizeof(s.openclaw_token));
 
     s.volume = clampi(s.volume, 0, 100);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
@@ -229,6 +234,84 @@ esp_err_t muse_settings_set_openai_key(const char *key)
         notify(MUSE_SETTING_OPENAI);
     }
     return err;
+}
+
+void muse_settings_openclaw(char url[MUSE_OPENCLAW_URL_MAX + 1], char token[MUSE_TOKEN_MAX + 1])
+{
+    LOCKED({
+        if (url) strlcpy(url, s.openclaw_url, MUSE_OPENCLAW_URL_MAX + 1);
+        if (token) strlcpy(token, s.openclaw_token, MUSE_TOKEN_MAX + 1);
+    });
+}
+
+bool muse_settings_openclaw_enabled(void)
+{
+    bool enabled;
+    LOCKED(enabled = s.openclaw_url[0] != '\0');
+    return enabled;
+}
+
+bool muse_settings_openclaw_token_set(void)
+{
+    bool set;
+    LOCKED(set = s.openclaw_token[0] != '\0');
+    return set;
+}
+
+static esp_err_t save_openclaw(const char *name, const char *value, char *out, size_t size)
+{
+    esp_err_t err;
+    LOCKED({
+        err = nvs_set_str(s_nvs, name, value);
+        if (err == ESP_OK) err = nvs_commit(s_nvs);
+        if (err == ESP_OK) strlcpy(out, value, size);
+    });
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OpenClaw setting save failed: %s", esp_err_to_name(err));
+    } else {
+        notify(MUSE_SETTING_OPENCLAW);
+    }
+    return err;
+}
+
+esp_err_t muse_settings_set_openclaw_url(const char *url)
+{
+    static const char suffix[] = "/v1/chat/completions";
+    bool valid = url && strlen(url) <= MUSE_OPENCLAW_URL_MAX;
+    if (valid && url[0]) {
+        valid = !strncmp(url, "https://", 8);
+        const char *host = valid ? url + 8 : "";
+        size_t n = strspn(host, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-");
+        const char *end = host + n;
+        valid = valid && n > 0;
+        if (valid && *end == ':') {
+            const char *port = ++end;
+            while (*end >= '0' && *end <= '9') end++;
+            long number = strtol(port, NULL, 10);
+            valid = end > port && number >= 1 && number <= 65535;
+        }
+        valid = valid && !strcmp(end, suffix);
+    }
+    if (!valid) {
+        ESP_LOGW(TAG, "OpenClaw URL rejected: expected an HTTPS chat endpoint");
+        return ESP_ERR_INVALID_ARG;
+    }
+    return save_openclaw("oc_url", url, s.openclaw_url, sizeof(s.openclaw_url));
+}
+
+esp_err_t muse_settings_set_openclaw_token(const char *token)
+{
+    bool valid = token && strlen(token) <= MUSE_TOKEN_MAX;
+    if (valid) {
+        for (const unsigned char *p = (const unsigned char *)token; *p; p++) {
+            if (*p <= 0x20 || *p >= 0x7f) valid = false;
+        }
+    }
+    if (!valid) {
+        ESP_LOGW(TAG, "OpenClaw token rejected: invalid length or character");
+        return ESP_ERR_INVALID_ARG;
+    }
+    return save_openclaw("oc_token", token, s.openclaw_token, sizeof(s.openclaw_token));
 }
 
 void muse_settings_set_volume(int pct)

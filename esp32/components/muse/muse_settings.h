@@ -33,6 +33,7 @@
 #define MUSE_HOST_MAX 63
 #define MUSE_VM_MAX 63
 #define MUSE_TOKEN_MAX 1023
+#define MUSE_OPENCLAW_URL_MAX 255
 
 #define MUSE_MIC_GAIN_MAX 36      /* dB; ES7210 PGA, applied in 3 dB steps */
 
@@ -46,6 +47,7 @@ typedef enum {
     MUSE_SETTING_BLE,
     MUSE_SETTING_HATCH,
     MUSE_SETTING_OPENAI,
+    MUSE_SETTING_OPENCLAW,
 } muse_setting_t;
 
 typedef void (*muse_setting_cb_t)(muse_setting_t what);
@@ -70,6 +72,11 @@ void muse_settings_openai_key(char out[MUSE_TOKEN_MAX + 1]);
 size_t muse_settings_openai_key_len(void);
 /* Empty removes the key. Never logged or included in status output. */
 esp_err_t muse_settings_set_openai_key(const char *key);
+void muse_settings_openclaw(char url[MUSE_OPENCLAW_URL_MAX + 1], char token[MUSE_TOKEN_MAX + 1]);
+bool muse_settings_openclaw_enabled(void);
+bool muse_settings_openclaw_token_set(void);
+esp_err_t muse_settings_set_openclaw_url(const char *url);
+esp_err_t muse_settings_set_openclaw_token(const char *token);
 
 void muse_settings_set_volume(int pct);
 void muse_settings_set_speaker_on(bool on);
