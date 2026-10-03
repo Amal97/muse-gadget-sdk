@@ -18,15 +18,9 @@
  * Muse chat turns on boards without PSRAM (CONFIG_MUSE_HATCH=n). There's no room
  * for a second TLS and Noise connection or for MP3 decoding, so turns ride
  * Home Link's own session (muse_link_req_*) and replies are text only:
- *   talk    -> POST /chat/stream with the voice note, sent as it's recorded
- *   release -> GET /chat/history?limit=1 marks where the chat ends; the
- *              reply to the POST names the note's message id
- *   reply   -> history rows after the mark, one at a time, until the
- *              assistant's replies to the note; they scroll as captions
- * One row per request: a row is ~2 KB plus three copies of its text, and a
- * reply frame larger than Link's session buffers would end that session. Rows
- * are read in place as they arrive, without cJSON, which would need more RAM
- * than the row itself.
+ * A live POST /chat/subscribe receives NDJSON replies while POST /chat/stream
+ * uploads the note. Both use the existing device token and Link connection.
+ * Lines are parsed without cJSON; bounded buffers keep internal RAM use small.
  */
 #include "muse_chat.h"
 #include "muse_chat_priv.h"
@@ -54,11 +48,10 @@ static const char *TAG = "muse_chat_link";
 #define STAGE_BYTES 1536                /* PCM per body chunk: 2 KB of base64, 48 ms */
 #define CHUNK_BYTES (STAGE_BYTES / 3 * 4)
 #define ACK_MAX 2048
-#define ROW_MAX 12288                   /* a history page split across frames, gathered */
+#define ROW_MAX 12288                   /* maximum subscription line gathered across frames */
 #define TEXT_MAX 1024                   /* reply text kept for the captions */
 #define EV_TEXT 72
 #define SEND_WAIT_MS 200               /* the press queues the pre-roll all at once */
-#define POLL_US 500000                  /* between history polls while nothing's new */
 #define SETTLE_US 3000000               /* quiet after a reply before the turn ends */
 #define REPLY_TIMEOUT_US 60000000
 #define READ_CHARS_PER_S 14             /* caption scroll, about speaking pace */
@@ -71,14 +64,13 @@ typedef struct {
     bool done;
     bool overflow;
     size_t len;
-    size_t cap;         /* fixed body (the note's ack); 0: history, gathered only if split */
+    size_t cap;         /* fixed note ACK buffer; 0: subscription line, gathered only if split */
     char *body;
 } rx_t;
 
-/* The one row of a history page. */
+/* A subscription event, decoded without allocating a JSON tree. */
 typedef struct {
-    bool ok;            /* the page parsed */
-    bool found;         /* it had a row */
+    char type[16];
     bool ready;         /* display_text_ready */
     uint64_t seq;
     char event[24];
@@ -87,7 +79,7 @@ typedef struct {
     char text[TEXT_MAX];
 } row_t;
 
-enum { RX_NOTE, RX_ROW, RX_COUNT };
+enum { RX_NOTE, RX_SUB, RX_COUNT };
 
 typedef enum { T_IDLE, T_TALKING, T_ACK, T_REPLY } phase_t;
 
@@ -100,7 +92,13 @@ static SemaphoreHandle_t s_rx_lock;
 static rx_t s_rx[RX_COUNT];
 static int64_t s_stream[RX_COUNT];      /* open request per slot, 0 none */
 static QueueHandle_t s_events;
-static row_t s_row;                     /* written with s_rx[RX_ROW], under s_rx_lock */
+/* Subscription callback state, always under s_rx_lock. Keep the two newest
+ * completed messages until the voice task drains them, including before ACK. */
+static row_t s_row, s_delta, s_pending[2];
+static unsigned s_pending_count;
+static uint64_t s_last_seq;
+static bool s_early_evicted, s_skipped_big;
+static char s_note_id[80], s_parent_id[80]; /* ACK IDs shared under s_rx_lock */
 
 /* Voice task only. */
 static struct {
@@ -108,18 +106,17 @@ static struct {
     uint8_t *stage;                     /* PCM waiting for the next chunk */
     size_t stage_len;
     char *chunk;
-    bool marked;                        /* have the chat's last seq */
-    uint64_t after;                     /* history seq read up to */
-    char note_id[80];
-    int64_t t_end, t_poll, t_reply, t_show;
-    bool heard, replied, skipped_big;
-    bool after_note;                    /* the walk is past the note's row, before any other user row */
+    char note_id[80], parent_id[80], seen[2][80];
+    unsigned seen_count;
+    int64_t t_end, t_reply, t_show;
+    bool heard, replied;
+    bool after_note;
     char error[EV_TEXT];                /* why the turn failed, repeated at the release */
     char text[TEXT_MAX];
     char shown[EV_TEXT];
 } s_turn;
 
-/* ---- History pages, read in place ---- */
+/* ---- Subscription rows, read in place ---- */
 
 typedef struct {
     const char *p, *end;
@@ -160,6 +157,7 @@ static bool read_string(scan_t *s, char *out, size_t cap)
         return false;
     }
     size_t n = 0;
+    bool clipped = false;
     for (s->p++; s->p < s->end && *s->p != '"'; s->p++) {
         char buf[4];
         size_t len = 1;
@@ -176,9 +174,14 @@ static bool read_string(scan_t *s, char *out, size_t cap)
                 }
                 uint32_t c = hex4(s->p + 1);
                 s->p += 4;
-                if (c >= 0xD800 && c < 0xDC00 && s->end - s->p >= 7 && s->p[1] == '\\' && s->p[2] == 'u') {
-                    c = 0x10000 + ((c - 0xD800) << 10) + (hex4(s->p + 3) - 0xDC00);
+                if (c >= 0xD800 && c < 0xDC00) {
+                    if (s->end - s->p < 7 || s->p[1] != '\\' || s->p[2] != 'u') return false;
+                    uint32_t low = hex4(s->p + 3);
+                    if (low < 0xDC00 || low > 0xDFFF) return false;
+                    c = 0x10000 + ((c - 0xD800) << 10) + (low - 0xDC00);
                     s->p += 6;
+                } else if (c >= 0xDC00 && c <= 0xDFFF) {
+                    return false;
                 }
                 if (c < 0x80) {
                     buf[0] = (char)c;
@@ -203,14 +206,20 @@ static bool read_string(scan_t *s, char *out, size_t cap)
             default: buf[0] = *s->p; break;   /* \" \\ \/ */
             }
         }
-        if (out && n + len < cap) {
+        if (out && !clipped && n + len < cap) {
             memcpy(out + n, buf, len);
             n += len;
+        } else if (out) {
+            clipped = true;
         }
     }
     if (out && cap) {
-        while (n && (out[n - 1] & 0xC0) == 0x80 && s->p >= s->end) {
-            n--;
+        if (clipped && n) {
+            size_t start = n - 1;
+            while (start && ((unsigned char)out[start] & 0xC0) == 0x80) start--;
+            unsigned char lead = (unsigned char)out[start];
+            size_t need = lead < 0x80 ? 1 : lead < 0xE0 ? 2 : lead < 0xF0 ? 3 : 4;
+            if (n - start < need) n = start;
         }
         out[n] = '\0';
     }
@@ -260,7 +269,7 @@ static bool read_field(scan_t *s, char *out, size_t cap)
     return s->p < s->end && *s->p == '"' ? read_string(s, out, cap) : skip_value(s);
 }
 
-static bool parse_row(scan_t *s, row_t *r)
+static bool parse_row(scan_t *s, row_t *r, scan_t *payload)
 {
     if (!expect(s, '{')) {
         return false;
@@ -268,6 +277,8 @@ static bool parse_row(scan_t *s, row_t *r)
     if (expect(s, '}')) {
         return true;
     }
+    unsigned text_rank = 0;
+    bool have_id = false, have_parent = false;
     do {
         char key[24];
         skip_ws(s);
@@ -276,7 +287,13 @@ static bool parse_row(scan_t *s, row_t *r)
         }
         skip_ws(s);
         bool ok;
-        if (!strcmp(key, "seq")) {
+        bool string = s->p < s->end && *s->p == '"';
+        if (payload && !strcmp(key, "payload")) {
+            *payload = *s;
+            ok = skip_value(s);
+        } else if (payload && !strcmp(key, "type")) {
+            ok = read_field(s, r->type, sizeof(r->type));
+        } else if (payload && !strcmp(key, "seq")) {
             for (r->seq = 0; s->p < s->end && *s->p >= '0' && *s->p <= '9'; s->p++) {
                 r->seq = r->seq * 10 + (*s->p - '0');
             }
@@ -284,14 +301,18 @@ static bool parse_row(scan_t *s, row_t *r)
         } else if (!strcmp(key, "display_text_ready")) {
             r->ready = s->p < s->end && *s->p == 't';
             ok = skip_value(s);
-        } else if (!strcmp(key, "event_name")) {
+        } else if (payload && (!strcmp(key, "event_name") || !strcmp(key, "event"))) {
             ok = read_field(s, r->event, sizeof(r->event));
-        } else if (!strcmp(key, "message_id")) {
+        } else if (!strcmp(key, "message_id") || (!have_id && !strcmp(key, "id"))) {
             ok = read_field(s, r->msg, sizeof(r->msg));
-        } else if (!strcmp(key, "reply_to_message_id")) {
+            have_id |= string && !strcmp(key, "message_id");
+        } else if (!strcmp(key, "reply_to_message_id") || (!have_parent && !strcmp(key, "parent_message_id"))) {
             ok = read_field(s, r->reply_to, sizeof(r->reply_to));
-        } else if (!strcmp(key, "display_text")) {
-            ok = read_field(s, r->text, sizeof(r->text));
+            have_parent |= string && !strcmp(key, "reply_to_message_id");
+        } else if (!strcmp(key, "display_text") || !strcmp(key, "content") || !strcmp(key, "text")) {
+            unsigned rank = !strcmp(key, "display_text") ? 3 : !strcmp(key, "content") ? 2 : 1;
+            ok = string && rank >= text_rank ? read_field(s, r->text, sizeof(r->text)) : skip_value(s);
+            if (string && rank > text_rank) text_rank = rank;
         } else {
             ok = skip_value(s);
         }
@@ -302,96 +323,147 @@ static bool parse_row(scan_t *s, row_t *r)
     return expect(s, '}');
 }
 
-static bool parse_object(scan_t *s, row_t *r);
-
-/* {"ok":true,"result":{"chat_events":[row],...}}: fills r from the first row, if any. */
-static bool parse_page(const char *p, size_t n, row_t *r)
+static bool parse_event(const char *data, size_t len)
 {
-    scan_t s = { p, p + n };
-    memset(r, 0, sizeof(*r));
-    return parse_object(&s, r);
+    scan_t scan = { data, data + len }, payload = {0};
+    memset(&s_row, 0, sizeof(s_row));
+    s_row.ready = true;
+    if (!parse_row(&scan, &s_row, &payload)) return false;
+    skip_ws(&scan);
+    if (scan.p != scan.end || strcmp(s_row.type, "event")) return false;
+    return !payload.p || parse_row(&payload, &s_row, NULL);
 }
 
-static bool parse_object(scan_t *sp, row_t *r)
+static bool related(const row_t *row)
 {
-    scan_t s = *sp;
-    if (!expect(&s, '{')) {
-        return false;
+    if (!strcmp(row->event, "message.user")) {
+        return !s_note_id[0] || !strcmp(row->msg, s_note_id) || !strcmp(row->msg, s_parent_id);
     }
-    if (expect(&s, '}')) {
-        *sp = s;
-        return true;
-    }
-    do {
-        char key[24];
-        skip_ws(&s);
-        if (!read_string(&s, key, sizeof(key)) || !expect(&s, ':')) {
-            return false;
-        }
-        if (!strcmp(key, "result")) {
-            if (!parse_object(&s, r)) {
-                return false;
-            }
-        } else if (strcmp(key, "chat_events")) {
-            if (!skip_value(&s)) {
-                return false;
-            }
-        } else if (expect(&s, '[') && !expect(&s, ']')) {
-            if (!parse_row(&s, r)) {
-                return false;
-            }
-            r->found = true;
-            while (expect(&s, ',')) {
-                if (!skip_value(&s)) {
-                    return false;
-                }
-            }
-            if (!expect(&s, ']')) {
-                return false;
-            }
-        }
-    } while (expect(&s, ','));
-    if (!expect(&s, '}')) {
-        return false;
-    }
-    *sp = s;
-    return true;
+    return !s_note_id[0] || !row->reply_to[0]
+        || !strcmp(row->reply_to, s_note_id) || !strcmp(row->reply_to, s_parent_id);
 }
 
-/* A page in one frame is parsed straight from Link's buffer; a split one is gathered first. */
+/* Append whole UTF-8 characters even when the caption is already nearly full. */
+static void text_append(char *out, size_t cap, const char *text)
+{
+    size_t used = strlen(out), n = strlen(text);
+    if (n >= cap - used) {
+        n = cap - used - 1;
+        while (n && ((unsigned char)text[n] & 0xc0) == 0x80) n--;
+    }
+    memcpy(out + used, text, n);
+    out[used + n] = 0;
+}
+
+/* Called with the receive lock held; never waits on the voice task. */
+static void subscription_event(void)
+{
+    if (s_row.seq && s_row.seq <= s_last_seq) return;
+    if (s_row.seq) s_last_seq = s_row.seq;
+    bool append = !strcmp(s_row.event, "delta.text_append");
+    bool start = !strcmp(s_row.event, "delta.message_start");
+    bool done = !strcmp(s_row.event, "delta.message_done");
+    bool full = !strcmp(s_row.event, "message.assistant");
+    bool user = !strcmp(s_row.event, "message.user");
+    if ((!append && !start && !done && !full && !user) || !s_row.msg[0]) return;
+    if (!related(&s_row)) return;
+    if (start || append) {
+        if (strcmp(s_delta.msg, s_row.msg)) {
+            memset(&s_delta, 0, sizeof(s_delta));
+            strlcpy(s_delta.msg, s_row.msg, sizeof(s_delta.msg));
+        }
+        if (s_row.reply_to[0]) strlcpy(s_delta.reply_to, s_row.reply_to, sizeof(s_delta.reply_to));
+        if (append) {
+            text_append(s_delta.text, sizeof(s_delta.text), s_row.text);
+        }
+        return;
+    }
+    if (!done && !s_row.ready) return;
+    if (!strcmp(s_row.msg, s_delta.msg)) {
+        if (!s_row.text[0]) strlcpy(s_row.text, s_delta.text, sizeof(s_row.text));
+        if (!s_row.reply_to[0]) strlcpy(s_row.reply_to, s_delta.reply_to, sizeof(s_row.reply_to));
+    }
+    if (!related(&s_row) || !s_row.text[0]) return;
+    if (!user) strlcpy(s_row.event, "message.assistant", sizeof(s_row.event));
+    s_row.ready = true;
+    /* Coalesce the done event and persisted full message, including before ACK. */
+    for (unsigned i = 0; i < s_pending_count; i++) {
+        if (!strcmp(s_pending[i].msg, s_row.msg)) { s_pending[i] = s_row; return; }
+    }
+    /* Keep the two newest finals if the voice task has not drained the queue.
+     * Before ACK they are provisional: unrelated traffic must not fail a turn
+     * or grow memory without bound. Remember eviction for a useful timeout. */
+    if (s_pending_count == 2) {
+        if (!s_note_id[0]) s_early_evicted = true;
+        s_pending[0] = s_pending[1];
+        s_pending_count--;
+    }
+    s_pending[s_pending_count++] = s_row;
+}
+
+/* Parse complete lines in Link's buffer; gather only a line split across frames.
+ * An oversized line is skipped through its newline, so later events still work. */
 static void row_data(rx_t *rx, const uint8_t *data, size_t len, bool end)
 {
-    if (rx->status != 200 || rx->overflow) {
-        return;
-    }
-    if (!rx->body && end) {
-        s_row.ok = parse_page((const char *)data, len, &s_row);
-        return;
-    }
-    if (len) {
-        char *grown = rx->len + len <= ROW_MAX ? realloc(rx->body, rx->len + len) : NULL;
-        if (!grown) {
-            rx->overflow = true;
-            return;
+    if (rx->status != 200) return;
+    while (len) {
+        const uint8_t *newline = memchr(data, '\n', len);
+        size_t n = newline ? (size_t)(newline - data) : len;
+        if (!rx->overflow) {
+            if (n > ROW_MAX - rx->len) {
+                rx->overflow = s_skipped_big = true;
+            } else if (!rx->body && newline) {
+                if (parse_event((const char *)data, n)) subscription_event();
+            } else if (n) {
+                char *grown = realloc(rx->body, rx->len + n);
+                if (!grown) {
+                    rx->overflow = s_skipped_big = true;
+                } else {
+                    rx->body = grown;
+                    memcpy(rx->body + rx->len, data, n);
+                    rx->len += n;
+                }
+            }
         }
-        memcpy(grown + rx->len, data, len);
-        rx->body = grown;
-        rx->len += len;
+        if (rx->overflow) {
+            free(rx->body);
+            rx->body = NULL;
+            rx->len = 0;
+        }
+        if (newline) {
+            if (rx->body && !rx->overflow && parse_event(rx->body, rx->len)) subscription_event();
+            free(rx->body);
+            rx->body = NULL;
+            rx->len = 0;
+            rx->overflow = false;
+            n++;
+        }
+        data += n;
+        len -= n;
     }
     if (end) {
-        s_row.ok = parse_page(rx->body, rx->len, &s_row);
+        if (rx->len && !rx->overflow && parse_event(rx->body, rx->len)) subscription_event();
+        free(rx->body);
+        rx->body = NULL;
+        rx->len = 0;
     }
 }
 
 static void rx_clear(rx_t *rx)
 {
-    if (!rx->cap) {
-        free(rx->body);
-        rx->body = NULL;
-    }
     rx->status = 0;
     rx->done = rx->overflow = false;
     rx->len = 0;
+    if (!rx->cap) {
+        free(rx->body);
+        rx->body = NULL;
+        s_skipped_big = false;
+        s_pending_count = 0;
+        s_last_seq = 0;
+        s_early_evicted = false;
+        s_note_id[0] = s_parent_id[0] = 0;
+        memset(&s_delta, 0, sizeof(s_delta));
+    }
 }
 
 static void on_frame(void *ctx, int status, const uint8_t *data, size_t len, bool end)
@@ -423,7 +495,8 @@ static bool request(int slot, const char *verb, const char *path, bool json, boo
     char req_id[40];
     snprintf(req_id, sizeof(req_id), "muse-%08" PRIx32 "-%08" PRIx32, esp_random(), esp_random());
     const char *headers[] = { "x-request-id", req_id, "x-app-id", "hatch-web",
-                              json ? "Content-Type" : NULL, "application/json", NULL };
+                              json ? "Content-Type" : NULL, "application/json",
+                              "Accept", slot == RX_SUB ? "application/x-ndjson" : "application/json", NULL };
     rx_t *rx = &s_rx[slot];
     xSemaphoreTake(s_rx_lock, portMAX_DELAY);
     rx->gen++;
@@ -431,7 +504,6 @@ static bool request(int slot, const char *verb, const char *path, bool json, boo
     if (rx->cap) {
         rx->body[0] = '\0';
     }
-    s_row.ok = false;
     uintptr_t token = (uintptr_t)rx->gen << 1 | slot;
     xSemaphoreGive(s_rx_lock);
     s_stream[slot] = muse_link_req_open(verb, path, headers, end_body, on_frame, (void *)token);
@@ -473,7 +545,7 @@ static void emit(muse_hatch_ev_t type, const char *text)
 static void end_turn(void)
 {
     drop(RX_NOTE);
-    drop(RX_ROW);
+    drop(RX_SUB);
     free(s_turn.stage);
     free(s_turn.chunk);
     s_turn.stage = NULL;
@@ -505,23 +577,11 @@ static bool send_stage(bool last)
 
 /* ---- The reply ---- */
 
-/* The chat's newest row (none yet: the mark) or the next one after it. */
-static bool poll_row(void)
-{
-    char path[64];
-    if (s_turn.marked) {
-        snprintf(path, sizeof(path), "/chat/history?limit=1&after_seq=%" PRIu64, s_turn.after);
-    } else {
-        strlcpy(path, "/chat/history?limit=1", sizeof(path));
-    }
-    return request(RX_ROW, "GET", path, false, true);
-}
-
 static void on_ack(void)
 {
     rx_t *rx = &s_rx[RX_NOTE];
-    if (rx->status != 200) {
-        ESP_LOGW(TAG, "chat/stream: %d %.120s", rx->status, rx->body);
+    if (rx->status != 200 || rx->overflow) {
+        ESP_LOGW(TAG, "chat/stream: %d", rx->status);
         fail(rx->status < 0 ? "LOST CONNECTION TO MUSE" : "MUSE DIDN'T TAKE IT");
         return;
     }
@@ -529,26 +589,37 @@ static void on_ack(void)
     cJSON *result = cJSON_GetObjectItem(root, "result");
     const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_IsObject(result) ? result : root, "message_id"));
     strlcpy(s_turn.note_id, id ? id : "", sizeof(s_turn.note_id));
+    const char *parent = cJSON_GetStringValue(cJSON_GetObjectItem(cJSON_IsObject(result) ? result : root, "reply_to_message_id"));
+    strlcpy(s_turn.parent_id, parent ? parent : "", sizeof(s_turn.parent_id));
     cJSON_Delete(root);
     if (!s_turn.note_id[0]) {
-        ESP_LOGW(TAG, "chat/stream ack without a message id: %.120s", rx->body);
+        ESP_LOGW(TAG, "chat/stream ack without a message id");
         fail("MUSE DIDN'T TAKE IT");
         return;
     }
-    ESP_LOGI(TAG, "note %s sent; ack after %.2fs", s_turn.note_id, (esp_timer_get_time() - s_turn.t_end) / 1e6);
+    xSemaphoreTake(s_rx_lock, portMAX_DELAY);
+    strlcpy(s_note_id, s_turn.note_id, sizeof(s_note_id));
+    strlcpy(s_parent_id, s_turn.parent_id, sizeof(s_parent_id));
+    unsigned kept = 0;
+    for (unsigned i = 0; i < s_pending_count; i++) {
+        if (related(&s_pending[i])) s_pending[kept++] = s_pending[i];
+    }
+    s_pending_count = kept;
+    if (!related(&s_delta)) memset(&s_delta, 0, sizeof(s_delta));
+    xSemaphoreGive(s_rx_lock);
     s_turn.phase = T_REPLY;
+    emit(MUSE_HATCH_EV_SENT, NULL);
 }
 
-/* Handles the row just read; returns true to move past it. */
-static bool on_row(const row_t *r)
+/* Handles a completed subscription row on the voice task. */
+static void on_row(row_t *r)
 {
     if (!strcmp(r->event, "message.user")) {
-        s_turn.after_note = !strcmp(r->msg, s_turn.note_id);
+        s_turn.after_note = !strcmp(r->msg, s_turn.note_id) || !strcmp(r->msg, s_turn.parent_id);
     }
     if (s_turn.after_note && !strcmp(r->event, "message.user")) {
         /* The row reads "<transcript>\n[file:audio/wav ...]", or "[Voice note]" before transcription. */
-        static char heard[TEXT_MAX];   /* voice task only */
-        strlcpy(heard, r->text, sizeof(heard));
+        char *heard = r->text;   /* the voice task owns this dequeued row */
         char *att = strstr(heard, "\n[file:");
         if (att) {
             *att = '\0';
@@ -559,19 +630,27 @@ static bool on_row(const row_t *r)
             emit(MUSE_HATCH_EV_HEARD, line);
             s_turn.heard = true;
         }
-        return true;
+        return;
     }
-    /* Replies to voice notes may leave reply_to_message_id empty: then it's whatever follows the note. */
+    /* Explicit parents must match the ACK. Unparented live replies follow the note. */
     if (strcmp(r->event, "message.assistant")
-        || (r->reply_to[0] ? strcmp(r->reply_to, s_turn.note_id) : !s_turn.after_note)) {
-        return true;
+        || (r->reply_to[0] && strcmp(r->reply_to, s_turn.note_id) && strcmp(r->reply_to, s_turn.parent_id))) {
+        return;
     }
     if (!r->ready) {
-        return false;   /* still being written; read it again */
+        return;
+    }
+    for (unsigned i = 0; i < s_turn.seen_count; i++) {
+        if (!strcmp(r->msg, s_turn.seen[i])) return;
     }
     if (r->text[0]) {
-        size_t len = strlen(s_turn.text);
-        snprintf(s_turn.text + len, sizeof(s_turn.text) - len, "%s%s", len ? " " : "", r->text);
+        if (s_turn.seen_count == 2) {
+            memcpy(s_turn.seen[0], s_turn.seen[1], sizeof(s_turn.seen[0]));
+            s_turn.seen_count = 1;
+        }
+        strlcpy(s_turn.seen[s_turn.seen_count++], r->msg, sizeof(s_turn.seen[0]));
+        if (s_turn.text[0]) text_append(s_turn.text, sizeof(s_turn.text), " ");
+        text_append(s_turn.text, sizeof(s_turn.text), r->text);
         ESP_LOGI(TAG, "reply after %.2fs: %.80s", (esp_timer_get_time() - s_turn.t_end) / 1e6, r->text);
         if (!s_turn.replied) {
             s_turn.t_show = esp_timer_get_time();
@@ -579,34 +658,18 @@ static bool on_row(const row_t *r)
         s_turn.replied = true;
         s_turn.t_reply = esp_timer_get_time();
     }
-    return true;
+    return;
 }
 
-/* A page is in: note where the chat ends, or read the next row. */
-static void on_page(void)
+static void subscription_error(int status)
 {
-    rx_t *rx = &s_rx[RX_ROW];
-    int64_t now = esp_timer_get_time();
-    s_turn.t_poll = now + POLL_US;
-    if (rx->status != 200) {
-        ESP_LOGW(TAG, "chat/history: %d", rx->status);
-        if (rx->status < 0) {
-            fail("LOST CONNECTION TO MUSE");
-        }
-        return;
-    }
-    if (!s_row.ok) {
-        ESP_LOGW(TAG, "chat/history page unreadable%s", rx->overflow ? ", too long" : "");
-        s_turn.skipped_big |= rx->overflow;
-        return;
-    }
-    if (!s_turn.marked) {
-        s_turn.marked = true;
-        s_turn.after = s_row.found ? s_row.seq : 0;
-        s_turn.t_poll = now;
-    } else if (s_row.found && s_row.seq > s_turn.after && on_row(&s_row)) {
-        s_turn.after = s_row.seq;
-        s_turn.t_poll = now;   /* there may be more */
+    if (status == 403) fail("MUSE REPLY ACCESS DENIED (403)");
+    else if (status == 401) fail("MUSE REPLY AUTH REQUIRED (401)");
+    else if (status <= 0 || status == 200) fail("LOST CONNECTION TO MUSE");
+    else {
+        char why[EV_TEXT];
+        snprintf(why, sizeof(why), "MUSE REPLY ERROR (HTTP %d)", status);
+        fail(why);
     }
 }
 
@@ -637,8 +700,35 @@ static void pump(void)
     if (s_turn.phase == T_ACK && received(RX_NOTE)) {
         on_ack();
     }
-    if (s_turn.phase != T_IDLE && received(RX_ROW)) {
-        on_page();
+    if (s_turn.phase == T_IDLE) return;
+    /* Preserve early events until the POST ACK supplies the note IDs. */
+    static row_t pending; /* voice task only; avoid a large stack frame */
+    xSemaphoreTake(s_rx_lock, portMAX_DELAY);
+    int status = s_rx[RX_SUB].status;
+    bool closed = s_rx[RX_SUB].done;
+    bool early_evicted = s_early_evicted;
+    bool skipped_big = s_skipped_big;
+    xSemaphoreGive(s_rx_lock);
+    if (status < 0 || status >= 400) {
+        subscription_error(status);
+        return;
+    }
+    if (s_turn.phase == T_REPLY) {
+        for (;;) {
+            xSemaphoreTake(s_rx_lock, portMAX_DELAY);
+            bool have = s_pending_count > 0;
+            if (have) {
+                pending = s_pending[0];
+                if (--s_pending_count) s_pending[0] = s_pending[1];
+            }
+            xSemaphoreGive(s_rx_lock);
+            if (!have) break;
+            on_row(&pending);
+        }
+        if (closed && !s_turn.replied) {
+            subscription_error(status);
+            return;
+        }
     }
     if (s_turn.phase != T_REPLY) {
         if (s_turn.phase == T_ACK && now - s_turn.t_end > REPLY_TIMEOUT_US) {
@@ -646,18 +736,13 @@ static void pump(void)
         }
         return;
     }
-    if (!s_stream[RX_ROW] && now >= s_turn.t_poll && !poll_row()) {
-        fail("LOST CONNECTION TO MUSE");
-        return;
-    }
     if (s_turn.replied) {
         if (scroll(now) && now - s_turn.t_reply > SETTLE_US) {
-            ESP_LOGI(TAG, "reply done: %u chars", (unsigned)strlen(s_turn.text));
             end_turn();
             emit(MUSE_HATCH_EV_DONE, NULL);
         }
     } else if (now - s_turn.t_end > REPLY_TIMEOUT_US) {
-        fail(s_turn.skipped_big ? "REPLY TOO LONG" : "NO REPLY FROM MUSE");
+        fail(skipped_big ? "REPLY TOO LONG" : early_evicted ? "REPLY BUFFER LIMIT - TRY AGAIN" : "NO REPLY FROM MUSE");
     }
 }
 
@@ -764,6 +849,13 @@ void muse_hatch_turn_end(void)
         emit(MUSE_HATCH_EV_ERROR, s_turn.error[0] ? s_turn.error : "CAN'T REACH MUSE");
         return;
     }
+    /* Subscribe only after recording: keep inbound reply traffic out of the
+     * real-time audio upload. Queue it before the note's final body chunk. */
+    if (!request(RX_SUB, "POST", "/chat/subscribe", true, false)
+        || !muse_link_req_send(s_stream[RX_SUB], "{}", 2, true, SEND_WAIT_MS)) {
+        fail("CAN'T SUBSCRIBE TO MUSE");
+        return;
+    }
     if (!send_stage(true)) {
         fail("CAN'T KEEP UP");
         return;
@@ -774,14 +866,6 @@ void muse_hatch_turn_end(void)
     s_turn.chunk = NULL;
     s_turn.t_end = esp_timer_get_time();
     s_turn.phase = T_ACK;
-    /*
-     * Only now mark where the chat ends: the newest row is often the last
-     * reply, and reading it mid-upload leaves no room for TLS to send. Hatch
-     * adds this note's row only after transcribing it, so none is missed.
-     */
-    if (!poll_row()) {
-        fail("LOST CONNECTION TO MUSE");
-    }
 }
 
 void muse_hatch_turn_cancel(void)
