@@ -63,8 +63,8 @@ static const char *TAG = "muse_input";
 #define LONG_TICKS 150         /* 1.5 s: power off */
 #define SLEEP_CHECK_MS 100
 
-#define SERIAL_RX 1024         /* the driver drops what doesn't fit, so a console line must */
-#define SERIAL_LINE 1024
+#define SERIAL_RX 2048         /* larger than a complete setup command */
+#define SERIAL_LINE 1200
 #define CHAT_MAX (192 * 1024)  /* a typed message, assembled from "chat+=" lines */
 
 static QueueHandle_t s_queue;
@@ -669,7 +669,11 @@ static void serial_task(void *arg)
             char none[1];   /* no room: the line is read and dropped */
             bool whole = read_line(line ? line : none, line ? SERIAL_LINE : sizeof(none));
             if (line && !console_command(line, whole)) {
-                muse_ble_command(line);
+                if (whole) {
+                    muse_ble_command(line);
+                } else {
+                    muse_hatch_console("error", "SETUP COMMAND TOO LONG", NULL);
+                }
             }
             free(line);
         } else if (c == 'd' || c == 'u') {

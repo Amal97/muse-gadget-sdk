@@ -44,6 +44,7 @@ static struct {
     char host[MUSE_HOST_MAX + 1];
     char vm[MUSE_VM_MAX + 1];
     char token[MUSE_TOKEN_MAX + 1];
+    char openai_key[MUSE_TOKEN_MAX + 1];
 } s = {
     .volume = 70,
     .speaker_on = true,
@@ -132,6 +133,7 @@ esp_err_t muse_settings_init(void)
     load_str("host", s.host, sizeof(s.host));
     load_str("vm", s.vm, sizeof(s.vm));
     load_str("token", s.token, sizeof(s.token));
+    load_str("openai_key", s.openai_key, sizeof(s.openai_key));
 
     s.volume = clampi(s.volume, 0, 100);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
@@ -189,6 +191,44 @@ size_t muse_settings_hatch_token_len(void)
     size_t n;
     LOCKED(n = strlen(s.token));
     return n;
+}
+
+void muse_settings_openai_key(char out[MUSE_TOKEN_MAX + 1])
+{
+    LOCKED(strlcpy(out, s.openai_key, MUSE_TOKEN_MAX + 1));
+}
+
+size_t muse_settings_openai_key_len(void)
+{
+    size_t n;
+    LOCKED(n = strlen(s.openai_key));
+    return n;
+}
+
+esp_err_t muse_settings_set_openai_key(const char *key)
+{
+    if (!key || strlen(key) > MUSE_TOKEN_MAX) {
+        ESP_LOGW(TAG, "OpenAI key rejected: invalid length");
+        return ESP_ERR_INVALID_SIZE;
+    }
+    for (const unsigned char *p = (const unsigned char *)key; *p; p++) {
+        if (*p <= 0x20 || *p >= 0x7f) {
+            ESP_LOGW(TAG, "OpenAI key rejected: invalid character");
+            return ESP_ERR_INVALID_ARG;
+        }
+    }
+    esp_err_t err;
+    LOCKED({
+        err = nvs_set_str(s_nvs, "openai_key", key);
+        if (err == ESP_OK) err = nvs_commit(s_nvs);
+        if (err == ESP_OK) strlcpy(s.openai_key, key, sizeof(s.openai_key));
+    });
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "OpenAI key save failed: %s", esp_err_to_name(err));
+    } else {
+        notify(MUSE_SETTING_OPENAI);
+    }
+    return err;
 }
 
 void muse_settings_set_volume(int pct)

@@ -105,6 +105,41 @@ menu "Muse"
             memory and preview decoding shares CPU time with voice and Link.
             Leave disabled to build without camera support.
 
+    config MUSE_OPENAI
+        bool "Standalone OpenAI voice assistant (no Muse account)"
+        depends on SPIRAM && (MUSE_BOARD_WAVESHARE_S3_175C || MUSE_BOARD_WAVESHARE_S3_175)
+        select MUSE_HATCH
+        select MBEDTLS_HAVE_TIME_DATE
+        default n
+        help
+            Connect directly to api.openai.com using an API key stored in
+            NVS. Uses transcription, chat completions and generated speech.
+            Wi-Fi and key setup are available on screen or over USB serial.
+            Disables Muse pairing, cloud sessions, tunnel and OTA services.
+            Audio and transcripts are sent to OpenAI; API usage is billed.
+            NVS is not encrypted, so physical access can expose the API key.
+            Currently supported on the Waveshare S3 1.75C and 1.75 boards.
+
+    config MUSE_OPENAI_CHAT_MODEL
+        string "OpenAI chat model"
+        depends on MUSE_OPENAI
+        default "gpt-4o-mini"
+
+    config MUSE_OPENAI_TRANSCRIPTION_MODEL
+        string "OpenAI transcription model"
+        depends on MUSE_OPENAI
+        default "gpt-4o-mini-transcribe"
+
+    config MUSE_OPENAI_SPEECH_MODEL
+        string "OpenAI speech model"
+        depends on MUSE_OPENAI
+        default "gpt-4o-mini-tts"
+
+    config MUSE_OPENAI_VOICE
+        string "OpenAI speech voice"
+        depends on MUSE_OPENAI
+        default "coral"
+
     config MUSE_HATCH
         bool "Muse's own voice session"
         depends on MUSE_ENABLED

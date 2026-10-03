@@ -70,11 +70,34 @@ like most WS2812s: turn the option off in `idf.py menuconfig`, or in
 
 ## Build
 
-Every build needs the user's SDK token (`mgst_…`, from gadgets.muse.ai >
+Default Muse-mode builds need the user's SDK token (`mgst_…`, from gadgets.muse.ai >
 Account > SDK tokens). Ask for it, then set `CONFIG_GADGET_SDK_TOKEN="mgst_…"`
 in that build directory's `sdkconfig` (or with `idf.py menuconfig`) before
 building. Without it the build warns, and the gadget will stop pairing once
 Muse requires tokens. Never commit the token or print it in full.
+
+### Standalone OpenAI
+
+On the Waveshare S3 1.75C or 1.75, load `devices/sdkconfig.openai` last,
+after `sdkconfig.defaults`, `devices/sdkconfig.muse` and the board overlay.
+Use a separate `build-openai-<profile>` directory. This enables
+`CONFIG_MUSE_OPENAI`, substitutes `components/muse/muse_openai.c` for the
+Muse chat backend, and skips Muse pairing and cloud startup. It does not
+need a Muse SDK token. See `README.md` for exact build/flash commands.
+
+Wi-Fi uses the existing settings and saved-network keeper. The OpenAI API
+key lives under `openai_key` in the `muse` NVS namespace; never put it in
+source or sdkconfig. Ask the user to run
+`python tools/muse/openai_setup.py --port PORT --wifi --key --test` locally
+so secrets are prompted without echo. On-screen OpenAI settings and USB
+commands also work. BLE setup and Muse OTA/tunnel services are disabled.
+Do not enable encryption or burn eFuses as part of this workflow.
+
+Verify boot logs say `Standalone OpenAI mode` and `standalone provider ready`;
+USB status should have `device.provider == "openai"`. A successful flash
+is not proof of working API access: test with the user's configured key and
+Wi-Fi. If unavailable, explicitly report that live OpenAI access is unverified.
+Host coverage: `python3 -m unittest tests/test_muse_openai.py`.
 
 ### DevKitC-1 (default)
 

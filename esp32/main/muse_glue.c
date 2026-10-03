@@ -362,7 +362,11 @@ static bool op_ble_started(void) {
 }
 
 static bool op_hatch_linked(void) {
+#if CONFIG_MUSE_OPENAI
+    return false;
+#else
     return s_linked;
+#endif
 }
 
 static bool op_hatch_vm(const char *want_vm, char *vm_id, size_t id_cap, char *vm_name, size_t name_cap,
@@ -371,7 +375,11 @@ static bool op_hatch_vm(const char *want_vm, char *vm_id, size_t id_cap, char *v
 }
 
 static bool op_talk_press(void) {
+#if CONFIG_MUSE_OPENAI
+    return false;
+#else
     return app_confirm_pairing_press();
+#endif
 }
 
 static void op_reset_setup(void) {
@@ -505,7 +513,9 @@ static void keeper_task(void *arg) {
             setup_done = done;
         }
         if (pending & KEEP_BLE) {
+#if !CONFIG_MUSE_OPENAI
             app_ble_companion_set(muse_settings_ble_on());
+#endif
         }
         if (pending & KEEP_WIFI) {
             backoff = RETRY_MIN_US;
@@ -607,7 +617,11 @@ static void keeper_task(void *arg) {
 
 static void boot_task(void *arg) {
     (void)arg;
+#if CONFIG_MUSE_OPENAI
+    xEventGroupWaitBits(s_ready, BIT_STORAGE | BIT_LINK, pdFALSE, pdTRUE, portMAX_DELAY);
+#else
     xEventGroupWaitBits(s_ready, BIT_STORAGE, pdFALSE, pdTRUE, portMAX_DELAY);
+#endif
     load_creds();
     muse_app_run(muse_board_get());
     xEventGroupSetBits(s_ready, BIT_MUSE);
@@ -619,12 +633,14 @@ void muse_glue_start(void) {
     s_ready = xEventGroupCreate();
     muse_link_register(&s_ops);
     muse_ble_set_name(identity_ble_name());
+#if !CONFIG_MUSE_OPENAI
     ble_companion_t companion = {
         .svcs = muse_ble_services(),
         .configure_host = muse_ble_configure_host,
         .on_gap_event = muse_ble_gap_event,
     };
     ble_server_set_companion(&companion);
+#endif
     // Pinned to the UI core, so the display's SPI interrupt, set up in it,
     // lands beside the task that sends to the display (muse_lcd_bands.h).
     if (xTaskCreatePinnedToCore(boot_task, "muse_boot", 8192, NULL, 5, NULL, MUSE_UI_CORE) != pdPASS

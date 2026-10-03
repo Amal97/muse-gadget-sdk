@@ -38,6 +38,9 @@
 #include "muse_ui.h"
 #include "muse_voice.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_OPENAI
+#include "muse_openai.h"
+#endif
 
 /* Keep content in a column that stays inside a round panel (and fits a 368 px one). */
 #define LIST_W 330
@@ -87,9 +90,12 @@ static int64_t s_forget_armed_us;
 static char s_join_ssid[MUSE_SSID_MAX + 1];
 
 /* Hatch page. */
-static lv_obj_t *s_hatch_status, *s_hatch_host, *s_hatch_vm, *s_hatch_token;
+static lv_obj_t *s_hatch_status, *s_hatch_token;
+#if !CONFIG_MUSE_OPENAI
+static lv_obj_t *s_hatch_host, *s_hatch_vm;
 static lv_obj_t *s_link_status, *s_link_reset_lbl;
 static int64_t s_link_reset_armed_us;
+#endif
 
 /* Bluetooth page. */
 static lv_obj_t *s_ble_sw, *s_ble_status;
@@ -820,6 +826,7 @@ static void tick_wifi(void)
 
 /* ---------- Hatch ---------- */
 
+#if !CONFIG_MUSE_OPENAI
 static void on_hatch_host_done(const char *text) { muse_settings_set_hatch_host(text); }
 static void on_hatch_vm_done(const char *text) { muse_settings_set_hatch_vm(text); }
 
@@ -851,6 +858,34 @@ static void on_hatch_token(lv_event_t *e)
     (void)e;
     open_text("Device token", "", true, MUSE_TOKEN_MAX, "Empty keeps the current one", on_hatch_token_done, s_hatch);
 }
+#else
+static void on_openai_key_done(const char *text)
+{
+    if (text[0] && muse_settings_set_openai_key(text) != ESP_OK) {
+        muse_state_set_caption("API KEY NOT SAVED");
+    }
+}
+
+static void on_hatch_token(lv_event_t *e)
+{
+    (void)e;
+    open_text("OpenAI API key", "", true, MUSE_TOKEN_MAX, "Empty keeps the current one", on_openai_key_done, s_hatch);
+}
+
+static void on_openai_forget(lv_event_t *e)
+{
+    (void)e;
+    if (muse_settings_set_openai_key("") != ESP_OK) {
+        muse_state_set_caption("API KEY NOT REMOVED");
+    }
+}
+
+static void on_openai_clear(lv_event_t *e)
+{
+    (void)e;
+    muse_openai_clear_history();
+}
+#endif
 
 static void on_hatch_test(lv_event_t *e)
 {
@@ -858,6 +893,7 @@ static void on_hatch_test(lv_event_t *e)
     muse_hatch_test();
 }
 
+#if !CONFIG_MUSE_OPENAI
 /* Two taps within a few seconds: this wipes Wi-Fi and the Muse app pairing. */
 static void on_link_reset(lv_event_t *e)
 {
@@ -871,10 +907,22 @@ static void on_link_reset(lv_event_t *e)
     s_link_reset_armed_us = now;
     set_text(s_link_reset_lbl, "Tap again to reset");
 }
+#endif
 
 static void build_hatch_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
+#if CONFIG_MUSE_OPENAI
+    s_hatch = page(tile, "OPENAI", true, &list);
+    s_hatch_status = note(list, "");
+    row(list, NULL, "API key", &s_hatch_token, on_hatch_token, NULL);
+    button(list, "Test API key", COLOR_ACCENT, on_hatch_test, NULL);
+    button(list, "New conversation", COLOR_ACCENT, on_openai_clear, NULL);
+    button(list, "Remove API key", COLOR_DANGER, on_openai_forget, NULL);
+    note(list, "Hold the talk button, then release. Audio and text go to OpenAI. "
+               "API usage is billed. The voice is AI-generated. "
+               "The key is stored on this device without encryption.");
+#else
     s_hatch = page(tile, "MUSE", true, &list);
     s_link_reset_armed_us = 0;
     s_link_status = note(list, "");
@@ -887,10 +935,12 @@ static void build_hatch_page(lv_obj_t *tile)
     note(list, "Pair with the Muse app to use your account; a device token here overrides it, and a long one is "
                "easier to send over Bluetooth. The VM ID picks one of your VMs. "
                "Reset pairing forgets Wi-Fi and the app pairing, then restarts.");
+#endif
 }
 
 static void tick_hatch(void)
 {
+#if !CONFIG_MUSE_OPENAI
     char link[64];
     snprintf(link, sizeof(link), "Muse app: %s\n%s", muse_link_hatch_linked() ? "paired" : "not paired",
              muse_link_state_name(muse_link_state()));
@@ -899,6 +949,7 @@ static void tick_hatch(void)
         s_link_reset_armed_us = 0;
         set_text(s_link_reset_lbl, "Reset pairing");
     }
+#endif
 
     muse_hatch_status_t h;
     muse_hatch_status(&h);
@@ -908,12 +959,16 @@ static void tick_hatch(void)
     lv_obj_set_style_text_color(s_hatch_status, lv_color_hex(h.state == MUSE_HATCH_REACHABLE ? COLOR_OK :
                                                              h.state == MUSE_HATCH_UNREACHABLE ? COLOR_WARN : COLOR_DIM), 0);
 
+#if !CONFIG_MUSE_OPENAI
     char host[MUSE_HOST_MAX + 1], vm[MUSE_VM_MAX + 1];
     muse_settings_hatch_host(host);
     muse_settings_hatch_vm(vm);
     set_text(s_hatch_host, host);
     set_text(s_hatch_vm, vm[0] ? vm : "Not set");
     size_t n = muse_settings_hatch_token_len();
+#else
+    size_t n = muse_settings_openai_key_len();
+#endif
     snprintf(buf, sizeof(buf), n ? "Set (%u chars)" : "Not set", (unsigned)n);
     set_text(s_hatch_token, buf);
 }
@@ -1248,8 +1303,13 @@ static void build_home(lv_obj_t *tile)
     lv_obj_t *list;
     s_home = page(tile, "SETTINGS", false, &list);
     row(list, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
+#if CONFIG_MUSE_OPENAI
+    row(list, LV_SYMBOL_HOME, "OpenAI", &s_home_hatch, on_nav, (void *)&HATCH);
+    lv_obj_add_flag(row(list, LV_SYMBOL_BLUETOOTH, "Bluetooth", &s_home_ble, on_nav, (void *)&BLE), LV_OBJ_FLAG_HIDDEN);
+#else
     row(list, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);
     row(list, LV_SYMBOL_BLUETOOTH, "Bluetooth", &s_home_ble, on_nav, (void *)&BLE);
+#endif
     row(list, LV_SYMBOL_VOLUME_MAX, "Sound", &s_home_sound, on_nav, (void *)&SOUND);
     row(list, LV_SYMBOL_EYE_CLOSE, "Sleep", &s_home_sleep, on_nav, (void *)&SLEEP);
     row(list, LV_SYMBOL_BATTERY_FULL, "Battery", &s_home_battery, on_nav, (void *)&BATTERY);

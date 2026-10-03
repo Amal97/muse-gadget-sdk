@@ -45,6 +45,7 @@ typedef enum {
     MUSE_SETTING_WIFI,          /* on/off or credentials */
     MUSE_SETTING_BLE,
     MUSE_SETTING_HATCH,
+    MUSE_SETTING_OPENAI,
 } muse_setting_t;
 
 typedef void (*muse_setting_cb_t)(muse_setting_t what);
@@ -65,6 +66,10 @@ void muse_settings_hatch_host(char out[MUSE_HOST_MAX + 1]);
 void muse_settings_hatch_vm(char out[MUSE_VM_MAX + 1]);
 void muse_settings_hatch_token(char out[MUSE_TOKEN_MAX + 1]);
 size_t muse_settings_hatch_token_len(void);
+void muse_settings_openai_key(char out[MUSE_TOKEN_MAX + 1]);
+size_t muse_settings_openai_key_len(void);
+/* Empty removes the key. Never logged or included in status output. */
+esp_err_t muse_settings_set_openai_key(const char *key);
 
 void muse_settings_set_volume(int pct);
 void muse_settings_set_speaker_on(bool on);

@@ -52,7 +52,7 @@ static const char *TAG = "muse_voice";
 #define SETTLE_CHUNKS 10   /* after Muse makes a sound, 200 ms of capture is its own tail */
 #define REST_BACKSTOP_MS 60000
 
-#if CONFIG_MUSE_HATCH
+#if CONFIG_MUSE_HATCH && !CONFIG_MUSE_OPENAI
 /* A note recorded while Hatch is out of reach is saved in PSRAM, and goes once it's back. */
 #define HOLD_NOTES 1
 #else
@@ -442,9 +442,19 @@ static const char *not_ready_reason(void)
     muse_hatch_status_t st;
     muse_hatch_status(&st);
     switch (st.state) {
-    case MUSE_HATCH_NOT_SET: return "SET UP MUSE FIRST";
+    case MUSE_HATCH_NOT_SET:
+#if CONFIG_MUSE_OPENAI
+        return "SET OPENAI API KEY IN SETTINGS";
+#else
+        return "SET UP MUSE FIRST";
+#endif
     case MUSE_HATCH_OFFLINE: return "NO WI-FI";
-    default: return "CAN'T REACH MUSE";
+    default:
+#if CONFIG_MUSE_OPENAI
+        return "OPENAI BUSY - TRY AGAIN";
+#else
+        return "CAN'T REACH MUSE";
+#endif
     }
 }
 

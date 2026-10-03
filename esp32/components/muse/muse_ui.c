@@ -1196,6 +1196,9 @@ static void update_chrome(float now)
     const lv_font_t *name_font = s_small ? &lv_font_unscii_8 : &lv_font_unscii_16;
     int name_cw = lv_font_get_glyph_width(name_font, 'M', ' ');
     const char *shown = paired ? "" : b.name;
+#if CONFIG_MUSE_OPENAI
+    shown = paired ? "" : "SET OPENAI API KEY";
+#endif
     if (name_cw > 0 && (int)strlen(shown) * name_cw > s_w) {
         const char *tail = strrchr(shown, '-');
         if (tail && tail[1]) {

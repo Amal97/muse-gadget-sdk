@@ -51,6 +51,7 @@ static void on_setting(muse_setting_t what)
         muse_ble_apply();
         break;
     case MUSE_SETTING_HATCH:
+    case MUSE_SETTING_OPENAI:
         muse_hatch_config_changed();
         break;
     default:
@@ -78,6 +79,9 @@ void muse_app_run(const muse_board_t *board)
 
     /* Let the boot animation (flame ignites, eyes open) play out. */
     vTaskDelay(pdMS_TO_TICKS(1400));
+#if CONFIG_MUSE_OPENAI
+    muse_hatch_start();
+#endif
     if (muse_voice_start(q) != ESP_OK) {
         ESP_LOGE(TAG, "voice pipeline unavailable");
     } else {
@@ -85,10 +89,15 @@ void muse_app_run(const muse_board_t *board)
         muse_state_set_caption("%s", "");   /* the button icons say how to talk */
     }
 
+#if !CONFIG_MUSE_OPENAI
     muse_hatch_start();
+#endif
     /* Home Link owns the radios; these just hand it the saved settings. */
     muse_wifi_apply();
     muse_ble_apply();
+#if CONFIG_MUSE_OPENAI
+    muse_state_set_caption("SWIPE LEFT TO SET UP WI-FI AND OPENAI");
+#endif
     ESP_LOGI(TAG, "ready: free heap %u internal, %u psram",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM));

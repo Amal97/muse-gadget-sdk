@@ -28,6 +28,9 @@ tried yet, and build your own Muse gadget.
 
 ## What you need
 
+For use without a Muse account, see [Standalone OpenAI mode](#standalone-openai-mode).
+The Muse app and SDK token below are only required for the default Muse mode.
+
 - **An ESP32 board.** The quickest start is the **ESP32-C5 DevKitC-1**, which
   works as-is with its built-in status light and BOOT button. The other boards
   that already work are listed [below](#boards).
@@ -153,6 +156,84 @@ Pairing requires a press of the button on the device, and every setup creates
 a fresh encrypted session. Because these are community devices, pairing has no
 manufacturer verification and can't prevent an active man-in-the-middle
 attack. Set it up on a network you trust.
+
+## Standalone OpenAI mode
+
+The Waveshare ESP32-S3-Touch-AMOLED-1.75C and 1.75 can connect directly to
+OpenAI without a Muse account, app, or computer bridge. This is an opt-in
+firmware build; the default Muse build is unchanged.
+
+You need 2.4 GHz Wi-Fi with internet access and an OpenAI API key with access
+to the configured models and API billing enabled. A ChatGPT subscription does
+not include API usage. Hold the talk button for up to 15 seconds, then release:
+the board uploads a 16 kHz WAV, transcribes it, requests a short text answer,
+and plays AI-generated speech. The display shows captions; muting skips the
+speech API and pages the text at reading pace.
+
+### Build and flash
+
+With ESP-IDF v6.0.1 activated, from this directory:
+
+```sh
+idf.py -B build-openai-waveshare-s3-175c -DIDF_TARGET=esp32s3 \
+  -DSDKCONFIG=build-openai-waveshare-s3-175c/sdkconfig \
+  -DSDKCONFIG_DEFAULTS="sdkconfig.defaults;devices/sdkconfig.muse;devices/sdkconfig.muse-waveshare-s3-175c;devices/sdkconfig.openai" \
+  build
+idf.py -B build-openai-waveshare-s3-175c -p /dev/cu.usbmodem2101 flash
+```
+
+Replace the serial port with yours. For the **1.75 (not 1.75C)**, replace
+`waveshare-s3-175c` with `waveshare-s3-175` in all three places in the build
+command and in the flash command. Do not reuse a Muse-mode build directory.
+
+### Set up Wi-Fi and your API key
+
+Swipe left to **Settings > Wi-Fi** to join a network, then open
+**Settings > OpenAI** to enter a key and test API access. For easier entry,
+use the USB setup tool in a local terminal:
+
+```sh
+python tools/muse/openai_setup.py --port /dev/cu.usbmodem2101 --wifi --key --test
+```
+
+It prompts privately for the Wi-Fi password and API key, sends them only over
+USB, and confirms the device saved the key. It is a setup tool, not a runtime
+bridge: unplug the computer afterward. Run it in the ESP-IDF environment,
+which already includes pyserial. Do not pass secrets as command-line arguments
+or paste them into chat. **The key is stored in NVS, not in source code or the
+build configuration; this build does not encrypt it or burn security eFuses.**
+Anyone with physical access may be able to extract it. Use a dedicated key,
+configure project usage alerts/limits, and revoke the key if the device is lost.
+
+**Test API key** checks chat-model access without generating a response.
+Voice turns incur separate transcription, chat and speech charges. The
+defaults are `gpt-4o-mini-transcribe`, `gpt-4o-mini`, `gpt-4o-mini-tts`, and
+the `coral` voice. Change them under **Muse** in `menuconfig` and rebuild.
+Model availability depends on your API account.
+
+The last four completed user/assistant exchanges are kept in RAM. **New
+conversation** clears them and cancels the current request; rebooting also
+forgets them. **Remove API key** deletes the saved key and clears the
+conversation. Requests use certificate-verified HTTPS and require network
+time (SNTP). The public GTS Root R4 certificate in
+[`components/muse/openai_root.pem`](components/muse/openai_root.pem) comes
+from [Google's PKI repository](https://pki.goog/repo/certs/gtsr4.pem).
+The complete root is embedded rather than ESP-IDF's compact bundle, so
+certificate dates remain verified even with the cross-signed server chain.
+If OpenAI changes its root CA, update this public certificate and reflash;
+never bypass certificate checks. Quota, authentication, connectivity, invalid responses and
+timeouts are shown explicitly; failed recordings are not retried automatically.
+A new press cancels playback, but an HTTPS request already in progress can
+take up to its 30-second socket timeout to stop. Retry after it finishes.
+
+This mode does not provide Muse tools, home-device control, app pairing,
+continuous realtime conversation, or OTA updates. Audio and text are sent
+to OpenAI; the AI models do not run locally.
+
+The USB console also accepts `>openai.key=KEY`, `>openai.test`,
+`>openai.clear`, and the existing Wi-Fi setup commands. Key values are never
+echoed in logs or status. `tools/muse/chat.py --port PORT "message"` can test
+a typed turn without paying for transcription or speech.
 
 ## Boards
 

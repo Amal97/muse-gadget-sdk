@@ -66,6 +66,7 @@ typedef struct {
     esp_http_client_event_cb_t event_handler;
     void *user_data;
     void *crt_bundle_attach;
+    const char *cert_pem;
     bool disable_auto_redirect;
     bool keep_alive_enable;
     int max_redirection_count;

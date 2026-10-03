@@ -73,6 +73,7 @@
 #endif
 #if CONFIG_MUSE_ENABLED
 #include "muse_glue.h"
+#include "muse_link.h"
 // Muse joins Wi-Fi from its own settings, before or without pairing.
 #define WIFI_WITHOUT_PAIRING 1
 #else
@@ -2197,7 +2198,11 @@ app_wifi_join_t app_wifi_join_saved(int timeout_ms, bool first_only) {
 
     // Unpaired, the LED keeps showing the pairing state; Wi-Fi is Muse's alone.
     // With no network in range the LED and status stay as they were.
+#if CONFIG_MUSE_OPENAI
+    bool paired = false;
+#else
     bool paired = config_is_provisioned();
+#endif
     char joined[WIFI_KNOWN_SSID_MAX + 1];
     app_wifi_join_t result = join_saved_networks(
         timeout_ms, first_only ? JOIN_FIRST : JOIN_ANY, paired, joined);
@@ -2222,8 +2227,10 @@ int64_t app_wifi_none_nearby_at(void) {
 
 bool app_wifi_nap(void) {
     if (!operation_gate_take(0, "Muse Wi-Fi nap")) return false;
+#if !CONFIG_MUSE_OPENAI
     s_muse_resume_vm = s_muse_resume_vm || noise_ctrl_is_running();
     disconnect_vm_transports();
+#endif
     wifi_mgr_disconnect();
     s_muse_napping = true;
     operation_gate_give();
@@ -2475,6 +2482,14 @@ void app_run(void) {
     identity_init();
 #if CONFIG_MUSE_ENABLED
     muse_glue_storage_ready();
+#endif
+
+#if CONFIG_MUSE_OPENAI
+    wifi_mgr_init();
+    muse_link_set_state(MUSE_LINK_OFFLINE);
+    muse_glue_link_ready();
+    ESP_LOGI(TAG, "Standalone OpenAI mode: Muse pairing and cloud services disabled");
+    return;
 #endif
 
     const esp_app_desc_t *app_desc = esp_app_get_description();

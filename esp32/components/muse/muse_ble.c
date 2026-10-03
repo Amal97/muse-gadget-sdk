@@ -32,6 +32,9 @@
 #include "muse_state.h"
 #include "muse_voice.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_OPENAI
+#include "muse_openai.h"
+#endif
 
 static const char *TAG = "muse_ble";
 
@@ -79,7 +82,9 @@ static int build_status(char *out, size_t len)
     muse_wifi_status(&w);
     muse_hatch_status_t h;
     muse_hatch_status(&h);
+#if !CONFIG_MUSE_OPENAI
     muse_power_t p = muse_state_power();
+#endif
     char host[MUSE_HOST_MAX + 1], vm[MUSE_VM_MAX + 1];
     muse_settings_hatch_host(host);
     muse_settings_hatch_vm(vm);
@@ -90,6 +95,17 @@ static int build_status(char *out, size_t len)
     json_str(vm_e, sizeof(vm_e), vm);
     json_str(last_e, sizeof(last_e), s_last);
 
+#if CONFIG_MUSE_OPENAI
+    char detail_e[97];
+    json_str(detail_e, sizeof(detail_e), h.detail);
+    return snprintf(out, len,
+                    "{\"name\":\"%s\",\"fw\":\"%s\",\"provider\":\"openai\","
+                    "\"wifi\":{\"on\":%s,\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d},"
+                    "\"openai\":{\"key_set\":%s,\"state\":\"%s\",\"detail\":\"%s\"},\"last\":\"%s\"}",
+                    s_name, esp_app_get_description()->version,
+                    muse_settings_wifi_on() ? "true" : "false", wifi_state_name(w.state), ssid_e, w.ip, w.rssi,
+                    muse_settings_openai_key_len() ? "true" : "false", muse_hatch_state_name(h.state), detail_e, last_e);
+#else
     return snprintf(out, len,
                     "{\"name\":\"%s\",\"fw\":\"%s\",\"battery\":%d,"
                     "\"wifi\":{\"on\":%s,\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d},"
@@ -103,6 +119,7 @@ static int build_status(char *out, size_t len)
                     muse_settings_volume(), muse_settings_speaker_on() ? "true" : "false",
                     muse_settings_mic_gain(), muse_settings_brightness(),
                     muse_settings_sleep_s(), last_e);
+#endif
 }
 
 static bool parse_int(const char *v, int lo, int hi, int *out)
@@ -149,6 +166,14 @@ static void run_command(char *cmd)
         } else {
             muse_settings_set_wifi("", "");   /* every saved network */
         }
+#if CONFIG_MUSE_OPENAI
+    } else if (!strcmp(cmd, "openai.key")) {
+        if (muse_settings_set_openai_key(v) != ESP_OK) res = "error: key not saved";
+    } else if (!strcmp(cmd, "openai.test")) {
+        muse_hatch_test();
+    } else if (!strcmp(cmd, "openai.clear")) {
+        muse_openai_clear_history();
+#endif
     } else if (!strcmp(cmd, "hatch.host")) {
         muse_settings_set_hatch_host(v);
     } else if (!strcmp(cmd, "hatch.vm")) {
@@ -176,7 +201,8 @@ static void run_command(char *cmd)
     }
 
     /* Never echo secrets back. */
-    bool secret = !strcmp(cmd, "wifi.pass") || !strncmp(cmd, "hatch.token", 11);
+    bool secret = !strcmp(cmd, "wifi.pass") || !strncmp(cmd, "hatch.token", 11)
+                  || !strcmp(cmd, "openai.key");
     snprintf(s_last, sizeof(s_last), "%s: %s", cmd, res);
     ESP_LOGI(TAG, "cmd %s%s%s -> %s", cmd, secret ? "" : "=", secret ? "" : v, res);
     muse_state_poke();
