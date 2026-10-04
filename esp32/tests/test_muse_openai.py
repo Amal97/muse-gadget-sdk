@@ -29,27 +29,32 @@ class OpenAIBackendTest(unittest.TestCase):
         (tmp / "esp_err.h").write_text("#pragma once\n"
                                       "typedef int esp_err_t;\n#define ESP_OK 0\n#define ESP_FAIL -1\n")
         cls.binary = tmp / "openai"
+        cls.normal_chrome_binary = tmp / "openai-normal-chrome"
         cjson = ROOT / "managed_components/espressif__cjson/cJSON"
         if not (cjson / "cJSON.c").exists():
             cls.tmp.cleanup()
             raise unittest.SkipTest("Run an ESP-IDF build first to download the cJSON component.")
-        proc = subprocess.run([
+        command = [
             *shlex.split(os.environ.get("CC", "cc")), "-std=gnu11", "-Wall", "-Wextra", "-Werror",
             "-I", str(tmp), "-I", str(cjson), "-I", str(ROOT / "tests"),
             "-I", str(ROOT / "tests/link_fakes"), "-I", str(ROOT / "components/muse"),
             str(tmp / "openai.c"), str(ROOT / "components/muse/muse_openai_codec.c"),
-            str(cjson / "cJSON.c"), "-o", str(cls.binary),
-        ], capture_output=True, text=True)
-        if proc.returncode:
-            cls.tmp.cleanup()
-            raise RuntimeError(proc.stdout + proc.stderr)
+            str(cjson / "cJSON.c"),
+        ]
+        for binary, flags in ((cls.binary, []),
+                              (cls.normal_chrome_binary, ["-DCONFIG_MUSE_OPENCLAW_NORMAL_CHROME=1"])):
+            proc = subprocess.run([*command, *flags, "-o", str(binary)], capture_output=True, text=True)
+            if proc.returncode:
+                cls.tmp.cleanup()
+                raise RuntimeError(proc.stdout + proc.stderr)
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.tmp.cleanup()
 
-    def run_case(self, case: int) -> None:
-        proc = subprocess.run([str(self.binary), str(case)], capture_output=True, text=True)
+    def run_case(self, case: int, *, normal_chrome: bool = False) -> None:
+        binary = self.normal_chrome_binary if normal_chrome else self.binary
+        proc = subprocess.run([str(binary), str(case)], capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
     def test_voice_pipeline_wav_upload_chat_and_fragmented_pcm(self) -> None:
@@ -81,6 +86,12 @@ class OpenAIBackendTest(unittest.TestCase):
 
     def test_openclaw_routes_only_chat_with_separate_credentials_and_no_failure_fallback(self) -> None:
         self.run_case(9)
+
+    def test_notifications_use_local_tls_ack_after_dismiss_and_pause_asleep_or_busy(self) -> None:
+        self.run_case(10)
+
+    def test_normal_chrome_opt_in_uses_local_skill_without_isolated_browser_fallback(self) -> None:
+        self.run_case(9, normal_chrome=True)
 
 
 class FakeBoard:

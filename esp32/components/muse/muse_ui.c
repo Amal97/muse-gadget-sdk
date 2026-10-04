@@ -43,6 +43,10 @@
 #include "muse_settings_ui.h"
 #include "muse_state.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_OPENCLAW
+#include "muse_openai.h"
+#include "muse_voice.h"
+#endif
 #if CONFIG_MUSE_WATCHER_CAMERA
 #include "boards/watcher_camera.h"
 #endif
@@ -143,6 +147,12 @@ static int s_preview_brightness = -1;
 static int s_shown_page = -1;
 static int s_shown_speaker = -1;
 static muse_mode_t s_last_mode = MUSE_MODE_COUNT;
+#if CONFIG_MUSE_OPENCLAW
+static lv_obj_t *s_notification_card, *s_notification_sender, *s_notification_preview;
+static char s_notification_id[33];
+static float s_notification_seconds;
+static float s_notification_tick;
+#endif
 
 /*
  * While Muse is thinking or speaking it shrinks to make room for the reply:
@@ -990,9 +1000,81 @@ static void on_any_press(lv_event_t *e)
     muse_state_poke();
 }
 
+#if CONFIG_MUSE_OPENCLAW
+static void dismiss_notification(lv_event_t *e)
+{
+    (void)e;
+    muse_openai_notification_dismiss();
+    s_notification_id[0] = '\0';
+    lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
+    ESP_LOGI(TAG, "iMessage notification dismissed");
+}
+
+static void update_notification(muse_mode_t mode, float now, bool visible)
+{
+    static muse_notification_t notification;
+    float elapsed = s_notification_tick ? now - s_notification_tick : 0;
+    s_notification_tick = now;
+    if (!visible || mode != MUSE_MODE_IDLE || !muse_openai_notification(&notification)) {
+        lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    if (strcmp(notification.id, s_notification_id)) {
+        strlcpy(s_notification_id, notification.id, sizeof(s_notification_id));
+        lv_label_set_text(s_notification_sender, notification.sender);
+        lv_label_set_text(s_notification_preview, notification.preview);
+        s_notification_seconds = 0;
+        elapsed = 0;
+        if (muse_settings_speaker_on()) muse_voice_request_chirp();
+        ESP_LOGI(TAG, "iMessage notification displayed");
+    } else if (lv_obj_has_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN)) {
+        elapsed = 0;
+    }
+    s_notification_seconds += elapsed;
+    if (s_notification_seconds >= 15) {
+        dismiss_notification(NULL);
+        return;
+    }
+    lv_obj_remove_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void build_notification(lv_obj_t *parent)
+{
+    int width = s_w * 3 / 5, height = s_h / 3;
+    s_notification_card = lv_obj_create(parent);
+    lv_obj_set_size(s_notification_card, width, height);
+    lv_obj_align(s_notification_card, LV_ALIGN_CENTER, 0, s_small ? 0 : s_h / 5);
+    lv_obj_set_style_bg_color(s_notification_card, lv_color_hex(COLOR_RING_BG), 0);
+    lv_obj_set_style_bg_opa(s_notification_card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(s_notification_card, lv_color_hex(COLOR_ACCENT), 0);
+    lv_obj_set_style_border_width(s_notification_card, 1, 0);
+    lv_obj_set_style_pad_all(s_notification_card, s_small ? 3 : 10, 0);
+    lv_obj_remove_flag(s_notification_card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_notification_card, dismiss_notification, LV_EVENT_CLICKED, NULL);
+    const lv_font_t *font = s_small ? FONT_COMPACT : &lv_font_montserrat_16;
+    s_notification_sender = make_label(s_notification_card, font, COLOR_ACCENT);
+    lv_obj_set_width(s_notification_sender, LV_PCT(100));
+    lv_obj_set_height(s_notification_sender, s_small ? 14 : 20);
+    lv_label_set_long_mode(s_notification_sender, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_notification_sender, LV_ALIGN_TOP_MID, 0, 0);
+    s_notification_preview = make_label(s_notification_card, font, COLOR_CAPTION);
+    lv_obj_set_width(s_notification_preview, LV_PCT(100));
+    lv_obj_set_height(s_notification_preview, height - (s_small ? 34 : 64));
+    lv_label_set_long_mode(s_notification_preview, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_notification_preview, LV_ALIGN_TOP_MID, 0, s_small ? 15 : 26);
+    lv_obj_t *hint = make_label(s_notification_card, FONT_COMPACT, COLOR_DIM);
+    lv_label_set_text(hint, s_small ? "iMessage" : "iMessage - tap to dismiss");
+    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, 0);
+}
+#endif
+
 static void build_overlays(void)
 {
     lv_obj_t *scr = lv_screen_active();
+#if CONFIG_MUSE_OPENCLAW
+    build_notification(scr);
+#endif
 
     /* Page dots. */
     for (int i = 0; i < 2 && s_tv; i++) {
@@ -1455,19 +1537,31 @@ static void frame_tick(lv_timer_t *timer)
         s_last_mode = mode;
     }
     if (update_sleep()) {
+#if CONFIG_MUSE_OPENCLAW
+        update_notification(mode, now, false);
+#endif
         return;
     }
     update_chrome(now);
     if (muse_menu_tick(now)) {
         image_hide_locked();
+#if CONFIG_MUSE_OPENCLAW
+        update_notification(mode, now, false);
+#endif
         return;   /* the menu covers the face */
     }
     if (s_image_dsc.data) {
+#if CONFIG_MUSE_OPENCLAW
+        update_notification(mode, now, false);
+#endif
         return;   /* the image covers the face */
     }
     if (s_tv && lv_obj_get_scroll_x(s_tv) != 0) {
         /* Off screen, or sliding to or from settings: hold still so the
          * slide gets the whole frame time. */
+#if CONFIG_MUSE_OPENCLAW
+        update_notification(mode, now, false);
+#endif
         return;
     }
 
@@ -1486,6 +1580,9 @@ static void frame_tick(lv_timer_t *timer)
     invalidate_muse();
 
     update_status(mode, now);
+#if CONFIG_MUSE_OPENCLAW
+    update_notification(mode, now, true);
+#endif
 }
 
 esp_err_t muse_ui_start(void)

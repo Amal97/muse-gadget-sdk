@@ -237,8 +237,9 @@ but use OpenClaw for text conversations. OpenAI still transcribes recordings
 and generates speech. This does not require a Muse account, and is not a
 replacement Arduino firmware for a generic ESP32 board.
 
-The included Python-standard-library HTTPS bridge exposes **only** the chat
-endpoint, authenticates the device with its own token, and forwards to a
+The included Python-standard-library HTTPS bridge exposes the chat endpoint
+and an opt-in local notification endpoint, authenticates the device with its
+own token, and forwards chat to a
 loopback-only OpenClaw gateway. By default it requires a dedicated `esp32`
 agent with `tools.deny: ["*"]`. Clients cannot select your main agent or
 access other gateway endpoints. Computer-control tools require the explicit
@@ -324,7 +325,7 @@ the existing CA before expiry. Replacing the CA requires rebuilding and
 reflashing the board.
 
 Host coverage includes `python3 -m unittest tests/test_muse_openai.py
-tests/test_muse_openclaw.py`.
+tests/test_muse_openclaw.py tests/test_muse_messages.py`.
 
 #### Opting into computer control
 
@@ -360,7 +361,7 @@ other agents' policies. Do not change global defaults or the main agent.
 
 The firmware's OpenClaw prompt permits available tools and requires tool
 results before claiming an action succeeded. It requests the managed
-`openclaw` browser profile instead of assuming a browser relay is attached.
+`openclaw` browser profile by default instead of assuming a browser relay is attached.
 If your existing browser configuration uses `attachOnly`, start a separate
 browser instance with that profile's debugging port and user-data directory
 (and arrange login startup if desired); keep the debugging endpoint on
@@ -375,6 +376,143 @@ To revoke computer control, restore the ESP32 agent's `tools.deny: ["*"]`,
 remove `--allow-computer-control` from the bridge service, and restart it.
 Restore that agent's previous exec-approval policy as well. Use the
 on-screen direct-OpenAI option to disconnect the board from OpenClaw entirely.
+
+#### Optional normal signed-in Chrome (macOS, Chrome 144+)
+
+For browser-wide access to existing sessions without attaching individual
+tabs, Chrome supports [consent-enabled auto-connect](https://developer.chrome.com/docs/devtools/agents/use-cases/auto-connect).
+This exposes signed-in sites and all normal tabs in the connected Chrome
+Stable profile. The agent can act with those accounts; requested page
+content may enter OpenClaw's configured model context and local transcripts.
+Use only on a trusted device. Do not copy cookies, clone Chrome profiles,
+or disable Chrome's permission checks.
+
+1. Install the pinned official Chrome tools in private Mac state:
+
+   ```sh
+   mkdir -p "$HOME/.openclaw/muse-esp32/browser-tools"
+   cp tools/muse/chrome/package.json "$HOME/.openclaw/muse-esp32/browser-tools/"
+   npm install --prefix "$HOME/.openclaw/muse-esp32/browser-tools" --ignore-scripts
+   cp tools/muse/normal_chrome.py "$HOME/.openclaw/muse-esp32/"
+   ```
+
+   The official CLI interface is experimental and pinned to version 1.10.1.
+   Upgrades require checking CLI/daemon-client syntax and output and rerunning
+   the adapter tests.
+2. Copy `tools/muse/normal-chrome-skill/SKILL.md` into the **ESP32 agent's**
+   workspace at `skills/normal-chrome/SKILL.md`. Add an agent instruction to
+   require `python3 "$HOME/.openclaw/muse-esp32/normal_chrome.py"` with JSON
+   parameters for every browser action and to read the skill for actual
+   command names, such as `new_page` and `evaluate_script`, rather than
+   executing placeholders like `TOOL`. Instruct it not to substitute
+   AppleScript, `osascript`, `open`, or direct Chrome launch commands if the
+   helper fails. These are model instructions, not permission boundaries
+   under unrestricted exec access. Add `"browser"` to **only that agent's**
+   existing `tools.deny` list, preserving other denied tools, to prevent native
+   isolated-profile fallback. Keep its full/exec tool access and the main
+   agent's/global browser settings unchanged. Restart the gateway.
+3. In your ordinary signed-in Chrome, enable
+   `chrome://inspect/#remote-debugging`. Keep Chrome open and click **Allow**
+   when Chrome requests the browser-wide connection. Chrome may require fresh
+   consent after restarting; no per-tab attachment or new website login is
+   required while your existing sessions remain valid.
+4. Add `CONFIG_MUSE_OPENCLAW_NORMAL_CHROME=y` to the hybrid build's local
+   SDK configuration defaults, rebuild, verify it is enabled in the generated
+   SDK configuration, and flash. The option defaults off for other setups.
+5. Disable any dedicated ESP32 isolated-Chrome login launcher if no longer
+   wanted. Do not automatically close its existing windows or erase its
+   profile, which may contain user work.
+
+The helper uses a dedicated local Chrome-tools daemon, auto-connects only
+to the normal Stable profile, disables usage statistics and CrUX URL
+reporting, and saves requested screenshots/downloads under
+`~/.openclaw/muse-esp32/browser-files`. It never launches a replacement
+browser when normal Chrome or permission is unavailable. Repeated tool
+calls reuse the connection. Opening a tab exposes only the new tab's
+metadata to the agent; closing a tab does not disclose the newly selected
+unrelated tab. New tabs open in the foreground. Explicitly listing tabs
+returns their titles/URLs, so do not request or log unrelated browser data.
+Tool parameters are supplied as a JSON object, not the native CLI's positional
+arguments. Actions use the pinned package's existing-daemon client directly,
+so losing the daemon cannot trigger the CLI's default isolated-browser launch.
+
+Test with `python3 tools/muse/normal_chrome.py status`. A running daemon
+does not by itself prove Chrome consent or connectivity: also perform a safe
+blank-tab action. `python3 tools/muse/normal_chrome.py stop` disconnects the
+adapter without closing normal Chrome. To revoke access, disable remote
+debugging in Chrome and stop the adapter. Restore the ESP32 agent's former
+browser policy and clear the firmware opt-in if returning to the isolated
+setup. Host coverage: `python3 -m unittest tests/test_normal_chrome.py
+tests/test_muse_openai.py`.
+
+#### Optional iMessage sending and incoming previews (macOS)
+
+Install the standard `imsg` CLI and sign into Messages.app. Copy
+`tools/muse/imessage-skill/SKILL.md` into **the ESP32 agent's workspace**
+at `skills/imsg/SKILL.md`, then restart the gateway. The skill is not
+automatically loaded from another agent's workspace. Sending requires
+computer-control tools; keep recipient/text confirmation even if shell
+commands otherwise run without approval. The skill explicitly selects
+iMessage and disables SMS fallback. A CLI submission does not prove delivery.
+Confirmation and no-retry rules are model instructions, not a hard security
+boundary: an agent with unrestricted shell tools can bypass them. Review
+the recipient and text carefully, and check an uncertain send result before
+authorizing another attempt.
+
+The board's OpenAI voice key and the Mac's OpenClaw credentials are separate.
+An accepted board key does not prove that the Mac has a valid model credential.
+Fix authentication for the dedicated ESP32 agent without replacing another
+agent's credentials. Never paste API keys into chat, commit them, or include
+them in shell arguments. If a key has been shared in chat, rotation is advised.
+
+Grant macOS **Privacy & Security > Full Disk Access** to the actual
+background service hosts (Homebrew `python3`, `node`, and `imsg` as needed),
+not only VS Code or your terminal. Use the file chooser's Command-Shift-G
+to select binaries in `/opt/homebrew/bin`. Restart services after changes;
+Homebrew upgrades can require renewing permissions. Sending additionally
+requires macOS **Automation** permission for the gateway host to control
+Messages. Never bypass privacy protections or use injection features.
+First verify access under the actual login-service context.
+
+Enable incoming alerts by adding `--imessages` to the bridge's launch command:
+
+```sh
+python3 tools/muse/openclaw_bridge.py serve --bind COMPUTER-IP \
+  --allow-computer-control --imessages
+```
+
+The OpenClaw firmware polls authenticated `POST /v1/notifications` approximately
+every five seconds while awake, idle, and connected. It shows the sender's
+phone/email and a short text preview over the Muse face, with one chirp
+(respecting speaker mute and volume). Tap the card to dismiss, or let it
+dismiss after 15 seconds of visible time. Alerts pause during voice turns,
+menus, images, and settings. They do not wake the sleeping display or keep
+Wi-Fi awake on battery; queued alerts appear when the device wakes. The
+Mac must remain awake and reachable. Previews are not automatically read
+aloud or used as a voice reply's recipient context.
+
+The bridge watches **all new incoming iMessages**, not SMS, outgoing texts,
+reactions, or system events. Initial setup starts at the current database
+row, not the historical inbox. Subsequent bridge restarts resume the durable
+cursor. Plaintext previews are stored privately in
+`~/.openclaw/muse-esp32/messages.sqlite`, with at most 200 queued events.
+When full, ingestion pauses without advancing the cursor; messages can
+be recovered while they remain in the Mac's Messages database. Acknowledgment
+occurs after display/dismissal and retries are idempotent. A board reboot
+before acknowledgment can display the oldest unacknowledged alert again.
+Attachment-only messages get a placeholder; photos and files are not
+downloaded. Sender and preview text are limited to 96 and 256 UTF-8 bytes.
+Glyph rendering depends on the board's fonts.
+
+Incoming previews stay local to the Mac and ESP32: the watcher never calls
+OpenClaw or an AI provider. Deliberately asking the voice agent to read a
+conversation or send a dictated message does send that requested content
+through its configured model and may save it in transcripts. Keep the
+device and local queue private. Watcher, permission, queue, and HTTP failures
+are reported in bridge/device logs, without message bodies or sender IDs.
+Removing `--imessages` and restarting stops incoming delivery; deleting
+the private queue deliberately resets the baseline at next setup. Do not
+delete it merely to hide a permission error.
 
 The USB console also accepts `>openai.key=KEY`, `>openai.test`,
 `>openai.clear`, and the existing Wi-Fi setup commands. Key values are never

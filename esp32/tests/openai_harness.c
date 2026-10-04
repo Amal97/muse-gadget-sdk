@@ -4,6 +4,7 @@
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,11 +42,13 @@
 #define portENTER_CRITICAL(lock) ((void)(lock))
 #define portEXIT_CRITICAL(lock) ((void)(lock))
 typedef int portMUX_TYPE;
+typedef int TickType_t;
 typedef int SemaphoreHandle_t;
 typedef struct { unsigned count, size, limit; unsigned char data[8][128]; } fake_queue_t;
 typedef fake_queue_t *QueueHandle_t;
 static QueueHandle_t feeder_queue;
 static void (*job_feeder)(void);
+static jmp_buf worker_exit;
 
 static SemaphoreHandle_t xSemaphoreCreateMutex(void) { return 1; }
 static void xSemaphoreTake(int lock, int wait) { (void)lock; (void)wait; }
@@ -72,7 +75,10 @@ static int xQueueReceive(QueueHandle_t queue, void *value, int wait)
 {
     (void)wait;
     if (!queue->count && queue == feeder_queue && job_feeder) job_feeder();
-    if (!queue->count) return 0;
+    if (!queue->count) {
+        if (queue == feeder_queue) longjmp(worker_exit, 1);
+        return 0;
+    }
     memcpy(value, queue->data[0], queue->size);
     queue->count--;
     memmove(queue->data[0], queue->data[1], queue->count * sizeof(queue->data[0]));
@@ -94,6 +100,8 @@ static int xTaskCreate(void (*fn)(void *), const char *name, unsigned stack, voi
 static void *heap_caps_malloc(size_t size, int caps) { (void)caps; return malloc(size); }
 static void mbedtls_platform_zeroize(void *ptr, size_t size) { memset(ptr, 0, size); }
 static bool wifi_on = true, speaker_on = true;
+static bool asleep;
+bool muse_state_asleep(void) { return asleep; }
 bool muse_wifi_connected(void) { return wifi_on; }
 bool muse_settings_speaker_on(void) { return speaker_on; }
 size_t muse_settings_openai_key_len(void) { return 8; }
@@ -155,7 +163,8 @@ esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *co
     if (!strncmp(config->url, "https://api.openai.com/v1/", 26)) {
         assert(config->cert_pem == openai_test_root && !config->common_name);
     } else {
-        assert(!strcmp(config->url, "https://192.168.1.72:8765/v1/chat/completions"));
+        assert(!strcmp(config->url, "https://192.168.1.72:8765/v1/chat/completions")
+               || !strcmp(config->url, "https://192.168.1.72:8765/v1/notifications"));
         assert(config->cert_pem == openclaw_test_root);
         assert(!strcmp(config->common_name, "muse-openclaw.local"));
     }
@@ -225,7 +234,14 @@ static int esp_http_client_close(esp_http_client_handle_t client) { (void)client
 int esp_http_client_cleanup(esp_http_client_handle_t client) { (void)client; closed_count++; return 0; }
 
 /* Production source is inserted here by test_muse_openai.py. */
+#define worker worker_task
 /* OPENAI_IMPLEMENTATION */
+#undef worker
+
+static void worker(void *arg)
+{
+    if (!setjmp(worker_exit)) worker_task(arg);
+}
 
 static const char transcript[] = "{\"text\":\"Hello there\"}";
 static const char answer[] = "{\"choices\":[{\"message\":{\"content\":\"Hello friend.\"},\"finish_reason\":\"stop\"}]}";
@@ -474,7 +490,21 @@ static void hybrid_pipeline(void)
     assert(!strcmp(cJSON_GetObjectItem(body, "model")->valuestring, "openclaw:esp32"));
     const char *prompt = cJSON_GetObjectItem(
         cJSON_GetArrayItem(cJSON_GetObjectItem(body, "messages"), 0), "content")->valuestring;
+    assert(strlen(prompt) < 2047);
     assert(strstr(prompt, "Use available tools") && strstr(prompt, "tool result confirms success"));
+    assert(strstr(prompt, "confirm the exact") && strstr(prompt, "named --to and --text")
+           && strstr(prompt, "--no-sms-fallback") && strstr(prompt, "retry a failed send"));
+#if CONFIG_MUSE_OPENCLAW_NORMAL_CHROME
+    assert(strstr(prompt, "read the normal-chrome skill") && strstr(prompt, "Never use the isolated"));
+    assert(strstr(prompt, "python3 \"$HOME/.openclaw/muse-esp32/normal_chrome.py\"")
+           && strstr(prompt, "JSON tool parameters") && strstr(prompt, "Do not use AppleScript")
+           && strstr(prompt, "instead of trying another method"));
+    assert(strstr(prompt, "Use new_page with url") && strstr(prompt, "evaluate_script with")
+           && strstr(prompt, "with the read tool") && strstr(prompt, "() => document.title"));
+    assert(!strstr(prompt, "For browser actions, use the openclaw profile"));
+#else
+    assert(strstr(prompt, "For browser actions, use the openclaw profile"));
+#endif
     assert(!strstr(prompt, "Do not claim to control devices"));
     cJSON_Delete(body);
     muse_hatch_turn_cancel();
@@ -500,6 +530,55 @@ static void hybrid_pipeline(void)
     worker(NULL);
     assert(client_count == 3 && clients[1].config.cert_pem == openai_test_root);
 }
+
+static void incoming_notifications(void)
+{
+    use_openclaw = true;
+    const char message[] = "{\"notification\":{\"id\":\"0123456789abcdef0123456789abcdef\","
+                           "\"sender\":\"Test sender\",\"preview\":\"Test preview\"}}";
+    fixture(message, strlen(message), 200, "application/json");
+    poll_notifications();
+    muse_notification_t notification;
+    assert(muse_openai_notification(&notification));
+    assert(!strcmp(notification.sender, "Test sender"));
+    assert(!strcmp(notification.preview, "Test preview"));
+    assert(!strcmp(paths[0], "https://192.168.1.72:8765/v1/notifications"));
+    assert(clients[0].config.timeout_ms == 2000);
+    assert(clients[0].config.cert_pem == openclaw_test_root);
+    assert(!strcmp(clients[0].upload, "{\"ack\":\"\"}"));
+    poll_notifications();
+    assert(client_count == 1);
+    muse_openai_notification_dismiss();
+    assert(!muse_openai_notification(&notification));
+    asleep = true;
+    poll_notifications();
+    assert(client_count == 1);
+    asleep = false;
+    atomic_store(&s_busy, true);
+    poll_notifications();
+    assert(client_count == 1);
+    atomic_store(&s_busy, false);
+    fixture("{}", 2, 503, "application/json");
+    poll_notifications();
+    assert(s_notification_ack[0] && client_count == 2);
+    const char empty[] = "{\"notification\":null}";
+    fixture(empty, strlen(empty), 200, "application/json");
+    poll_notifications();
+    assert(!s_notification_ack[0] && !muse_openai_notification(&notification));
+    assert(strstr(clients[2].upload, "0123456789abcdef0123456789abcdef"));
+    const char invalid[] = "{\"notification\":{\"id\":\"bad\",\"sender\":\"x\",\"preview\":\"y\"}}";
+    fixture(invalid, strlen(invalid), 200, "application/json");
+    poll_notifications();
+    assert(!muse_openai_notification(&notification));
+    fixture(message, strlen(message), 200, "application/json");
+    poll_notifications();
+    assert(muse_openai_notification(&notification));
+    muse_hatch_config_changed();
+    assert(!muse_openai_notification(&notification) && !s_notification_ack[0]);
+    use_openclaw = false;
+    poll_notifications();
+    assert(client_count == 5);
+}
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -515,6 +594,7 @@ int main(int argc, char **argv)
     case 7: bounded_history(); break;
     case 8: clear_active_voice(); break;
     case 9: hybrid_pipeline(); break;
+    case 10: incoming_notifications(); break;
     default: return 2;
     }
     muse_hatch_turn_cancel();

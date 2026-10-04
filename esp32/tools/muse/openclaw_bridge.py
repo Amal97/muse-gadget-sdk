@@ -5,20 +5,25 @@ from __future__ import annotations
 
 import argparse
 import http.client
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import ssl
 import subprocess
 import sys
+import threading
+
+from openclaw_messages import MessageInbox
 
 STATE = Path.home() / ".openclaw/muse-esp32"
 GATEWAY_CONFIG = Path.home() / ".openclaw/openclaw.json"
 IDENTITY = "muse-openclaw.local"
 CHAT_PATH = "/v1/chat/completions"
+NOTIFICATION_PATH = "/v1/notifications"
 JSON_CAP = 16384
 TEXT_CAP = 2048
 
@@ -125,9 +130,11 @@ def agent_reply(config_path: Path, messages: list[dict[str, str]], *,
         connection.close()
 
 
-class BridgeServer(HTTPServer):
+class BridgeServer(ThreadingHTTPServer):
+    daemon_threads = True
+
     def __init__(self, address: tuple[str, int], state: Path, config_path: Path, *,
-                 allow_computer_control: bool = False) -> None:
+                 allow_computer_control: bool = False, imessages: bool = False) -> None:
         gateway_credentials(config_path, allow_computer_control=allow_computer_control)
         token = read_object(state / "bridge.json").get("device_token")
         if not isinstance(token, str) or len(token) < 32 or not token.isascii():
@@ -135,10 +142,37 @@ class BridgeServer(HTTPServer):
         self.device_token = token
         self.config_path = config_path
         self.allow_computer_control = allow_computer_control
+        self.chat_lock = threading.Lock()
+        self.clients = threading.BoundedSemaphore(8)
+        self.inbox = MessageInbox(state) if imessages else None
         self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.tls.minimum_version = ssl.TLSVersion.TLSv1_2
         self.tls.load_cert_chain(state / "server.pem", state / "server-key.pem")
         super().__init__(address, BridgeHandler)
+        if self.inbox is not None:
+            self.inbox.start()
+
+    def server_close(self) -> None:
+        if self.inbox is not None:
+            self.inbox.close()
+        super().server_close()
+
+    def process_request(self, request, client_address) -> None:
+        if not self.clients.acquire(blocking=False):
+            self.shutdown_request(request)
+            logging.warning("Bridge connection limit reached.")
+            return
+        try:
+            super().process_request(request, client_address)
+        except RuntimeError:
+            self.clients.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.clients.release()
 
     def get_request(self) -> tuple[ssl.SSLSocket, tuple[str, int]]:
         connection, address = super().get_request()
@@ -173,8 +207,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
         server = self.server
         if not isinstance(server, BridgeServer):
             raise RuntimeError("Invalid bridge server.")
-        if self.path != CHAT_PATH:
-            self.reject(404, "Only the chat endpoint is available.")
+        if self.path not in (CHAT_PATH, NOTIFICATION_PATH):
+            self.reject(404, "Unknown bridge endpoint.")
             return
         authorization = self.headers.get("Authorization", "").encode("utf-8")
         if not secrets.compare_digest(authorization, ("Bearer " + server.device_token).encode()):
@@ -194,9 +228,26 @@ class BridgeHandler(BaseHTTPRequestHandler):
             data = self.rfile.read(size)
             if len(data) != size:
                 raise ValueError("Incomplete request.")
-            messages = validate_messages(json.loads(data))
+            body = json.loads(data)
+            if self.path == NOTIFICATION_PATH:
+                if not isinstance(body, dict) or set(body) != {"ack"}:
+                    raise ValueError("Expected a notification acknowledgment.")
+                if server.inbox is None:
+                    self.reject(404, "Incoming iMessages are not enabled.")
+                    return
+                result = server.inbox.poll(body["ack"])
+                self.send_json(200, json.dumps(result, ensure_ascii=False).encode())
+                return
+            messages = validate_messages(body)
         except (ValueError, UnicodeError):
-            self.reject(400, "Invalid chat request.")
+            self.reject(400, "Invalid bridge request.")
+            return
+        except (RuntimeError, sqlite3.Error):
+            logging.error("Incoming iMessages unavailable; check watcher status and Messages permissions.")
+            self.reject(503, "Incoming iMessages unavailable; check the bridge log.")
+            return
+        if not server.chat_lock.acquire(blocking=False):
+            self.reject(409, "Another chat request is still running.")
             return
         try:
             reply = agent_reply(server.config_path, messages,
@@ -205,6 +256,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             logging.exception("OpenClaw chat request failed.")
             self.reject(502, "OpenClaw request failed; check the bridge log.")
             return
+        finally:
+            server.chat_lock.release()
         self.send_json(200, reply)
 
 
@@ -259,6 +312,8 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--allow-computer-control", action="store_true",
                         help="explicitly permit the ESP32 agent's full computer-control tool profile")
+    parser.add_argument("--imessages", action="store_true",
+                        help="queue local incoming-iMessage previews (requires Messages Full Disk Access)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -266,14 +321,15 @@ def main() -> int:
             prepare(args.state)
         else:
             with BridgeServer((args.bind, args.port), args.state, args.openclaw_config,
-                              allow_computer_control=args.allow_computer_control) as server:
+                              allow_computer_control=args.allow_computer_control,
+                              imessages=args.imessages) as server:
                 if args.allow_computer_control:
                     logging.warning("Computer control enabled: device requests can run tools on this computer.")
                 logging.info("Muse HTTPS chat bridge listening on %s:%d", args.bind, args.port)
                 server.serve_forever()
     except KeyboardInterrupt:
         return 0
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, sqlite3.Error, subprocess.CalledProcessError) as error:
         logging.error("Bridge stopped: %s", error)
         return 1
     return 0

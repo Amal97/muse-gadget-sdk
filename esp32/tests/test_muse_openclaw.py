@@ -16,6 +16,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest.mock import Mock, patch
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools/muse"
 
@@ -129,6 +130,52 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.request({}, path="/tools/invoke")[0], 404)
         self.assertEqual(self.request({}, path=bridge.CHAT_PATH + "?model=main")[0], 404)
         self.assertEqual(Upstream.records, [])
+
+    def test_notification_endpoint_is_authenticated_local_and_opt_in(self) -> None:
+        self.assertEqual(self.request({"ack": ""}, path=bridge.NOTIFICATION_PATH)[0], 404)
+        inbox = Mock()
+        inbox.poll.return_value = {"notification": {"id": "a" * 32, "sender": "Test", "preview": "Hello"}}
+        with patch.object(self.server, "inbox", inbox):
+            self.assertEqual(self.request({"ack": ""}, path=bridge.NOTIFICATION_PATH, token="wrong")[0], 401)
+            self.assertEqual(self.request({}, path=bridge.NOTIFICATION_PATH)[0], 400)
+            self.assertEqual(self.request({"ack": "", "model": "main"}, path=bridge.NOTIFICATION_PATH)[0], 400)
+            code, result = self.request({"ack": ""}, path=bridge.NOTIFICATION_PATH)
+            self.assertEqual(code, 200)
+            self.assertEqual(result["notification"]["preview"], "Hello")
+            inbox.poll.assert_called_once_with("")
+            inbox.poll.side_effect = RuntimeError("Watcher unavailable.")
+            with self.assertLogs(level="ERROR"):
+                self.assertEqual(self.request({"ack": ""}, path=bridge.NOTIFICATION_PATH)[0], 503)
+            inbox.poll.side_effect = ValueError("Unknown acknowledgment.")
+            self.assertEqual(self.request({"ack": "bad"}, path=bridge.NOTIFICATION_PATH)[0], 400)
+        self.assertEqual(Upstream.records, [])
+
+    def test_notification_polling_does_not_wait_for_a_long_chat(self) -> None:
+        started, release = threading.Event(), threading.Event()
+        result = []
+
+        def reply(*args, **kwargs):
+            started.set()
+            if not release.wait(4):
+                raise RuntimeError("Test chat timed out.")
+            return b'{"choices":[{"message":{"content":"Done"}}]}'
+
+        inbox = Mock()
+        inbox.poll.return_value = {"notification": None}
+        with patch.object(bridge, "agent_reply", side_effect=reply), \
+                patch.object(self.server, "inbox", inbox):
+            thread = threading.Thread(target=lambda: result.append(
+                self.request({"messages": [{"role": "user", "content": "Long action"}]})))
+            thread.start()
+            try:
+                self.assertTrue(started.wait(2))
+                self.assertEqual(self.request({"ack": ""}, path=bridge.NOTIFICATION_PATH)[0], 200)
+                self.assertFalse(release.is_set())
+                self.assertEqual(self.request({"messages": [{"role": "user", "content": "Other"}]})[0], 409)
+            finally:
+                release.set()
+                thread.join(timeout=5)
+            self.assertEqual(result[0][0], 200)
 
     def test_request_limits_are_utf8_bytes_and_invalid_roles_are_rejected(self) -> None:
         for content, expected in (("x" * 2047, 200), ("x" * 2048, 400),

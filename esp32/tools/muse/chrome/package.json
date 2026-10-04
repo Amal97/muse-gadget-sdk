@@ -1,0 +1,9 @@
+{
+  "name": "muse-normal-chrome-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned local browser tooling for the optional ESP32 normal-Chrome integration.",
+  "dependencies": {
+    "chrome-devtools-mcp": "1.10.1"
+  }
+}

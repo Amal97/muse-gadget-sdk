@@ -50,8 +50,12 @@ static atomic_bool s_busy, s_clear_history;
 static portMUX_TYPE s_status_lock = portMUX_INITIALIZER_UNLOCKED;
 static muse_hatch_state_t s_status = MUSE_HATCH_UNTESTED;
 static char s_detail[48];
+#if CONFIG_MUSE_OPENCLAW
+static muse_notification_t s_notification;
+static char s_notification_ack[33];
+#endif
 
-typedef enum { JOB_VOICE, JOB_TEXT, JOB_TEST } job_kind_t;
+typedef enum { JOB_VOICE, JOB_TEXT, JOB_TEST, JOB_NOTIFICATION } job_kind_t;
 typedef struct {
     job_kind_t kind;
     unsigned generation;
@@ -190,6 +194,10 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
 #if CONFIG_MUSE_OPENCLAW
     if (openclaw) {
         muse_settings_openclaw(url, auth + 7);
+        if (job->kind == JOB_NOTIFICATION) {
+            char *endpoint = strstr(url, "/v1/chat/completions");
+            if (endpoint) strlcpy(endpoint, "/v1/notifications", sizeof(url) - (size_t)(endpoint - url));
+        }
         certificate = openclaw_root_pem;
         common_name = "muse-openclaw.local";
         if (!url[0] || !auth[7]) {
@@ -206,7 +214,7 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
         .method = method,
         .cert_pem = certificate,
         .common_name = common_name,
-        .timeout_ms = 30000,
+        .timeout_ms = job->kind == JOB_NOTIFICATION ? 2000 : 30000,
         .buffer_size = 2048,
         .buffer_size_tx = 2048,
         .disable_auto_redirect = true,
@@ -220,7 +228,7 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
     if (err == ESP_OK && content_type) err = esp_http_client_set_header(client, "Content-Type", content_type);
     size_t total = 0;
     for (size_t i = 0; i < part_count; i++) total += parts[i].size;
-    int64_t deadline = esp_timer_get_time() + REQUEST_US;
+    int64_t deadline = esp_timer_get_time() + (job->kind == JOB_NOTIFICATION ? 5000000 : REQUEST_US);
     if (err == ESP_OK && current(job->generation)) err = esp_http_client_open(client, (int)total);
     if (err != ESP_OK || !current(job->generation)) {
         request_error(openclaw, "HTTPS CONNECT FAILED", why, why_cap);
@@ -407,8 +415,30 @@ static char *complete(const job_t *job, const char *text, cJSON *history, char *
                              openclaw ?
                              "You are a friendly voice companion connected to OpenClaw. "
                              "Use available tools when asked to perform an action. Only claim an action "
-                             "succeeded when its tool result confirms success. For browser actions, "
-                             "use the openclaw profile. Reply in plain text without emoji, "
+                             "succeeded when its tool result confirms success. "
+#if CONFIG_MUSE_OPENCLAW_NORMAL_CHROME
+                             "For browser actions, read the normal-chrome skill and use its local helper "
+                             "through exec to control normal signed-in Chrome. All browser commands must "
+                             "use python3 \"$HOME/.openclaw/muse-esp32/normal_chrome.py\" with JSON tool "
+                             "parameters. Use new_page with url to open a tab, and evaluate_script with "
+                             "the returned pageId and function to inspect or change its DOM. The function "
+                             "must be callable JavaScript such as () => document.title, not a bare "
+                             "assignment. Read skills/normal-chrome/SKILL.md with the read tool before "
+                             "browser actions, including its JSON-escaped string examples. "
+                             "TOOL and OPEN_TAB are not command names. Do not use AppleScript, "
+                             "osascript, open, or other browser "
+                             "launchers for browser actions. If the helper fails, report the error "
+                             "instead of trying another method. Never use the isolated "
+                             "openclaw browser profile or fall back to another browser. "
+#else
+                             "For browser actions, use the openclaw profile. "
+#endif
+                             "Before sending a message, confirm the exact "
+                             "recipient and text. Never infer a reply recipient from a display preview. "
+                             "For iMessage, read the imsg skill and use imsg send with named --to and --text "
+                             "arguments, --service imessage --no-sms-fallback --json. Never use positional "
+                             "send arguments or automatically retry a failed send. "
+                             "Reply in plain text without emoji, "
                              "in at most three short sentences." :
                              "You are a friendly standalone voice companion. Reply in plain text, "
                              "in at most three short sentences. Do not claim to control devices.");
@@ -470,12 +500,102 @@ static bool show_muted_reply(const job_t *job, const char *text)
     return current(job->generation);
 }
 
+#if CONFIG_MUSE_OPENCLAW
+bool muse_openai_notification(muse_notification_t *out)
+{
+    if (!s_data) return false;
+    xSemaphoreTake(s_data, portMAX_DELAY);
+    bool available = s_notification.id[0] && openclaw_chat();
+    if (available) *out = s_notification;
+    xSemaphoreGive(s_data);
+    return available;
+}
+
+void muse_openai_notification_dismiss(void)
+{
+    if (!s_data) return;
+    xSemaphoreTake(s_data, portMAX_DELAY);
+    if (s_notification.id[0]) {
+        strlcpy(s_notification_ack, s_notification.id, sizeof(s_notification_ack));
+        memset(&s_notification, 0, sizeof(s_notification));
+    }
+    xSemaphoreGive(s_data);
+}
+
+static void poll_notifications(void)
+{
+    if (!openclaw_chat() || !muse_settings_openclaw_token_set() || !muse_wifi_connected()
+        || muse_state_asleep() || muse_state_mode(NULL) != MUSE_MODE_IDLE
+        || atomic_load(&s_busy) || time(NULL) < 1700000000) return;
+    char acknowledgment[33];
+    xSemaphoreTake(s_data, portMAX_DELAY);
+    bool pending = s_notification.id[0];
+    strlcpy(acknowledgment, s_notification_ack, sizeof(acknowledgment));
+    xSemaphoreGive(s_data);
+    if (pending) return;
+    job_t job = { .kind = JOB_NOTIFICATION, .generation = atomic_load(&s_generation) };
+    cJSON *body = cJSON_CreateObject();
+    char why[96] = "OPENCLAW NOTIFICATION FAILED";
+    char *response = body && cJSON_AddStringToObject(body, "ack", acknowledgment) ?
+        json_request(&job, "notifications", body, false, true, why, sizeof(why)) : NULL;
+    cJSON_Delete(body);
+    if (!response) {
+        if (current(job.generation)) ESP_LOGW(TAG, "incoming iMessages: %s", why);
+        return;
+    }
+    cJSON *root = cJSON_Parse(response);
+    cJSON *notification = cJSON_GetObjectItemCaseSensitive(root, "notification");
+    muse_notification_t next = {0};
+    bool valid = cJSON_IsNull(notification);
+    if (cJSON_IsObject(notification)) {
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(notification, "id");
+        cJSON *sender = cJSON_GetObjectItemCaseSensitive(notification, "sender");
+        cJSON *text = cJSON_GetObjectItemCaseSensitive(notification, "preview");
+        valid = cJSON_IsString(id) && strlen(id->valuestring) == 32
+            && strspn(id->valuestring, "0123456789abcdef") == 32
+            && cJSON_IsString(sender) && sender->valuestring[0]
+            && strlen(sender->valuestring) < sizeof(next.sender)
+            && cJSON_IsString(text) && text->valuestring[0]
+            && strlen(text->valuestring) < sizeof(next.preview);
+        if (valid) {
+            strlcpy(next.id, id->valuestring, sizeof(next.id));
+            strlcpy(next.sender, sender->valuestring, sizeof(next.sender));
+            strlcpy(next.preview, text->valuestring, sizeof(next.preview));
+        }
+    }
+    cJSON_Delete(root);
+    free(response);
+    if (!valid) {
+        ESP_LOGW(TAG, "incoming iMessages: invalid notification response");
+        return;
+    }
+    xSemaphoreTake(s_data, portMAX_DELAY);
+    if (current(job.generation)) {
+        s_notification = next;
+        s_notification_ack[0] = '\0';
+        if (next.id[0]) ESP_LOGI(TAG, "incoming iMessage queued for display");
+    }
+    xSemaphoreGive(s_data);
+}
+#endif
+
 static void worker(void *arg)
 {
     (void)arg;
     cJSON *history = cJSON_CreateArray();
     job_t job;
-    while (xQueueReceive(s_jobs, &job, portMAX_DELAY) == pdTRUE) {
+#if CONFIG_MUSE_OPENCLAW
+    const TickType_t wait = pdMS_TO_TICKS(5000);
+#else
+    const TickType_t wait = portMAX_DELAY;
+#endif
+    for (;;) {
+        if (xQueueReceive(s_jobs, &job, wait) != pdTRUE) {
+#if CONFIG_MUSE_OPENCLAW
+            poll_notifications();
+#endif
+            continue;
+        }
         char why[96] = "OPENAI REQUEST FAILED";
         char *text = NULL, *reply = NULL;
         if (atomic_exchange(&s_clear_history, false)) {
@@ -735,6 +855,14 @@ void muse_openai_clear_history(void)
 void muse_hatch_config_changed(void)
 {
     muse_openai_clear_history();
+#if CONFIG_MUSE_OPENCLAW
+    if (s_data) {
+        xSemaphoreTake(s_data, portMAX_DELAY);
+        memset(&s_notification, 0, sizeof(s_notification));
+        s_notification_ack[0] = '\0';
+        xSemaphoreGive(s_data);
+    }
+#endif
     report(MUSE_HATCH_UNTESTED, "Ready to talk");
 }
 
