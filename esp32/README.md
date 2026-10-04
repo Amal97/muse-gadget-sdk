@@ -497,6 +497,8 @@ details in place, scroll vertically for longer text, and tap the collapse hint
 to return to the preview. This does not navigate to Settings or change your
 remembered screen. Dismiss, Reply and Snooze remain available; explicit Review
 actions still open Companion for reply confirmation or timer replacement.
+Expanded popups block taps on the underlying screen. On larger touch displays,
+actions use 48-pixel-high buttons with separated, padded touch targets.
 Incoming message previews dismiss after 15 seconds of visible, collapsed
 time; expanding pauses that timeout, and collapsing starts a fresh 15 seconds.
 Alerts pause during voice turns,
@@ -633,6 +635,8 @@ Grant **full** calendar access to Muse Calendar Reader; write-only access
 cannot read an agenda. Calendar queries launch that authorized app through
 LaunchServices with private temporary request/response files; invoking its
 executable directly can instead inherit the terminal's privacy identity.
+The bridge waits up to 15 seconds for the app's atomic response file rather
+than relying on LaunchServices to wait for the short-lived app to exit.
 Rebuilding the ad-hoc-signed helper may require granting access again.
 Enable all currently readable calendars with
 `{"action":"settings","settings":{"calendars_enabled":true,"calendar_ids":"all"}}`

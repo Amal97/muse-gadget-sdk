@@ -37,7 +37,8 @@ class NotificationUITest(unittest.TestCase):
 typedef int muse_mode_t;
 typedef struct { int unused; } lv_event_t;
 typedef struct { int w,h,flags,mode,scroll_y; char text[2048]; } lv_obj_t;
-static lv_obj_t card,sender,preview,details,dismiss,action,action_label,hint,stop;
+static lv_obj_t backdrop,card,sender,preview,details,dismiss,action,action_label,hint,stop;
+static lv_obj_t *s_notification_backdrop=&backdrop;
 static lv_obj_t *s_notification_card=&card,*s_notification_sender=&sender,*s_notification_preview=&preview;
 static lv_obj_t *s_notification_details=&details,*s_notification_dismiss=&dismiss,*s_notification_action=&action;
 static lv_obj_t *s_notification_action_label=&action_label,*s_notification_hint=&hint,*s_stop_job=&stop;
@@ -78,9 +79,12 @@ int main(void){
     strcpy(incoming.preview,"Preview");
     memset(incoming.body,'X',2047);incoming.body[2047]=0;
     update_notification(MUSE_MODE_IDLE,1,true);
+    assert(card.h==233 && details.h==85);
     assert(!strcmp(preview.text,"Preview"));
     open_notification(NULL);
     assert(s_notification_expanded && card.w==340 && card.h==302);
+    assert(dismiss.w==138 && action.w==138);
+    assert(!(backdrop.flags&LV_OBJ_FLAG_HIDDEN));
     assert(details.flags&LV_OBJ_FLAG_SCROLLABLE);
     assert(preview.h==LV_SIZE_CONTENT && preview.mode==LV_LABEL_LONG_MODE_WRAP);
     assert(strlen(preview.text)==2047 && !strcmp(preview.text,incoming.body));
@@ -93,6 +97,7 @@ int main(void){
     assert(!strcmp(preview.text,"Updated details") && s_notification_expanded);
     open_notification(NULL);
     assert(!s_notification_expanded && details.scroll_y==0);
+    assert(backdrop.flags&LV_OBJ_FLAG_HIDDEN);
     assert(!(details.flags&LV_OBJ_FLAG_SCROLLABLE) && preview.mode==LV_LABEL_LONG_DOT);
     assert(!strcmp(preview.text,"Preview") && s_notification_seconds==0);
     update_notification(MUSE_MODE_IDLE,103,true);
@@ -112,12 +117,18 @@ int main(void){
     assert(s_notification_expanded && !strcmp(preview.text,"Time is up."));
     available=false;update_notification(MUSE_MODE_IDLE,122,true);
     assert(!s_notification_expanded && lv_obj_has_flag(&card,LV_OBJ_FLAG_HIDDEN));
+    assert(backdrop.flags&LV_OBJ_FLAG_HIDDEN);
     available=true;strcpy(incoming.kind,"reply_wait");
     update_notification(MUSE_MODE_IDLE,123,true);open_notification(NULL);
     assert(strstr(hint.text,"hold Talk to reply"));
     update_notification(MUSE_MODE_THINKING,124,true);
     assert(!s_notification_expanded && lv_obj_has_flag(&card,LV_OBJ_FLAG_HIDDEN));
     assert(navigations==0);
+    s_small=true;s_w=s_h=240;
+    notification_layout(false);
+    assert(card.h==96 && details.h==32 && dismiss.w==56);
+    notification_layout(true);
+    assert(card.w==232 && card.h==232 && details.h==168);
     return 0;
 }
 '''

@@ -102,6 +102,8 @@ static lv_obj_t *s_replace_timer, *s_cancel_replace, *s_replace_timer_text;
 static unsigned s_shown_replace_seconds;
 static char *s_companion_view;
 static char s_companion_detail[2048], s_reminder_title[161], s_draft_id[33], s_latest_job[33];
+/* LVGL callbacks are serialized; keep their large conversion scratch off the task stack. */
+static char s_companion_shown[2048];
 static char s_calendar_ids[32][257];
 static unsigned s_companion_view_version = UINT32_MAX;
 static int64_t s_companion_refresh;
@@ -1384,13 +1386,12 @@ static void build_power_page(lv_obj_t *tile)
 #if CONFIG_MUSE_OPENCLAW
 static lv_obj_t *companion_note(lv_obj_t *list, const char *text)
 {
-    char shown[2048];
     lv_obj_t *l = lv_label_create(list);
     lv_obj_set_width(l, lv_pct(100));
     lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(l, lv_color_hex(COLOR_DIM), 0);
     lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
-    lv_label_set_text(l, muse_text_showable(text, shown, sizeof(shown)));
+    lv_label_set_text(l, muse_text_showable(text, s_companion_shown, sizeof(s_companion_shown)));
     return l;
 }
 
@@ -1601,11 +1602,10 @@ static void fill_companion(void)
         companion_note(s_companion_list, json_text(draft, "detail"));
         strlcpy(s_draft_id, json_text(draft, "id"), sizeof(s_draft_id));
         if (!strcmp(json_text(draft, "state"), "unconfirmed")) {
-            char shown[2048];
             const char *text = json_text(draft, "text");
-            bool exact = !strcmp(text, muse_text_showable(text, shown, sizeof(shown)));
+            bool exact = !strcmp(text, muse_text_showable(text, s_companion_shown, sizeof(s_companion_shown)));
             const char *recipient = json_text(draft, "recipient");
-            exact = exact && !strcmp(recipient, muse_text_showable(recipient, shown, sizeof(shown)));
+            exact = exact && !strcmp(recipient, muse_text_showable(recipient, s_companion_shown, sizeof(s_companion_shown)));
             if (exact) row(s_companion_list, NULL, "Confirm and send iMessage", NULL,
                            on_draft_action, "reply_confirm");
             else note(s_companion_list, "Unsupported characters: edit to plain text or use Messages. Sending is disabled.");

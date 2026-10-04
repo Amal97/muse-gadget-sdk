@@ -5,6 +5,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -107,7 +108,8 @@ class CompanionTest(unittest.TestCase):
 
     def test_calendar_reader_uses_authorized_app_and_private_exchange(self):
         def launch(arguments, **kwargs):
-            self.assertEqual(arguments[:3], ["/usr/bin/open", "-n", "-W"])
+            self.assertEqual(arguments[:2], ["/usr/bin/open", "-n"])
+            self.assertNotIn("-W", arguments)
             request = Path(arguments[-1])
             self.assertEqual(request.stat().st_mode & 0o777, 0o600)
             self.assertEqual(request.parent.stat().st_mode & 0o777, 0o700)
@@ -116,9 +118,28 @@ class CompanionTest(unittest.TestCase):
             return SimpleNamespace(returncode=0)
         with patch("openclaw_companion.subprocess.run", side_effect=launch):
             self.assertTrue(self.store.calendar_query("status")["authorized"])
-        with patch("openclaw_companion.subprocess.run", return_value=SimpleNamespace(returncode=0)):
+        with patch("openclaw_companion.subprocess.run", return_value=SimpleNamespace(returncode=0)), \
+                patch("openclaw_companion.time.monotonic", side_effect=[0, 16]):
             with self.assertRaisesRegex(RuntimeError, "did not respond"):
                 self.store.calendar_query("status")
+
+    def test_calendar_exchange_waits_for_response_after_early_launch_return(self):
+        workers = []
+        def launch(arguments, **kwargs):
+            response = Path(arguments[-1]).parent / "response.json"
+            def publish():
+                if response.parent.exists():
+                    response.write_text('{"authorized":true,"authorization":3}')
+            worker = threading.Timer(0.1, publish)
+            workers.append(worker)
+            worker.start()
+            return SimpleNamespace(returncode=0)
+        try:
+            with patch("openclaw_companion.subprocess.run", side_effect=launch):
+                self.assertTrue(self.store.calendar_query("status")["authorized"])
+        finally:
+            for worker in workers:
+                worker.join()
 
     def test_stale_confirmation_never_sends_and_keeps_draft_unconfirmed(self):
         inbox = Mock(executable="/test/imsg")

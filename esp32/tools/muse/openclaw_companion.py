@@ -89,11 +89,17 @@ class Companion:
             request.write_text(json.dumps({"command": command, "query": query}), encoding="utf-8")
             request.chmod(0o600)
             result = subprocess.run(
-                ["/usr/bin/open", "-n", "-W", str(self.calendar.parents[2]),
+                ["/usr/bin/open", "-n", str(self.calendar.parents[2]),
                  "--args", "exchange", str(request)],
                 capture_output=True, text=True, timeout=15, check=False)
             response = Path(directory) / "response.json"
-            if result.returncode or not response.is_file():
+            if result.returncode:
+                raise RuntimeError("Calendar reader launch failed; check its installation and permissions.")
+            # The atomic response is authoritative; short-lived apps cannot reliably use open -W.
+            deadline = time.monotonic() + 15
+            while not response.is_file() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if not response.is_file():
                 raise RuntimeError("Calendar reader did not respond; check its installation and permissions.")
             value = json.loads(response.read_text(encoding="utf-8"))
         if not isinstance(value, dict):

@@ -164,7 +164,7 @@ static unsigned s_home_version;
 static float s_home_tick, s_home_refresh;
 static bool s_home_manual_scroll, s_home_selecting;
 static muse_home_navigation_t s_home_navigation;
-static lv_obj_t *s_notification_card, *s_notification_sender, *s_notification_preview;
+static lv_obj_t *s_notification_backdrop, *s_notification_card, *s_notification_sender, *s_notification_preview;
 static lv_obj_t *s_stop_job;
 static lv_obj_t *s_notification_action, *s_notification_action_label, *s_notification_hint;
 static lv_obj_t *s_notification_details, *s_notification_dismiss;
@@ -1280,8 +1280,10 @@ static void notification_layout(bool expanded)
 {
     s_notification_expanded = expanded;
     int width = expanded ? (s_small ? s_w - 8 : s_w * 73 / 100) : s_w * 3 / 5;
-    int height = expanded ? (s_small ? s_h - 8 : s_h * 65 / 100) : s_h * 2 / 5;
-    int body_height = LV_MAX(14, height - (s_small ? 64 : 104));
+    int height = expanded ? (s_small ? s_h - 8 : s_h * 65 / 100) :
+                 s_small ? s_h * 2 / 5 : s_h / 2;
+    int body_height = LV_MAX(14, height - (s_small ? 64 : 148));
+    lv_obj_set_flag(s_notification_backdrop, LV_OBJ_FLAG_HIDDEN, !expanded);
     lv_obj_set_size(s_notification_card, width, height);
     lv_obj_align(s_notification_card, LV_ALIGN_CENTER, 0, expanded || s_small ? 0 : s_h / 10);
     lv_obj_set_height(s_notification_details, body_height);
@@ -1290,8 +1292,8 @@ static void notification_layout(bool expanded)
     lv_label_set_long_mode(s_notification_preview, expanded ? LV_LABEL_LONG_MODE_WRAP : LV_LABEL_LONG_DOT);
     lv_obj_set_height(s_notification_preview, expanded ? LV_SIZE_CONTENT : body_height);
     lv_obj_scroll_to_y(s_notification_details, 0, LV_ANIM_OFF);
-    lv_obj_set_width(s_notification_dismiss, width / 2 - 16);
-    lv_obj_set_width(s_notification_action, width / 2 - 16);
+    lv_obj_set_width(s_notification_dismiss, width / 2 - (s_small ? 16 : 32));
+    lv_obj_set_width(s_notification_action, width / 2 - (s_small ? 16 : 32));
     s_notification_seconds = 0;
     notification_content();
 }
@@ -1408,7 +1410,12 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
 
 static void build_notification(lv_obj_t *parent)
 {
-    int width = s_w * 3 / 5, height = s_h * 2 / 5;
+    int width = s_w * 3 / 5, height = s_small ? s_h * 2 / 5 : s_h / 2;
+    s_notification_backdrop = lv_obj_create(parent);
+    lv_obj_remove_style_all(s_notification_backdrop);
+    lv_obj_set_size(s_notification_backdrop, LV_PCT(100), LV_PCT(100));
+    lv_obj_remove_flag(s_notification_backdrop, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(s_notification_backdrop, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
     s_notification_card = lv_obj_create(parent);
     lv_obj_set_size(s_notification_card, width, height);
     lv_obj_align(s_notification_card, LV_ALIGN_CENTER, 0, s_small ? 0 : s_h / 10);
@@ -1444,20 +1451,22 @@ static void build_notification(lv_obj_t *parent)
     lv_obj_add_event_cb(s_notification_preview, open_notification, LV_EVENT_CLICKED, NULL);
     lv_obj_align(s_notification_preview, LV_ALIGN_TOP_MID, 0, 0);
     s_notification_hint = make_label(s_notification_card, FONT_COMPACT, COLOR_DIM);
-    lv_obj_align(s_notification_hint, LV_ALIGN_BOTTOM_MID, 0, s_small ? -22 : -34);
+    lv_obj_align(s_notification_hint, LV_ALIGN_BOTTOM_MID, 0, s_small ? -22 : -76);
     lv_obj_add_flag(s_notification_hint, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_event_cb(s_notification_hint, open_notification, LV_EVENT_CLICKED, NULL);
     lv_obj_t *dismiss = lv_button_create(s_notification_card);
     s_notification_dismiss = dismiss;
-    lv_obj_set_size(dismiss, width / 2 - 16, s_small ? 22 : 30);
-    lv_obj_align(dismiss, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_set_size(dismiss, width / 2 - (s_small ? 16 : 32), s_small ? 22 : 48);
+    lv_obj_align(dismiss, LV_ALIGN_BOTTOM_LEFT, 0, s_small ? 0 : -20);
+    lv_obj_set_ext_click_area(dismiss, s_small ? 0 : 16);
     lv_obj_add_event_cb(dismiss, dismiss_notification, LV_EVENT_CLICKED, NULL);
     lv_obj_t *dismiss_label = make_label(dismiss, FONT_COMPACT, COLOR_CAPTION);
     lv_label_set_text(dismiss_label, "Dismiss");
     lv_obj_center(dismiss_label);
     s_notification_action = lv_button_create(s_notification_card);
-    lv_obj_set_size(s_notification_action, width / 2 - 16, s_small ? 22 : 30);
-    lv_obj_align(s_notification_action, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_set_size(s_notification_action, width / 2 - (s_small ? 16 : 32), s_small ? 22 : 48);
+    lv_obj_align(s_notification_action, LV_ALIGN_BOTTOM_RIGHT, 0, s_small ? 0 : -20);
+    lv_obj_set_ext_click_area(s_notification_action, s_small ? 0 : 16);
     lv_obj_add_event_cb(s_notification_action, notification_action, LV_EVENT_CLICKED, NULL);
     s_notification_action_label = make_label(s_notification_action, FONT_COMPACT, COLOR_CAPTION);
     lv_obj_center(s_notification_action_label);
