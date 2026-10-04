@@ -357,6 +357,12 @@ static bool hatch_reply(bool *delivered)
     int64_t t0 = esp_timer_get_time();
     *delivered = false;
     for (;;) {
+#if CONFIG_MUSE_OPENCLAW
+        if (s_chirp && !speaking && !replied) {
+            s_chirp = false;
+            muse_audio_chirp(1);
+        }
+#endif
         muse_hatch_ev_t ev;
         while ((ev = muse_hatch_turn_event(text, sizeof(text))) != MUSE_HATCH_EV_NONE) {
             switch (ev) {

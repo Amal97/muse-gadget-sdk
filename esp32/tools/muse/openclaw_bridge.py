@@ -16,14 +16,20 @@ import ssl
 import subprocess
 import sys
 import threading
+import time
 
 from openclaw_messages import MessageInbox
+from openclaw_jobs import GatewayRPC, JobManager
+from openclaw_companion import Companion
+import normal_chrome
 
 STATE = Path.home() / ".openclaw/muse-esp32"
 GATEWAY_CONFIG = Path.home() / ".openclaw/openclaw.json"
 IDENTITY = "muse-openclaw.local"
 CHAT_PATH = "/v1/chat/completions"
 NOTIFICATION_PATH = "/v1/notifications"
+JOB_PATHS = ("/v1/jobs/start", "/v1/jobs/status", "/v1/jobs/cancel")
+COMPANION_PATH = "/v1/companion"
 JSON_CAP = 16384
 TEXT_CAP = 2048
 
@@ -134,7 +140,8 @@ class BridgeServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, address: tuple[str, int], state: Path, config_path: Path, *,
-                 allow_computer_control: bool = False, imessages: bool = False) -> None:
+                 allow_computer_control: bool = False, imessages: bool = False,
+                 companion: bool = False) -> None:
         gateway_credentials(config_path, allow_computer_control=allow_computer_control)
         token = read_object(state / "bridge.json").get("device_token")
         if not isinstance(token, str) or len(token) < 32 or not token.isascii():
@@ -145,17 +152,86 @@ class BridgeServer(ThreadingHTTPServer):
         self.chat_lock = threading.Lock()
         self.clients = threading.BoundedSemaphore(8)
         self.inbox = MessageInbox(state) if imessages else None
+        self.jobs = None
+        self.companion = None
+        self.monitor_stop = threading.Event()
+        self.monitor_thread = None
+        self.connectivity = {"gateway": "Not checked", "browser": "Not checked", "checked_at": None}
+        if companion:
+            self.verify_jobs()
         self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         self.tls.minimum_version = ssl.TLSVersion.TLSv1_2
         self.tls.load_cert_chain(state / "server.pem", state / "server-key.pem")
         super().__init__(address, BridgeHandler)
+        if companion:
+            try:
+                self.companion = Companion(state)
+                host = f"[{address[0]}]" if ":" in address[0] else address[0]
+                self.companion.put("endpoint", f"https://{host}:{self.server_address[1]}{COMPANION_PATH}")
+                self.jobs = JobManager(
+                    state, GatewayRPC(config_path, self.verify_jobs), self.chat_lock,
+                    notify=lambda job_id, status, text: self.companion.alert(
+                        "job", "Task completed" if status == "completed" else "Task needs attention",
+                        text, job_id))
+                self.companion.start()
+                self.monitor_thread = threading.Thread(target=self.monitor,
+                                                       name="companion-connectivity", daemon=True)
+                self.monitor_thread.start()
+            except (OSError, ValueError, RuntimeError, sqlite3.Error):
+                if self.jobs is not None:
+                    self.jobs.close()
+                if self.companion is not None:
+                    self.companion.close()
+                super().server_close()
+                raise
         if self.inbox is not None:
             self.inbox.start()
 
+    def verify_jobs(self) -> tuple[int, str]:
+        credentials = gateway_credentials(
+            self.config_path, allow_computer_control=self.allow_computer_control)
+        if self.allow_computer_control:
+            agents = read_object(self.config_path)["agents"]["list"]
+            agent = next(a for a in agents if isinstance(a, dict) and a.get("id") == "esp32")
+            if "process" not in object_field(agent, "tools").get("deny", []):
+                raise ValueError("Device jobs require tools.deny to include 'process' "
+                                 "on the ESP32 agent for foreground cancellation.")
+        return credentials
+
     def server_close(self) -> None:
+        self.monitor_stop.set()
+        if self.jobs is not None:
+            self.jobs.close()
+        if self.companion is not None:
+            self.companion.close()
+        if self.monitor_thread is not None:
+            self.monitor_thread.join(timeout=70)
+            if self.monitor_thread.is_alive():
+                logging.error("Connectivity monitor did not stop before shutdown.")
         if self.inbox is not None:
             self.inbox.close()
         super().server_close()
+
+    def monitor(self) -> None:
+        rpc = GatewayRPC(self.config_path, self.verify_jobs)
+        while not self.monitor_stop.is_set():
+            status = {"gateway": "Unavailable", "browser": "Unavailable", "checked_at": time.time()}
+            try:
+                result = rpc("agent.wait", {"runId": "muse-connectivity-probe", "timeoutMs": 0})
+                if result.get("status") != "timeout":
+                    raise ValueError("Invalid gateway probe response.")
+                status["gateway"] = "Reachable"
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+                logging.warning("Gateway connectivity probe failed.")
+            try:
+                result = json.loads(normal_chrome.execute("list_pages", ["{}"]))
+                if not isinstance(result, dict):
+                    raise ValueError("Invalid browser probe response.")
+                status["browser"] = "Connected"
+            except (OSError, ValueError, normal_chrome.ChromeError):
+                logging.warning("Normal Chrome connectivity probe failed; verify browser consent.")
+            self.connectivity = status
+            self.monitor_stop.wait(60)
 
     def process_request(self, request, client_address) -> None:
         if not self.clients.acquire(blocking=False):
@@ -192,6 +268,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
         logging.info("Bridge HTTP %s", code)
 
     def send_json(self, status: int, data: bytes) -> None:
+        if len(data) >= JSON_CAP:
+            logging.error("Bridge response exceeds the device JSON limit.")
+            status = 413
+            data = json.dumps({"error": {"message": "Response exceeds the device JSON limit."}}).encode()
         self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -207,7 +287,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         server = self.server
         if not isinstance(server, BridgeServer):
             raise RuntimeError("Invalid bridge server.")
-        if self.path not in (CHAT_PATH, NOTIFICATION_PATH):
+        if self.path not in (CHAT_PATH, NOTIFICATION_PATH, COMPANION_PATH, *JOB_PATHS):
             self.reject(404, "Unknown bridge endpoint.")
             return
         authorization = self.headers.get("Authorization", "").encode("utf-8")
@@ -229,22 +309,73 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if len(data) != size:
                 raise ValueError("Incomplete request.")
             body = json.loads(data)
+            if self.path == COMPANION_PATH:
+                if server.companion is None:
+                    self.reject(404, "Device companion features are not enabled.")
+                    return
+                if isinstance(body, dict) and body.get("action") == "job_cancel":
+                    if set(body) != {"action", "id"} or server.jobs is None:
+                        raise ValueError("Invalid job cancellation request.")
+                    result = {"last_job": server.jobs.cancel(body["id"])}
+                else:
+                    result = server.companion.handle(body, server.inbox)
+                if isinstance(body, dict) and body.get("action") == "status":
+                    result.update({"connectivity": server.connectivity,
+                                   "served_at": time.time(),
+                                   "last_job": server.jobs.latest() if server.jobs else None,
+                                   "usage": server.jobs.costs() if server.jobs else None})
+                self.send_json(200, json.dumps(result, ensure_ascii=False).encode())
+                return
+            if self.path in JOB_PATHS:
+                if server.jobs is None:
+                    self.reject(404, "Device companion jobs are not enabled.")
+                    return
+                if not isinstance(body, dict):
+                    raise ValueError("Expected a device job request.")
+                if self.path == JOB_PATHS[0]:
+                    if set(body) != {"id", "messages"}:
+                        raise ValueError("Expected device job identifier and messages.")
+                    result = server.jobs.start(body["id"], validate_messages(body))
+                else:
+                    if set(body) != {"id"}:
+                        raise ValueError("Expected a device job identifier.")
+                    operation = server.jobs.status if self.path == JOB_PATHS[1] else server.jobs.cancel
+                    result = operation(body["id"])
+                self.send_json(200, json.dumps(result, ensure_ascii=False).encode())
+                return
             if self.path == NOTIFICATION_PATH:
                 if not isinstance(body, dict) or set(body) != {"ack"}:
                     raise ValueError("Expected a notification acknowledgment.")
-                if server.inbox is None:
+                if server.inbox is None and server.companion is None:
                     self.reject(404, "Incoming iMessages are not enabled.")
                     return
-                result = server.inbox.poll(body["ack"])
+                ack = body["ack"]
+                if not isinstance(ack, str):
+                    raise ValueError("Invalid notification acknowledgment.")
+                if ack:
+                    from openclaw_jobs import identifier
+                    identifier(ack)
+                local_ack = bool(server.companion and server.companion.owns_ack(ack))
+                if local_ack:
+                    server.companion.poll(ack)
+                if ack and not local_ack:
+                    if server.inbox is None:
+                        raise ValueError("Unknown notification acknowledgment.")
+                    server.inbox.poll(ack)
+                result = server.companion.poll() if server.companion else {"notification": None}
+                if result["notification"] is None and server.inbox is not None:
+                    result = server.inbox.poll("")
+                    if server.companion and result["notification"]:
+                        result["notification"]["kind"] = "imessage"
                 self.send_json(200, json.dumps(result, ensure_ascii=False).encode())
                 return
             messages = validate_messages(body)
         except (ValueError, UnicodeError):
             self.reject(400, "Invalid bridge request.")
             return
-        except (RuntimeError, sqlite3.Error):
-            logging.error("Incoming iMessages unavailable; check watcher status and Messages permissions.")
-            self.reject(503, "Incoming iMessages unavailable; check the bridge log.")
+        except (OSError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired):
+            logging.error("Device service unavailable; check the bridge log and permissions.")
+            self.reject(503, "Device service unavailable; check the bridge log.")
             return
         if not server.chat_lock.acquire(blocking=False):
             self.reject(409, "Another chat request is still running.")
@@ -314,6 +445,8 @@ def main() -> int:
                         help="explicitly permit the ESP32 agent's full computer-control tool profile")
     parser.add_argument("--imessages", action="store_true",
                         help="queue local incoming-iMessage previews (requires Messages Full Disk Access)")
+    parser.add_argument("--companion", action="store_true",
+                        help="enable jobs, reminders, confirmed replies and local morning briefings")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     try:
@@ -322,7 +455,7 @@ def main() -> int:
         else:
             with BridgeServer((args.bind, args.port), args.state, args.openclaw_config,
                               allow_computer_control=args.allow_computer_control,
-                              imessages=args.imessages) as server:
+                              imessages=args.imessages, companion=args.companion) as server:
                 if args.allow_computer_control:
                     logging.warning("Computer control enabled: device requests can run tools on this computer.")
                 logging.info("Muse HTTPS chat bridge listening on %s:%d", args.bind, args.port)

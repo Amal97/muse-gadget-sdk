@@ -10,6 +10,7 @@
 #include <string.h>
 #include <strings.h>
 #include <time.h>
+#include <ctype.h>
 
 #include "host_compat.h"
 #include "cJSON.h"
@@ -21,6 +22,7 @@
 #include "muse_state.h"
 #include "muse_wifi.h"
 #include "muse_audio.h"
+#include "muse_companion.h"
 
 #define ESP_ERR_NO_MEM 2
 #define ESP_LOGI(tag, ...) ((void)(tag))
@@ -98,21 +100,38 @@ static int xTaskCreate(void (*fn)(void *), const char *name, unsigned stack, voi
     return pdPASS;
 }
 static void *heap_caps_malloc(size_t size, int caps) { (void)caps; return malloc(size); }
+static void esp_fill_random(void *out, size_t size)
+{
+    for (size_t i = 0; i < size; i++) ((uint8_t *)out)[i] = (uint8_t)i;
+}
 static void mbedtls_platform_zeroize(void *ptr, size_t size) { memset(ptr, 0, size); }
 static bool wifi_on = true, speaker_on = true;
 static bool asleep;
 bool muse_state_asleep(void) { return asleep; }
+void muse_state_set_caption(const char *format, ...) { (void)format; }
+void muse_companion_start(void) {}
+static muse_timer_state_t timer_phase;
+static unsigned timer_seconds, timer_pending;
+muse_timer_state_t muse_timer_status(unsigned *seconds)
+{
+    if (seconds) *seconds = 0;
+    return timer_phase;
+}
+bool muse_timer_dismiss(void) { return true; }
+bool muse_timer_start(unsigned seconds) { timer_seconds = seconds; return true; }
+unsigned muse_timer_pending(void) { return timer_pending; }
 bool muse_wifi_connected(void) { return wifi_on; }
 bool muse_settings_speaker_on(void) { return speaker_on; }
 size_t muse_settings_openai_key_len(void) { return 8; }
 void muse_settings_openai_key(char *out) { strcpy(out, "test-key"); }
-static bool use_openclaw, bridge_token_set = true;
+static bool use_openclaw, bridge_token_set = true, bridge_changed;
 bool muse_settings_openclaw_enabled(void) { return use_openclaw; }
 bool muse_settings_openclaw_token_set(void) { return bridge_token_set; }
 void muse_settings_openclaw(char *url, char *token)
 {
-    if (url) strcpy(url, "https://192.168.1.72:8765/v1/chat/completions");
-    if (token) strcpy(token, bridge_token_set ? "bridge-key" : "");
+    if (url) strcpy(url, bridge_changed ? "https://192.168.1.73:8765/v1/chat/completions" :
+                   "https://192.168.1.72:8765/v1/chat/completions");
+    if (token) strcpy(token, bridge_token_set ? (bridge_changed ? "changed-key" : "bridge-key") : "");
 }
 muse_mode_t muse_state_mode(float *seconds) { (void)seconds; return MUSE_MODE_IDLE; }
 static unsigned console_errors, console_done, console_sent;
@@ -147,7 +166,7 @@ struct fake_esp_http_client {
 static fixture_t fixtures[8];
 static struct fake_esp_http_client clients[8];
 static unsigned fixture_count, client_count, closed_count, read_count;
-static bool cancel_on_read, incomplete, fail_open;
+static bool cancel_on_read, change_on_cancel, incomplete, fail_open;
 static char paths[8][160];
 const char openai_test_root[] asm("_binary_openai_root_pem_start") = "public test root";
 const char openclaw_test_root[] asm("_binary_openclaw_root_start") = "public bridge root";
@@ -164,7 +183,9 @@ esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *co
         assert(config->cert_pem == openai_test_root && !config->common_name);
     } else {
         assert(!strcmp(config->url, "https://192.168.1.72:8765/v1/chat/completions")
-               || !strcmp(config->url, "https://192.168.1.72:8765/v1/notifications"));
+               || !strcmp(config->url, "https://192.168.1.72:8765/v1/notifications")
+               || !strcmp(config->url, "https://192.168.1.72:8765/v1/companion")
+               || strstr(config->url, "https://192.168.1.72:8765/v1/jobs/") == config->url);
         assert(config->cert_pem == openclaw_test_root);
         assert(!strcmp(config->common_name, "muse-openclaw.local"));
     }
@@ -217,6 +238,7 @@ static int esp_http_client_read(esp_http_client_handle_t client, char *out, int 
     if (cancel_on_read) {
         cancel_on_read = false;
         muse_hatch_turn_cancel();
+        if (change_on_cancel) bridge_changed = true;
     }
     size_t n = client->fixture.size - client->read_at;
     size_t fragment = read_count % 7 + 1;
@@ -245,6 +267,10 @@ static void worker(void *arg)
 
 static const char transcript[] = "{\"text\":\"Hello there\"}";
 static const char answer[] = "{\"choices\":[{\"message\":{\"content\":\"Hello friend.\"},\"finish_reason\":\"stop\"}]}";
+static const char job_running[] =
+    "{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"status\":\"running\",\"elapsed_seconds\":123}";
+static const char job_completed[] =
+    "{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"status\":\"completed\",\"reply\":\"Hello friend.\"}";
 static const uint8_t speech[] = { 0, 0, 100, 0, 200, 0, 44, 1, 144, 1, 244, 1 };
 
 static void fixture(const void *body, size_t size, int status, const char *type)
@@ -254,7 +280,12 @@ static void fixture(const void *body, size_t size, int status, const char *type)
 static void good_fixtures(void)
 {
     fixture(transcript, strlen(transcript), 200, "application/json");
-    fixture(answer, strlen(answer), 200, "application/json");
+    if (use_openclaw) {
+        fixture(job_running, strlen(job_running), 200, "application/json");
+        fixture(job_completed, strlen(job_completed), 200, "application/json");
+    } else {
+        fixture(answer, strlen(answer), 200, "application/json");
+    }
     fixture(speech, sizeof(speech), 200, "audio/pcm");
 }
 static void reset_transport(void)
@@ -482,12 +513,14 @@ static void hybrid_pipeline(void)
     good_fixtures();
     record_note();
     worker(NULL);
-    assert(client_count == 3 && closed_count == 3);
+    assert(client_count == 4 && closed_count == 4);
     assert(clients[0].config.cert_pem == openai_test_root);
     assert(clients[1].config.cert_pem == openclaw_test_root);
-    assert(clients[2].config.cert_pem == openai_test_root);
+    assert(clients[2].config.cert_pem == openclaw_test_root);
+    assert(clients[3].config.cert_pem == openai_test_root);
+    assert(strstr(paths[1], "/jobs/start") && strstr(paths[2], "/jobs/status"));
     cJSON *body = cJSON_Parse(clients[1].upload);
-    assert(!strcmp(cJSON_GetObjectItem(body, "model")->valuestring, "openclaw:esp32"));
+    assert(!strcmp(cJSON_GetObjectItem(body, "id")->valuestring, "000102030405060708090a0b0c0d0e0f"));
     const char *prompt = cJSON_GetObjectItem(
         cJSON_GetArrayItem(cJSON_GetObjectItem(body, "messages"), 0), "content")->valuestring;
     assert(strlen(prompt) < 2047);
@@ -579,6 +612,86 @@ static void incoming_notifications(void)
     poll_notifications();
     assert(client_count == 5);
 }
+static void local_timer_shortcut(void)
+{
+    use_openclaw = true;
+    const char timer[] = "{\"text\":\"Set a timer for 5 minutes\"}";
+    fixture(timer, strlen(timer), 200, "application/json");
+    fixture(speech, sizeof(speech), 200, "audio/pcm");
+    record_note();
+    worker(NULL);
+    assert(timer_seconds == 300 && client_count == 2);
+    assert(strstr(paths[0], "/audio/transcriptions") && strstr(paths[1], "/audio/speech"));
+    timer_pending = 600;
+    timer_phase = MUSE_TIMER_RINGING;
+    muse_notification_t notification;
+    assert(muse_openai_notification(&notification));
+    assert(!strcmp(notification.kind, "timer"));
+}
+
+static void dictated_reply(bool valid)
+{
+    use_openclaw = true;
+    const char id[] = "0123456789abcdef0123456789abcdef";
+    strlcpy(s_notification.id, id, sizeof(s_notification.id));
+    strlcpy(s_notification.kind, "imessage", sizeof(s_notification.kind));
+    assert(muse_openai_reply_begin(id));
+    const char draft[] = "{\"draft\":{\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+        "\"state\":\"unconfirmed\",\"recipient\":\"Test recipient: +15555550100\","
+        "\"text\":\"Hello there\",\"preview\":\"Hello there\",\"detail\":\"Not sent\"}}";
+    fixture(transcript, strlen(transcript), 200, "application/json");
+    fixture(valid ? draft : "{}", valid ? strlen(draft) : 2, 200, "application/json");
+    record_note();
+    worker(NULL);
+    assert(client_count == 2 && strstr(paths[1], "/companion"));
+    cJSON *body = cJSON_Parse(clients[1].upload);
+    assert(!strcmp(cJSON_GetObjectItem(body, "action")->valuestring, "reply_prepare"));
+    assert(!strcmp(cJSON_GetObjectItem(body, "notification")->valuestring, id));
+    assert(!strcmp(cJSON_GetObjectItem(body, "text")->valuestring, "Hello there"));
+    cJSON_Delete(body);
+    if (valid) {
+        assert(!strcmp(s_notification_ack, id) && !s_notification.id[0]);
+        assert(s_draft_notice.id[0]);
+    } else {
+        assert(!s_notification_ack[0] && !strcmp(s_notification.id, id));
+        muse_hatch_status_t status;
+        muse_hatch_status(&status);
+        assert(!strcmp(status.detail, "COMPANION RESPONSE INVALID"));
+    }
+}
+
+static void scoped_stop_after_settings_change(void)
+{
+    use_openclaw = true;
+    const char stopped[] = "{\"id\":\"000102030405060708090a0b0c0d0e0f\","
+        "\"status\":\"cancelled\",\"detail\":\"Native run stopped\"}";
+    fixture(job_running, strlen(job_running), 200, "application/json");
+    fixture(stopped, strlen(stopped), 200, "application/json");
+    cancel_on_read = change_on_cancel = true;
+    muse_hatch_text_turn(strdup("Harmless task"));
+    worker(NULL);
+    assert(bridge_changed && client_count == 2 && strstr(paths[1], "/jobs/cancel"));
+    assert(!muse_openai_job_active() && !atomic_load(&s_busy));
+}
+
+static void snooze_ack_only_after_success(void)
+{
+    use_openclaw = true;
+    const char id[] = "0123456789abcdef0123456789abcdef";
+    strlcpy(s_notification.id, id, sizeof(s_notification.id));
+    strlcpy(s_notification.kind, "reminder", sizeof(s_notification.kind));
+    const char request[] = "{\"action\":\"snooze\",\"id\":\"0123456789abcdef0123456789abcdef\",\"seconds\":300}";
+    fixture("{}", 2, 503, "application/json");
+    assert(muse_openai_companion_command(request));
+    worker(NULL);
+    assert(!strcmp(s_notification.id, id) && !s_notification_ack[0]);
+    reset_transport();
+    fixture("{\"settings\":{}}", 15, 200, "application/json");
+    assert(muse_openai_companion_command(request));
+    worker(NULL);
+    assert(!s_notification.id[0] && !strcmp(s_notification_ack, id));
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -595,6 +708,11 @@ int main(int argc, char **argv)
     case 8: clear_active_voice(); break;
     case 9: hybrid_pipeline(); break;
     case 10: incoming_notifications(); break;
+    case 11: local_timer_shortcut(); break;
+    case 12: dictated_reply(true); break;
+    case 13: dictated_reply(false); break;
+    case 14: scoped_stop_after_settings_change(); break;
+    case 15: snooze_ack_only_after_success(); break;
     default: return 2;
     }
     muse_hatch_turn_cancel();

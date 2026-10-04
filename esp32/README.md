@@ -491,9 +491,15 @@ python3 tools/muse/openclaw_bridge.py serve --bind COMPUTER-IP \
 
 The OpenClaw firmware polls authenticated `POST /v1/notifications` approximately
 every five seconds while awake, idle, and connected. It shows the sender's
-phone/email and a short text preview over the Muse face, with one chirp
-(respecting speaker mute and volume). Tap the card to dismiss, or let it
-dismiss after 15 seconds of visible time. Alerts pause during voice turns,
+phone/email and a short text preview over Home or the Muse face, with one chirp
+(respecting speaker mute and volume). Tap the popup to expand its available
+details in place, scroll vertically for longer text, and tap the collapse hint
+to return to the preview. This does not navigate to Settings or change your
+remembered screen. Dismiss, Reply and Snooze remain available; explicit Review
+actions still open Companion for reply confirmation or timer replacement.
+Incoming message previews dismiss after 15 seconds of visible, collapsed
+time; expanding pauses that timeout, and collapsing starts a fresh 15 seconds.
+Alerts pause during voice turns,
 menus, images, and settings. They do not wake the sleeping display or keep
 Wi-Fi awake on battery; queued alerts appear when the device wakes. The
 Mac must remain awake and reachable. Previews are not automatically read
@@ -511,6 +517,147 @@ before acknowledgment can display the oldest unacknowledged alert again.
 Attachment-only messages get a placeholder; photos and files are not
 downloaded. Sender and preview text are limited to 96 and 256 UTF-8 bytes.
 Glyph rendering depends on the board's fonts.
+
+#### Optional gadget companion features (OpenClaw builds)
+
+Hybrid touch displays at least 320x320 start on a **Home** information screen:
+local time/date, current weather, the next gadget reminder or active local
+timer, and a daily briefing preview. The black, lavender and pixel-heading
+theme matches Muse. Swipe left for **Muse**, then left again for **Settings**;
+swipe right to return. Manually selecting Home or Muse remembers that screen
+across reboots. Settings is not saved as the default. Voice temporarily shows
+Muse and returns to your selection when idle; manually swiping during a turn
+overrides that automatic return. Smaller and non-touch displays and other
+firmware providers retain their existing navigation.
+
+Tap a Home card for details in Companion. An absent or previous-day briefing
+can be built from its card; this is deterministic and does not call an AI model.
+Home refreshes companion status every 30 seconds only while visible, awake,
+connected, and the backend is idle. Mac local-time offsets are cached in NVS
+without changing global timezone settings; reconnect to update them after a
+timezone or daylight-saving change. Before initial clock/timezone sync the
+screen explicitly shows that it is waiting, rather than displaying UTC as
+local time.
+
+The Mac fetches configured Open-Meteo current conditions and daily high/low
+and rain probability about every 15 minutes, independently of status requests.
+Briefings reuse that private, persistent cache. Failed weather refreshes retain
+old measurements marked **Cached**, and retry no more often than five minutes.
+Offline clock/timer display continues; reminders and briefing content indicate
+cached/offline state rather than pretending to be live. Missing configuration
+or sources are shown explicitly. This feed requires Mac internet access but
+does not use OpenAI or require a weather API key.
+
+Add `--companion` to the bridge launch command. Before enabling it with
+launchd, ensure its `EnvironmentVariables.PATH` includes the directory containing
+Node and the OpenClaw CLI (for example `/opt/homebrew/bin` on Apple Silicon);
+launchd does not inherit your interactive shell's search path. After changing
+LaunchAgent arguments or environment, bootout/bootstrap it rather than only
+kickstarting the old definition. Before enabling it with
+computer control, add `process` to **only the ESP32 agent's** `tools.deny`
+alongside its existing denials. Keep its full tool profile and other exec
+settings. This makes OpenClaw exec foreground-only: native cancellation
+otherwise deliberately leaves background commands running. Set this
+agent's `tools.exec.timeoutSec` to `86400` for long foreground commands.
+Other agents and credentials should not be changed.
+
+Chat uses authenticated `/v1/jobs/start`, `/v1/jobs/status`, and
+`/v1/jobs/cancel`. Each device request has an idempotent identifier and a
+dedicated `agent:esp32:muse-job:...` session. Short polling replaces the old
+90-second chat deadline; Stop calls native `chat.abort` for that exact run.
+The gateway still has a 24-hour run ceiling, and provider/tool limits can
+end a job earlier. Stop does not undo completed actions. Independent
+background launches are prohibited for the ESP32 agent.
+
+Jobs and completion alerts survive bridge restart in private SQLite state.
+Interrupted actions are not replayed automatically. Failed or unconfirmed
+stops are reported explicitly; check OpenClaw before repeating uncertain
+actions. Native requests separate the current user turn from reference-only,
+completed conversation history and include the installed companion helper's
+exact path and JSON protocol; old commands are not presented as pending work.
+Native model cost metadata is an **estimate**, not account billing;
+missing steps and potentially truncated histories are marked incomplete,
+not zero. API responses at or above the 16,384-byte device limit are explicitly
+rejected, never delivered as a clipped successful response. The dashboard separately states
+that direct OpenAI voice usage is not metered and shows budgeting rates.
+Browser connectivity checks invoke a read-only tool on normal Chrome;
+daemon liveness alone is not treated as browser connectivity.
+
+Open **Settings > Companion** for configurable favourite cards, timer
+controls, gadget reminders, reply review, connectivity, and briefing settings.
+Favourites currently select from six deterministic actions: five- and
+ten-minute timers, a custom timer, adding a reminder, the briefing, and
+the dashboard. They do not require a model call.
+
+There is one local countdown timer, with confirmation before replacing it.
+It works offline, wakes the sleeping display, and supports Dismiss and
+five-minute Snooze. It cannot wake a powered-off board. Timers are anchored
+to monotonic time while running; restoration after reboot needs network time.
+A timer started without a valid clock cannot be restored across a restart,
+and that interruption is reported. Supported voice shortcuts include
+`Set a timer for 10 minutes` and `Start a timer for thirty seconds`;
+these still use paid OpenAI transcription/speech but skip AI chat.
+
+Mac-backed gadget reminders and scheduled briefings queue while the display
+sleeps and are shown when awake. They need an awake, reachable Mac.
+Reminders persist and support Dismiss and five-minute Snooze.
+Install `tools/muse/companion-skill/SKILL.md` as
+`skills/gadget-companion/SKILL.md` in the ESP32 workspace, and copy
+`tools/muse/companion_cli.py` to the private bridge state directory.
+The authenticated local helper supports reminders and briefing requests;
+do not substitute OpenClaw cron or a Mac sleep command for local timers.
+
+Tap **Reply** on an incoming iMessage, hold Talk to dictate, then review the
+exact conversation participants and full text in Companion. Edit, cancel,
+or explicitly confirm sending. The bridge resolves the source message's
+actual chat GUID, never its preview sender. Confirmation sends directly
+through `imsg`, without asking a chat model to choose a recipient. Unsupported
+display glyphs disable confirmation rather than hiding changes to the text.
+Sends are attempted once with no SMS fallback; uncertain sends must be checked
+in Messages before authorizing another attempt. Full shell access can still
+bypass UI rules, so these are not an isolation boundary against the agent.
+
+The morning briefing is assembled locally from configured weather,
+gadget reminders, and enabled Mac event calendars, including recurring
+occurrences via EventKit. It is displayed without automatically sending
+calendar data to an AI provider. Asking the chat agent for the digest may
+put its contents into that model conversation.
+
+Install the read-only helper using the existing Apple developer tools:
+
+```sh
+python3 tools/muse/install_calendar.py --request-access
+```
+
+Grant **full** calendar access to Muse Calendar Reader; write-only access
+cannot read an agenda. Calendar queries launch that authorized app through
+LaunchServices with private temporary request/response files; invoking its
+executable directly can instead inherit the terminal's privacy identity.
+Rebuilding the ad-hoc-signed helper may require granting access again.
+Enable all currently readable calendars with
+`{"action":"settings","settings":{"calendars_enabled":true,"calendar_ids":"all"}}`
+through the local helper. The overall switch and individual calendar switches
+are in Companion. New calendars are not silently enabled; refresh and select
+them. Calendars absent from EventKit are unavailable to this integration.
+The device shows switches for the first 32 calendars; use the helper for
+larger selections.
+Weather coordinates, briefing `hour`/`minute`, and favourite choices can also
+be edited through the helper's `settings` action. Preferences remain private
+in `~/.openclaw/muse-esp32/companion.sqlite`, not in the repository.
+
+The daily schedule uses the Mac's local timezone, runs once per local date,
+and catches up after the scheduled time if the service was asleep/offline.
+Manual briefings are also available. Unavailable sources produce an explicitly
+partial digest; an interrupted build is not silently retried.
+
+Focused companion regressions (from the repository root):
+
+```sh
+python3 -m unittest esp32/tests/test_muse_companion.py \
+  esp32/tests/test_openclaw_companion.py esp32/tests/test_openclaw_jobs.py \
+  esp32/tests/test_muse_openai.py esp32/tests/test_muse_openclaw.py \
+  esp32/tests/test_muse_messages.py esp32/tests/test_muse_settings_ui.py
+```
 
 Incoming previews stay local to the Mac and ESP32: the watcher never calls
 OpenClaw or an AI provider. Deliberately asking the voice agent to read a

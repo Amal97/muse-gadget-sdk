@@ -34,6 +34,11 @@
 #include "muse_ble.h"
 #include "muse_board.h"
 #include "muse_chat.h"
+#if CONFIG_MUSE_OPENCLAW
+#include "muse_companion.h"
+#include "muse_home.h"
+#include "cJSON.h"
+#endif
 #include "muse_console.h"
 #include "muse_link.h"
 #include "muse_mem.h"
@@ -42,6 +47,7 @@
 #include "muse_settings.h"
 #include "muse_settings_ui.h"
 #include "muse_state.h"
+#include "muse_text.h"
 #include "muse_wifi.h"
 #if CONFIG_MUSE_OPENCLAW
 #include "muse_openai.h"
@@ -96,7 +102,8 @@ static lv_indev_t *s_indev;
 static lv_obj_t *s_tv;
 static lv_obj_t *s_face;
 static lv_obj_t *s_settings;
-static lv_obj_t *s_dots[2];
+static lv_obj_t *s_dots[3];
+static int s_page_count = 2;
 static lv_obj_t *s_wifi_icon;
 static lv_obj_t *s_ble_icon;
 static lv_obj_t *s_cover;
@@ -148,7 +155,23 @@ static int s_shown_page = -1;
 static int s_shown_speaker = -1;
 static muse_mode_t s_last_mode = MUSE_MODE_COUNT;
 #if CONFIG_MUSE_OPENCLAW
+static lv_obj_t *s_home, *s_home_time, *s_home_date, *s_home_weather_title;
+static lv_obj_t *s_home_weather, *s_home_weather_detail, *s_home_reminder, *s_home_reminder_detail;
+static lv_obj_t *s_home_briefing, *s_home_footer;
+static char *s_home_json;
+static cJSON *s_home_data;
+static unsigned s_home_version;
+static float s_home_tick, s_home_refresh;
+static bool s_home_manual_scroll, s_home_selecting;
+static muse_home_navigation_t s_home_navigation;
 static lv_obj_t *s_notification_card, *s_notification_sender, *s_notification_preview;
+static lv_obj_t *s_stop_job;
+static lv_obj_t *s_notification_action, *s_notification_action_label, *s_notification_hint;
+static lv_obj_t *s_notification_details, *s_notification_dismiss;
+static bool s_notification_expanded;
+static char s_notification_text[2048];
+static muse_notification_t s_shown_notification;
+static float s_alarm_chirp;
 static char s_notification_id[33];
 static float s_notification_seconds;
 static float s_notification_tick;
@@ -778,6 +801,206 @@ static void on_ring_draw(lv_event_t *e)
     layer->_clip_area = clip;
 }
 
+#if CONFIG_MUSE_OPENCLAW
+static void home_set_text(lv_obj_t *label, const char *text)
+{
+    char shown[512];
+    const char *safe = muse_text_showable(text, shown, sizeof(shown));
+    if (strcmp(lv_label_get_text(label), safe)) lv_label_set_text(label, safe);
+}
+
+static void home_detail(lv_event_t *event)
+{
+    intptr_t card = (intptr_t)lv_event_get_user_data(event);
+    muse_home_view_t view;
+    muse_wifi_status_t wifi;
+    muse_wifi_status(&wifi);
+    muse_home_format(&view, s_home_data, time(NULL), muse_settings_home_offset(), wifi.state == MUSE_WIFI_CONNECTED);
+    char detail[1024];
+    if (card == 0) {
+        const cJSON *weather = cJSON_GetObjectItemCaseSensitive(s_home_data, "weather");
+        const cJSON *location = cJSON_GetObjectItemCaseSensitive(weather, "location");
+        snprintf(detail, sizeof(detail), "WEATHER\n%s\n%s\n%s\n%s\n"
+                 "Source: Open-Meteo. Updated every 15 minutes while the Mac bridge runs.",
+                 muse_home_text(location, "label"), view.weather, view.weather_detail,
+                 muse_home_text(weather, "error"));
+        muse_settings_ui_open_companion(detail);
+    } else if (card == 1) {
+        muse_settings_ui_open_companion("REMINDERS & TIMERS\nView your gadget reminders and local timer below.");
+    } else {
+        const cJSON *briefing = cJSON_GetObjectItemCaseSensitive(s_home_data, "briefing");
+        const char *body = muse_home_text(briefing, "body");
+        if (!*body || !strncmp(view.briefing, "Previous briefing.", 18)) {
+            if (!muse_openai_companion_command("{\"action\":\"briefing\"}")) {
+                muse_state_set_caption("BRIEFING NOT QUEUED - MAC MAY BE BUSY");
+            }
+            muse_settings_ui_open_companion("DAILY BRIEFING\nYour refreshed briefing appears below when ready.");
+        } else muse_settings_ui_open_companion(body);
+    }
+}
+
+static lv_obj_t *home_card(int center_percent, intptr_t index, const char *heading,
+                           lv_obj_t **title, lv_obj_t **primary, lv_obj_t **secondary)
+{
+    lv_obj_t *card = lv_button_create(s_home);
+    int width = s_w * 73 / 100;
+    int height = s_h * 17 / 100;
+    lv_obj_set_size(card, width, height);
+    lv_obj_align(card, LV_ALIGN_TOP_MID, 0, s_h * center_percent / 100 - height / 2);
+    lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_RING_BG), 0);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(COLOR_DOT_OFF), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_pad_all(card, 0, 0);
+    lv_obj_set_style_shadow_width(card, 0, 0);
+    lv_obj_add_event_cb(card, home_detail, LV_EVENT_CLICKED, (void *)index);
+    lv_obj_t *label = make_label(card, &lv_font_montserrat_14, COLOR_ACCENT);
+    lv_obj_set_width(label, width - 28);
+    lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
+    lv_label_set_text(label, heading);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 14, 7);
+    if (title) *title = label;
+    *primary = make_label(card, secondary ? &lv_font_montserrat_20 : &lv_font_montserrat_14, COLOR_LIT);
+    lv_obj_set_size(*primary, width - 28, secondary ? 25 : 38);
+    lv_label_set_long_mode(*primary, LV_LABEL_LONG_DOT);
+    lv_obj_align(*primary, LV_ALIGN_TOP_LEFT, 14, 28);
+    if (secondary) {
+        *secondary = make_label(card, &lv_font_montserrat_14, COLOR_DIM);
+        lv_obj_set_width(*secondary, width - 28);
+        lv_label_set_long_mode(*secondary, LV_LABEL_LONG_DOT);
+        lv_obj_align(*secondary, LV_ALIGN_TOP_LEFT, 14, 54);
+    }
+    return card;
+}
+
+static void build_home(void)
+{
+    lv_obj_remove_flag(s_home, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_t *heading = make_label(s_home, &lv_font_unscii_16, COLOR_ACCENT);
+    lv_label_set_text(heading, "TODAY");
+    lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, s_h * 6 / 100);
+#if LV_FONT_MONTSERRAT_48
+    const lv_font_t *clock_font = &lv_font_montserrat_48;
+#else
+    const lv_font_t *clock_font = &lv_font_montserrat_28;
+#endif
+    s_home_time = make_label(s_home, clock_font, COLOR_LIT);
+    lv_label_set_text(s_home_time, "--:--");
+    lv_obj_align(s_home_time, LV_ALIGN_TOP_MID, 0, s_h * 12 / 100);
+    s_home_date = make_label(s_home, &lv_font_montserrat_14, COLOR_CAPTION);
+    lv_label_set_text(s_home_date, "Waiting for local time");
+    lv_obj_align(s_home_date, LV_ALIGN_TOP_MID, 0, s_h * 25 / 100);
+    home_card(39, 0, "WEATHER", &s_home_weather_title, &s_home_weather, &s_home_weather_detail);
+    home_card(59, 1, "REMINDERS", NULL, &s_home_reminder, &s_home_reminder_detail);
+    home_card(78, 2, "DAILY BRIEFING", NULL, &s_home_briefing, NULL);
+    s_home_footer = make_label(s_home, &lv_font_montserrat_14, COLOR_DIM);
+    lv_obj_set_style_text_align(s_home_footer, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_width(s_home_footer, s_w * 56 / 100);
+    lv_label_set_long_mode(s_home_footer, LV_LABEL_LONG_DOT);
+    lv_obj_align(s_home_footer, LV_ALIGN_TOP_MID, 0, s_h * 89 / 100);
+    s_home_json = malloc(16384);
+    if (!s_home_json) {
+        ESP_LOGE(TAG, "Home status buffer allocation failed");
+        muse_state_set_caption("HOME STATUS MEMORY UNAVAILABLE");
+    }
+}
+
+static void home_navigation(lv_event_t *event)
+{
+    lv_event_code_t code = lv_event_get_code(event);
+    if (code == LV_EVENT_SCROLL_BEGIN && !s_home_selecting && !lv_event_get_param(event) &&
+        lv_indev_active() == s_indev) s_home_manual_scroll = true;
+    if (code != LV_EVENT_VALUE_CHANGED || !s_home_manual_scroll) return;
+    s_home_manual_scroll = false;
+    lv_obj_t *tile = lv_tileview_get_tile_active(s_tv);
+    muse_home_page_t page = tile == s_home ? MUSE_HOME_DASHBOARD :
+                            tile == s_face ? MUSE_HOME_FACE : MUSE_HOME_SETTINGS;
+    muse_home_choose(&s_home_navigation, page);
+    ESP_LOGI(TAG, "Preferred screen: %s", page == MUSE_HOME_FACE ? "Muse" :
+             page == MUSE_HOME_DASHBOARD ? "Home" : "Settings (not saved)");
+    if (page != MUSE_HOME_SETTINGS && muse_settings_set_home_face(page == MUSE_HOME_FACE) != ESP_OK) {
+        muse_state_set_caption("SCREEN CHOICE NOT SAVED");
+    }
+}
+
+static void home_select(lv_obj_t *tile, lv_anim_enable_t animation)
+{
+    s_home_selecting = true;
+    s_home_manual_scroll = false;
+    lv_obj_add_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE);
+    lv_tileview_set_tile(s_tv, tile, animation);
+    s_home_selecting = false;
+}
+
+static void update_home(float now)
+{
+    if (!s_home || now < s_home_tick) return;
+    s_home_tick = now + 1;
+    if (s_home_json && muse_openai_companion_snapshot(s_home_json, 16384, &s_home_version)) {
+        cJSON *root = cJSON_Parse(s_home_json);
+        if (cJSON_IsObject(root)) {
+            cJSON_Delete(s_home_data);
+            s_home_data = root;
+            int32_t offset;
+            if (muse_home_clock_offset(root, &offset)) {
+                if (muse_settings_set_home_offset(offset) != ESP_OK) muse_state_set_caption("LOCAL TIMEZONE NOT SAVED");
+            } else {
+                ESP_LOGW(TAG, "Companion local clock metadata unavailable");
+            }
+        } else {
+            cJSON_Delete(root);
+            ESP_LOGE(TAG, "Invalid home status snapshot");
+            muse_state_set_caption("HOME STATUS INVALID");
+        }
+    }
+    muse_wifi_status_t wifi;
+    muse_wifi_status(&wifi);
+    bool connected = wifi.state == MUSE_WIFI_CONNECTED;
+    muse_home_view_t view;
+    muse_home_format(&view, s_home_data, time(NULL), muse_settings_home_offset(), connected);
+    home_set_text(s_home_time, view.time);
+    home_set_text(s_home_date, view.date);
+    const cJSON *weather = cJSON_GetObjectItemCaseSensitive(s_home_data, "weather");
+    const cJSON *location = cJSON_GetObjectItemCaseSensitive(weather, "location");
+    const char *city = muse_home_text(location, "label");
+    home_set_text(s_home_weather_title, *city ? city : "WEATHER");
+    home_set_text(s_home_weather, view.weather);
+    home_set_text(s_home_weather_detail, view.weather_detail);
+    unsigned seconds;
+    muse_timer_state_t timer = muse_timer_status(&seconds);
+    if (timer == MUSE_TIMER_RUNNING) {
+        snprintf(view.reminder, sizeof(view.reminder), "Timer  %u:%02u", seconds / 60, seconds % 60);
+        const char *next = muse_home_text(cJSON_GetArrayItem(
+            cJSON_GetObjectItemCaseSensitive(s_home_data, "reminders"), 0), "title");
+        if (*next) {
+            char shown[160];
+            snprintf(view.reminder_detail, sizeof(view.reminder_detail), "Next: %.68s",
+                     muse_text_showable(next, shown, sizeof(shown)));
+        } else snprintf(view.reminder_detail, sizeof(view.reminder_detail), "Tap to view reminders and timers");
+    } else if (timer == MUSE_TIMER_RINGING) {
+        snprintf(view.reminder, sizeof(view.reminder), "Timer finished");
+        snprintf(view.reminder_detail, sizeof(view.reminder_detail), "Use the alarm card to dismiss or snooze");
+    } else if (timer == MUSE_TIMER_WAIT_CLOCK) {
+        snprintf(view.reminder, sizeof(view.reminder), "Timer waiting for clock");
+    }
+    home_set_text(s_home_reminder, view.reminder);
+    home_set_text(s_home_reminder_detail, view.reminder_detail);
+    home_set_text(s_home_briefing, view.briefing);
+    muse_hatch_status_t backend;
+    muse_hatch_status(&backend);
+    if (backend.state == MUSE_HATCH_UNREACHABLE)
+        snprintf(view.footer, sizeof(view.footer), "Mac unavailable / cached info");
+    if (!muse_settings_openclaw_token_set()) snprintf(view.footer, sizeof(view.footer), "Set up OpenClaw in Settings");
+    home_set_text(s_home_footer, view.footer);
+    if (s_home_json && connected && lv_tileview_get_tile_active(s_tv) == s_home &&
+        muse_settings_openclaw_token_set() && now >= s_home_refresh && !muse_openai_companion_busy()) {
+        muse_openai_companion_command("{\"action\":\"status\"}");
+        s_home_refresh = now + 30;
+    }
+}
+#endif
+
 static void build_screen(void)
 {
     lv_obj_t *scr = lv_screen_active();
@@ -787,16 +1010,32 @@ static void build_screen(void)
 
     lv_obj_t *face = scr;
     if (muse_board->touch) {
-        /* Swipe left from Muse for settings. */
+        /* Touch navigation keeps settings beside the avatar. */
         s_tv = lv_tileview_create(scr);
         lv_obj_set_style_bg_color(s_tv, lv_color_black(), 0);
         lv_obj_set_style_bg_opa(s_tv, LV_OPA_COVER, 0);
         lv_obj_set_scrollbar_mode(s_tv, LV_SCROLLBAR_MODE_OFF);
-        s_face = lv_tileview_add_tile(s_tv, 0, 0, LV_DIR_RIGHT);
+        int face_column = 0;
+#if CONFIG_MUSE_OPENCLAW
+        if (s_w >= 320 && s_h >= 320) {
+            s_home = lv_tileview_add_tile(s_tv, 0, 0, LV_DIR_RIGHT);
+            build_home();
+            face_column = 1;
+            s_page_count = 3;
+        }
+#endif
+        s_face = lv_tileview_add_tile(s_tv, face_column, 0, face_column ? LV_DIR_HOR : LV_DIR_RIGHT);
         /* It never scrolls, but LVGL would size its scrollbars from all its
          * children every time it draws any part of it. */
         lv_obj_set_scrollbar_mode(s_face, LV_SCROLLBAR_MODE_OFF);
-        s_settings = lv_tileview_add_tile(s_tv, 1, 0, LV_DIR_LEFT);
+        s_settings = lv_tileview_add_tile(s_tv, face_column + 1, 0, LV_DIR_LEFT);
+#if CONFIG_MUSE_OPENCLAW
+        if (s_home) {
+            s_home_navigation.preferred = muse_settings_home_face() ? MUSE_HOME_FACE : MUSE_HOME_DASHBOARD;
+            lv_obj_add_event_cb(s_tv, home_navigation, LV_EVENT_SCROLL_BEGIN, NULL);
+            lv_obj_add_event_cb(s_tv, home_navigation, LV_EVENT_VALUE_CHANGED, NULL);
+        }
+#endif
         face = s_face;
     }
 
@@ -1001,49 +1240,178 @@ static void on_any_press(lv_event_t *e)
 }
 
 #if CONFIG_MUSE_OPENCLAW
+static void stop_mac_job(lv_event_t *e)
+{
+    (void)e;
+    muse_hatch_turn_cancel();
+    muse_state_poke();
+}
+
 static void dismiss_notification(lv_event_t *e)
 {
     (void)e;
+    if (!strcmp(s_shown_notification.kind, "timer_replace")) {
+        muse_timer_cancel_replace();
+        return;
+    }
+    if (!strcmp(s_shown_notification.kind, "reply")) {
+        cJSON *body = cJSON_CreateObject();
+        if (body) {
+            cJSON_AddStringToObject(body, "action", "reply_cancel");
+            cJSON_AddStringToObject(body, "id", s_shown_notification.id);
+        }
+        char *json = body ? cJSON_PrintUnformatted(body) : NULL;
+        if (!json || !muse_openai_companion_command(json)) muse_state_set_caption("DRAFT CANCEL NOT QUEUED");
+        free(json);
+        cJSON_Delete(body);
+        return;
+    }
     muse_openai_notification_dismiss();
+    if (!strcmp(s_shown_notification.kind, "timer") &&
+        muse_timer_status(NULL) == MUSE_TIMER_RINGING) return;
     s_notification_id[0] = '\0';
     lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
     ESP_LOGI(TAG, "iMessage notification dismissed");
 }
 
+static void notification_content(void);
+
+static void notification_layout(bool expanded)
+{
+    s_notification_expanded = expanded;
+    int width = expanded ? (s_small ? s_w - 8 : s_w * 73 / 100) : s_w * 3 / 5;
+    int height = expanded ? (s_small ? s_h - 8 : s_h * 65 / 100) : s_h * 2 / 5;
+    int body_height = LV_MAX(14, height - (s_small ? 64 : 104));
+    lv_obj_set_size(s_notification_card, width, height);
+    lv_obj_align(s_notification_card, LV_ALIGN_CENTER, 0, expanded || s_small ? 0 : s_h / 10);
+    lv_obj_set_height(s_notification_details, body_height);
+    lv_obj_set_flag(s_notification_details, LV_OBJ_FLAG_SCROLLABLE, expanded);
+    lv_obj_set_scrollbar_mode(s_notification_details, expanded ? LV_SCROLLBAR_MODE_AUTO : LV_SCROLLBAR_MODE_OFF);
+    lv_label_set_long_mode(s_notification_preview, expanded ? LV_LABEL_LONG_MODE_WRAP : LV_LABEL_LONG_DOT);
+    lv_obj_set_height(s_notification_preview, expanded ? LV_SIZE_CONTENT : body_height);
+    lv_obj_scroll_to_y(s_notification_details, 0, LV_ANIM_OFF);
+    lv_obj_set_width(s_notification_dismiss, width / 2 - 16);
+    lv_obj_set_width(s_notification_action, width / 2 - 16);
+    s_notification_seconds = 0;
+    notification_content();
+}
+
+static void notification_content(void)
+{
+    const char *text = s_notification_expanded && s_shown_notification.body[0] ?
+                       s_shown_notification.body : s_shown_notification.preview;
+    text = muse_text_showable(text, s_notification_text, sizeof(s_notification_text));
+    if (strcmp(lv_label_get_text(s_notification_preview), text)) lv_label_set_text(s_notification_preview, text);
+    lv_label_set_text(s_notification_hint, s_notification_expanded ?
+                      (!strcmp(s_shown_notification.kind, "reply_wait") ? "Collapse / hold Talk to reply" :
+                       "Tap here to collapse") : !strcmp(s_shown_notification.kind, "reply_wait") ?
+                      "Hold talk to dictate; not sent" : "Tap text to read details");
+}
+
+static void open_notification(lv_event_t *e)
+{
+    (void)e;
+    notification_layout(!s_notification_expanded);
+    muse_state_poke();
+}
+
+static void notification_action(lv_event_t *e)
+{
+    (void)e;
+    if (!strcmp(s_shown_notification.kind, "imessage")) {
+        muse_openai_reply_begin(s_shown_notification.id);
+        s_notification_seconds = 0;
+    } else if (!strcmp(s_shown_notification.kind, "timer")) {
+        if (muse_timer_snooze(300)) {
+            s_notification_id[0] = '\0';
+            lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
+        }
+    } else if (!strcmp(s_shown_notification.kind, "reminder")) {
+        cJSON *body = cJSON_CreateObject();
+        if (body) {
+            cJSON_AddStringToObject(body, "action", "snooze");
+            cJSON_AddStringToObject(body, "id", s_shown_notification.id);
+            cJSON_AddNumberToObject(body, "seconds", 300);
+        }
+        char *json = body ? cJSON_PrintUnformatted(body) : NULL;
+        if (json && muse_openai_companion_command(json)) {
+            muse_state_set_caption("SNOOZE REQUESTED - WAITING FOR MAC");
+        } else muse_state_set_caption("SNOOZE REQUEST NOT QUEUED");
+        free(json);
+        cJSON_Delete(body);
+    } else if (!strcmp(s_shown_notification.kind, "reply") ||
+               !strcmp(s_shown_notification.kind, "timer_replace")) {
+        muse_settings_ui_open_companion(NULL);
+    }
+}
+
 static void update_notification(muse_mode_t mode, float now, bool visible)
 {
+    if (muse_openai_job_active()) {
+        lv_obj_remove_flag(s_stop_job, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_stop_job, LV_OBJ_FLAG_HIDDEN);
+    }
     static muse_notification_t notification;
     float elapsed = s_notification_tick ? now - s_notification_tick : 0;
     s_notification_tick = now;
-    if (!visible || mode != MUSE_MODE_IDLE || !muse_openai_notification(&notification)) {
+    bool available = muse_openai_notification(&notification);
+    bool timer = available && !strcmp(notification.kind, "timer");
+    if (!available || (!timer && (!visible || mode != MUSE_MODE_IDLE))) {
+        if (s_notification_expanded) notification_layout(false);
         lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
         return;
     }
+    bool content_changed = strcmp(notification.id, s_shown_notification.id) ||
+        strcmp(notification.kind, s_shown_notification.kind) ||
+        strcmp(notification.sender, s_shown_notification.sender) ||
+        strcmp(notification.preview, s_shown_notification.preview) ||
+        strcmp(notification.body, s_shown_notification.body);
+    s_shown_notification = notification;
+    const char *action = !strcmp(notification.kind, "imessage") ? "Reply" :
+        (!strcmp(notification.kind, "timer") || !strcmp(notification.kind, "reminder")) ? "Snooze 5m" :
+        (!strcmp(notification.kind, "reply") || !strcmp(notification.kind, "timer_replace")) ? "Review" : NULL;
+    if (action) {
+        lv_label_set_text(s_notification_action_label, action);
+        lv_obj_remove_flag(s_notification_action, LV_OBJ_FLAG_HIDDEN);
+    } else lv_obj_add_flag(s_notification_action, LV_OBJ_FLAG_HIDDEN);
     if (strcmp(notification.id, s_notification_id)) {
+        notification_layout(false);
         strlcpy(s_notification_id, notification.id, sizeof(s_notification_id));
-        lv_label_set_text(s_notification_sender, notification.sender);
-        lv_label_set_text(s_notification_preview, notification.preview);
+        home_set_text(s_notification_sender, notification.sender);
         s_notification_seconds = 0;
         elapsed = 0;
-        if (muse_settings_speaker_on()) muse_voice_request_chirp();
+        if (muse_settings_speaker_on() && (mode == MUSE_MODE_IDLE || (timer && mode == MUSE_MODE_THINKING))) {
+            muse_voice_request_chirp();
+            s_alarm_chirp = now;
+        }
         ESP_LOGI(TAG, "iMessage notification displayed");
     } else if (lv_obj_has_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN)) {
         elapsed = 0;
     }
-    s_notification_seconds += elapsed;
-    if (s_notification_seconds >= 15) {
+    if (content_changed) {
+        home_set_text(s_notification_sender, notification.sender);
+        notification_content();
+    }
+    if (!s_notification_expanded) s_notification_seconds += elapsed;
+    if (s_notification_seconds >= 15 && !strcmp(notification.kind, "imessage")) {
         dismiss_notification(NULL);
         return;
+    }
+    if (timer && (mode == MUSE_MODE_IDLE || mode == MUSE_MODE_THINKING)
+        && muse_settings_speaker_on() && now - s_alarm_chirp >= 10) {
+        muse_voice_request_chirp();
+        s_alarm_chirp = now;
     }
     lv_obj_remove_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
 }
 
 static void build_notification(lv_obj_t *parent)
 {
-    int width = s_w * 3 / 5, height = s_h / 3;
+    int width = s_w * 3 / 5, height = s_h * 2 / 5;
     s_notification_card = lv_obj_create(parent);
     lv_obj_set_size(s_notification_card, width, height);
-    lv_obj_align(s_notification_card, LV_ALIGN_CENTER, 0, s_small ? 0 : s_h / 5);
+    lv_obj_align(s_notification_card, LV_ALIGN_CENTER, 0, s_small ? 0 : s_h / 10);
     lv_obj_set_style_bg_color(s_notification_card, lv_color_hex(COLOR_RING_BG), 0);
     lv_obj_set_style_bg_opa(s_notification_card, LV_OPA_COVER, 0);
     lv_obj_set_style_border_color(s_notification_card, lv_color_hex(COLOR_ACCENT), 0);
@@ -1051,21 +1419,49 @@ static void build_notification(lv_obj_t *parent)
     lv_obj_set_style_pad_all(s_notification_card, s_small ? 3 : 10, 0);
     lv_obj_remove_flag(s_notification_card, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_event_cb(s_notification_card, dismiss_notification, LV_EVENT_CLICKED, NULL);
+    lv_obj_add_event_cb(s_notification_card, open_notification, LV_EVENT_CLICKED, NULL);
     const lv_font_t *font = s_small ? FONT_COMPACT : &lv_font_montserrat_16;
     s_notification_sender = make_label(s_notification_card, font, COLOR_ACCENT);
     lv_obj_set_width(s_notification_sender, LV_PCT(100));
     lv_obj_set_height(s_notification_sender, s_small ? 14 : 20);
     lv_label_set_long_mode(s_notification_sender, LV_LABEL_LONG_DOT);
     lv_obj_align(s_notification_sender, LV_ALIGN_TOP_MID, 0, 0);
-    s_notification_preview = make_label(s_notification_card, font, COLOR_CAPTION);
+    s_notification_details = lv_obj_create(s_notification_card);
+    lv_obj_remove_style_all(s_notification_details);
+    lv_obj_set_width(s_notification_details, LV_PCT(100));
+    lv_obj_align(s_notification_details, LV_ALIGN_TOP_MID, 0, s_small ? 17 : 26);
+    lv_obj_set_scroll_dir(s_notification_details, LV_DIR_VER);
+    lv_obj_set_style_width(s_notification_details, 3, LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_color(s_notification_details, lv_color_hex(COLOR_ACCENT), LV_PART_SCROLLBAR);
+    lv_obj_set_style_bg_opa(s_notification_details, LV_OPA_COVER, LV_PART_SCROLLBAR);
+    lv_obj_remove_flag(s_notification_details, LV_OBJ_FLAG_SCROLL_CHAIN_HOR | LV_OBJ_FLAG_SCROLL_CHAIN_VER |
+                                              LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(s_notification_details, open_notification, LV_EVENT_CLICKED, NULL);
+    s_notification_preview = make_label(s_notification_details, font, COLOR_CAPTION);
     lv_obj_set_width(s_notification_preview, LV_PCT(100));
-    lv_obj_set_height(s_notification_preview, height - (s_small ? 34 : 64));
-    lv_label_set_long_mode(s_notification_preview, LV_LABEL_LONG_DOT);
-    lv_obj_align(s_notification_preview, LV_ALIGN_TOP_MID, 0, s_small ? 15 : 26);
-    lv_obj_t *hint = make_label(s_notification_card, FONT_COMPACT, COLOR_DIM);
-    lv_label_set_text(hint, s_small ? "iMessage" : "iMessage - tap to dismiss");
-    lv_obj_align(hint, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_add_flag(s_notification_preview, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(s_notification_preview, LV_OBJ_FLAG_EVENT_BUBBLE);
+    lv_obj_add_event_cb(s_notification_preview, open_notification, LV_EVENT_CLICKED, NULL);
+    lv_obj_align(s_notification_preview, LV_ALIGN_TOP_MID, 0, 0);
+    s_notification_hint = make_label(s_notification_card, FONT_COMPACT, COLOR_DIM);
+    lv_obj_align(s_notification_hint, LV_ALIGN_BOTTOM_MID, 0, s_small ? -22 : -34);
+    lv_obj_add_flag(s_notification_hint, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(s_notification_hint, open_notification, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dismiss = lv_button_create(s_notification_card);
+    s_notification_dismiss = dismiss;
+    lv_obj_set_size(dismiss, width / 2 - 16, s_small ? 22 : 30);
+    lv_obj_align(dismiss, LV_ALIGN_BOTTOM_LEFT, 0, 0);
+    lv_obj_add_event_cb(dismiss, dismiss_notification, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *dismiss_label = make_label(dismiss, FONT_COMPACT, COLOR_CAPTION);
+    lv_label_set_text(dismiss_label, "Dismiss");
+    lv_obj_center(dismiss_label);
+    s_notification_action = lv_button_create(s_notification_card);
+    lv_obj_set_size(s_notification_action, width / 2 - 16, s_small ? 22 : 30);
+    lv_obj_align(s_notification_action, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_event_cb(s_notification_action, notification_action, LV_EVENT_CLICKED, NULL);
+    s_notification_action_label = make_label(s_notification_action, FONT_COMPACT, COLOR_CAPTION);
+    lv_obj_center(s_notification_action_label);
+    notification_layout(false);
 }
 #endif
 
@@ -1074,10 +1470,18 @@ static void build_overlays(void)
     lv_obj_t *scr = lv_screen_active();
 #if CONFIG_MUSE_OPENCLAW
     build_notification(scr);
+    s_stop_job = lv_button_create(scr);
+    lv_obj_set_size(s_stop_job, 112, 40);
+    lv_obj_align(s_stop_job, LV_ALIGN_BOTTOM_MID, 0, -24);
+    lv_obj_add_event_cb(s_stop_job, stop_mac_job, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *stop_label = make_label(s_stop_job, FONT_COMPACT, COLOR_CAPTION);
+    lv_label_set_text(stop_label, "Stop Mac job");
+    lv_obj_center(stop_label);
+    lv_obj_add_flag(s_stop_job, LV_OBJ_FLAG_HIDDEN);
 #endif
 
     /* Page dots. */
-    for (int i = 0; i < 2 && s_tv; i++) {
+    for (int i = 0; i < s_page_count && s_tv; i++) {
         lv_obj_t *d = lv_obj_create(scr);
         lv_obj_remove_style_all(d);
         lv_obj_set_size(d, 8, 8);
@@ -1085,7 +1489,7 @@ static void build_overlays(void)
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
         lv_obj_set_style_bg_color(d, lv_color_hex(COLOR_DOT_OFF), 0);
         lv_obj_remove_flag(d, LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, i ? 8 : -8, -14);
+        lv_obj_align(d, LV_ALIGN_BOTTOM_MID, (2 * i - s_page_count + 1) * 8, -14);
         s_dots[i] = d;
     }
 
@@ -1231,21 +1635,23 @@ static void update_chrome(float now)
     s_next_settings_tick = now + SETTINGS_TICK_S;
 
     if (s_tv) {
-        int page = lv_tileview_get_tile_active(s_tv) == s_settings;
+        lv_obj_t *tile = lv_tileview_get_tile_active(s_tv);
+        bool settings = tile == s_settings;
+        int page = settings ? s_page_count - 1 : tile == s_face ? s_page_count - 2 : 0;
         bool subpage = muse_settings_ui_in_subpage();
-        bool swipe = !page || !subpage;
+        bool swipe = !settings || !subpage;
         if (swipe != lv_obj_has_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE)) {
             lv_obj_set_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE, swipe);
         }
         int shown = page * 2 + subpage;
         if (shown != s_shown_page) {
-            for (int i = 0; i < 2; i++) {
+            for (int i = 0; i < s_page_count; i++) {
                 lv_obj_set_style_bg_color(s_dots[i], lv_color_hex(i == page ? COLOR_ACCENT : COLOR_DOT_OFF), 0);
-                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, page && subpage);
+                lv_obj_set_flag(s_dots[i], LV_OBJ_FLAG_HIDDEN, settings && subpage);
             }
             s_shown_page = shown;
         }
-        muse_settings_ui_tick(lv_obj_get_scroll_x(s_tv) > 0);
+        muse_settings_ui_tick(settings);
     }
 
     /* Joining, the icon blinks: the compact layout has no state label. */
@@ -1534,6 +1940,19 @@ static void frame_tick(lv_timer_t *timer)
     float now = (float)esp_timer_get_time() / 1e6f;
 
     if (mode != s_last_mode) {
+#if CONFIG_MUSE_OPENCLAW
+        bool active = mode == MUSE_MODE_LISTENING || mode == MUSE_MODE_THINKING || mode == MUSE_MODE_SPEAKING;
+        bool was_active = s_last_mode == MUSE_MODE_LISTENING || s_last_mode == MUSE_MODE_THINKING ||
+                          s_last_mode == MUSE_MODE_SPEAKING;
+        if (s_home && active && !was_active) {
+            image_hide_locked();
+            muse_home_borrow(&s_home_navigation);
+            muse_ui_show_face();
+        } else if (s_home && mode == MUSE_MODE_IDLE) {
+            muse_home_page_t page = muse_home_return(&s_home_navigation);
+            if (page != MUSE_HOME_KEEP) home_select(page == MUSE_HOME_FACE ? s_face : s_home, LV_ANIM_ON);
+        } else
+#endif
         if (mode == MUSE_MODE_LISTENING) {
             image_hide_locked();
             muse_ui_show_face();
@@ -1547,6 +1966,9 @@ static void frame_tick(lv_timer_t *timer)
         return;
     }
     update_chrome(now);
+#if CONFIG_MUSE_OPENCLAW
+    update_home(now);
+#endif
     if (muse_menu_tick(now)) {
         image_hide_locked();
 #if CONFIG_MUSE_OPENCLAW
@@ -1560,11 +1982,13 @@ static void frame_tick(lv_timer_t *timer)
 #endif
         return;   /* the image covers the face */
     }
-    if (s_tv && lv_obj_get_scroll_x(s_tv) != 0) {
+    if (s_tv && (lv_tileview_get_tile_active(s_tv) != s_face ||
+                 lv_obj_get_scroll_x(s_tv) != lv_obj_get_x(s_face))) {
         /* Off screen, or sliding to or from settings: hold still so the
          * slide gets the whole frame time. */
 #if CONFIG_MUSE_OPENCLAW
-        update_notification(mode, now, false);
+        update_notification(mode, now,
+                            s_home && lv_tileview_get_tile_active(s_tv) == s_home);
 #endif
         return;
     }
@@ -1632,6 +2056,12 @@ esp_err_t muse_ui_start(void)
         muse_menu_build(lv_screen_active(), s_w, s_h);
     }
     build_overlays();
+#if CONFIG_MUSE_OPENCLAW
+    if (s_home) {
+        ESP_LOGI(TAG, "Saved default screen: %s", muse_settings_home_face() ? "Muse" : "Home");
+        home_select(muse_settings_home_face() ? s_face : s_home, LV_ANIM_OFF);
+    }
+#endif
     lv_timer_create(frame_tick, muse_board->frame_ms, NULL);
     s_ready = true;
     muse_board->display_unlock();
@@ -1646,7 +2076,27 @@ void muse_ui_show_face(void)
         return;
     }
     lv_obj_add_flag(s_tv, LV_OBJ_FLAG_SCROLLABLE);
+#if CONFIG_MUSE_OPENCLAW
+    if (s_home) {
+        home_select(s_face, LV_ANIM_ON);
+        return;
+    }
+#endif
     lv_tileview_set_tile(s_tv, s_face, LV_ANIM_ON);
+}
+
+void muse_ui_show_settings(void)
+{
+    if (s_tv && s_settings) {
+#if CONFIG_MUSE_OPENCLAW
+        if (s_home) {
+            s_home_navigation.borrowed = false;
+            home_select(s_settings, LV_ANIM_ON);
+            return;
+        }
+#endif
+        lv_tileview_set_tile(s_tv, s_settings, LV_ANIM_ON);
+    }
 }
 
 void muse_ui_set_swipe_enabled(bool enabled)

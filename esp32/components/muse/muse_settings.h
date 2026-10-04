@@ -62,6 +62,11 @@ int muse_settings_brightness(void);     /* 10..100 */
 int muse_settings_sleep_s(void);        /* 0 = never */
 bool muse_settings_wifi_on(void);
 bool muse_settings_ble_on(void);
+bool muse_settings_home_face(void);
+esp_err_t muse_settings_set_home_face(bool face);
+/* INT32_MAX means the Mac's local UTC offset has not been received yet. */
+int32_t muse_settings_home_offset(void);
+esp_err_t muse_settings_set_home_offset(int32_t seconds);
 
 void muse_settings_wifi(char ssid[MUSE_SSID_MAX + 1], char pass[MUSE_PASS_MAX + 1]);
 void muse_settings_hatch_host(char out[MUSE_HOST_MAX + 1]);

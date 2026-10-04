@@ -93,6 +93,21 @@ class OpenAIBackendTest(unittest.TestCase):
     def test_normal_chrome_opt_in_uses_local_skill_without_isolated_browser_fallback(self) -> None:
         self.run_case(9, normal_chrome=True)
 
+    def test_timer_voice_shortcut_skips_chat_and_expired_timer_beats_replacement(self) -> None:
+        self.run_case(11)
+
+    def test_dictated_reply_is_bound_and_never_calls_chat_or_send(self) -> None:
+        self.run_case(12)
+
+    def test_malformed_draft_does_not_ack_original_message(self) -> None:
+        self.run_case(13)
+
+    def test_stop_uses_captured_original_bridge_credentials(self) -> None:
+        self.run_case(14)
+
+    def test_failed_snooze_preserves_card_until_success(self) -> None:
+        self.run_case(15)
+
 
 class FakeBoard:
     def __init__(self, device: dict) -> None:

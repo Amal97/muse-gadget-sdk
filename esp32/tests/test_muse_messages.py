@@ -54,6 +54,47 @@ class InboxTest(unittest.TestCase):
         self.assertEqual((self.root / "messages.sqlite").stat().st_mode & 0o777, 0o600)
         restarted.close()
 
+    def group_fixture(self) -> str:
+        self.inbox.ingest(self.add(101))
+        notification = self.inbox.poll("")["notification"]["id"]
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.execute("CREATE TABLE chat (ROWID INTEGER PRIMARY KEY,guid TEXT,service_name TEXT,"
+                       "display_name TEXT,chat_identifier TEXT)")
+            db.execute("CREATE TABLE chat_message_join (chat_id INTEGER,message_id INTEGER)")
+            db.execute("CREATE TABLE handle (ROWID INTEGER PRIMARY KEY,id TEXT)")
+            db.execute("CREATE TABLE chat_handle_join (chat_id INTEGER,handle_id INTEGER)")
+            db.execute("INSERT INTO chat VALUES (1,'iMessage;+;fixture-group','iMessage','Fixture group','group')")
+            db.execute("INSERT INTO chat_message_join VALUES (1,101)")
+            db.executemany("INSERT INTO handle VALUES (?,?)", [(1, "+15555550100"), (2, "fixture@example.invalid")])
+            db.executemany("INSERT INTO chat_handle_join VALUES (1,?)", [(1,), (2,)])
+        return notification
+
+    def test_reply_uses_exact_group_guid_and_all_participants_not_preview_sender(self) -> None:
+        target = self.inbox.reply_target(self.group_fixture())
+        self.assertEqual(target, {"chat_guid": "iMessage;+;fixture-group",
+                                 "recipient": "Fixture group: +15555550100; fixture@example.invalid"})
+        self.assertNotIn("Test sender", target["recipient"])
+
+    def test_ambiguous_or_missing_group_participants_are_never_guessed(self) -> None:
+        notification = self.group_fixture()
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.execute("INSERT INTO chat VALUES (2,'iMessage;+;other','iMessage','','other')")
+            db.execute("INSERT INTO chat_message_join VALUES (2,101)")
+        with self.assertRaisesRegex(ValueError, "safely resolved"):
+            self.inbox.reply_target(notification)
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.execute("DELETE FROM chat_message_join WHERE chat_id=2")
+            db.execute("DELETE FROM handle WHERE ROWID=2")
+        with self.assertRaisesRegex(ValueError, "participants"):
+            self.inbox.reply_target(notification)
+
+    def test_sms_conversation_is_rejected_even_for_an_imessage_preview(self) -> None:
+        notification = self.group_fixture()
+        with closing(sqlite3.connect(self.source)) as db, db:
+            db.execute("UPDATE chat SET service_name='SMS',guid='SMS;-;fixture'")
+        with self.assertRaisesRegex(ValueError, "safely resolved"):
+            self.inbox.reply_target(notification)
+
     def test_filters_outgoing_sms_reactions_and_system_messages_without_replaying(self) -> None:
         for rowid, options in ((101, {"outgoing": 1}), (102, {"service": "SMS"}),
                                (103, {"reaction": 2000}), (104, {"system": 1})):

@@ -10,7 +10,10 @@ typedef struct {
     char id[33];
     char sender[97];
     char preview[257];
+    char kind[17];
+    char body[2048];
 } muse_notification_t;
 
 bool muse_openai_notification(muse_notification_t *out);
 void muse_openai_notification_dismiss(void);
+bool muse_openai_job_active(void);

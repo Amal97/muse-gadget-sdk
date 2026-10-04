@@ -41,6 +41,10 @@
 #if CONFIG_MUSE_OPENAI
 #include "muse_openai.h"
 #endif
+#if CONFIG_MUSE_OPENCLAW
+#include "cJSON.h"
+#include "muse_companion.h"
+#endif
 
 /* Keep content in a column that stays inside a round panel (and fits a 368 px one). */
 #define LIST_W 330
@@ -93,6 +97,21 @@ static char s_join_ssid[MUSE_SSID_MAX + 1];
 static lv_obj_t *s_hatch_status, *s_hatch_token;
 #if CONFIG_MUSE_OPENCLAW
 static lv_obj_t *s_openclaw_url, *s_openclaw_token;
+static lv_obj_t *s_companion, *s_companion_list, *s_companion_status, *s_timer_status;
+static lv_obj_t *s_replace_timer, *s_cancel_replace, *s_replace_timer_text;
+static unsigned s_shown_replace_seconds;
+static char *s_companion_view;
+static char s_companion_detail[2048], s_reminder_title[161], s_draft_id[33], s_latest_job[33];
+static char s_calendar_ids[32][257];
+static unsigned s_companion_view_version = UINT32_MAX;
+static int64_t s_companion_refresh;
+static bool s_focus_draft;
+static const char *const FAVOURITE_IDS[] = {
+    "timer_5", "timer_10", "timer_custom", "reminder", "briefing", "dashboard"
+};
+static const char *const FAVOURITE_LABELS[] = {
+    "5-minute timer", "10-minute timer", "Custom timer", "Add reminder", "Morning briefing", "Dashboard"
+};
 #endif
 #if !CONFIG_MUSE_OPENAI
 static lv_obj_t *s_hatch_host, *s_hatch_vm;
@@ -276,7 +295,7 @@ static lv_obj_t *row(lv_obj_t *list, const char *icon, const char *text, lv_obj_
     return c;
 }
 
-static lv_obj_t *switch_row(lv_obj_t *list, const char *text, bool on, lv_event_cb_t cb)
+static lv_obj_t *switch_row_data(lv_obj_t *list, const char *text, bool on, lv_event_cb_t cb, void *user)
 {
     lv_obj_t *c = card(list, false);
     lv_obj_t *t = label(c, &lv_font_montserrat_20, COLOR_TEXT, text);
@@ -288,8 +307,13 @@ static lv_obj_t *switch_row(lv_obj_t *list, const char *text, bool on, lv_event_
     if (on) {
         lv_obj_add_state(sw, LV_STATE_CHECKED);
     }
-    lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, NULL);
+    lv_obj_add_event_cb(sw, cb, LV_EVENT_VALUE_CHANGED, user);
     return sw;
+}
+
+static lv_obj_t *switch_row(lv_obj_t *list, const char *text, bool on, lv_event_cb_t cb)
+{
+    return switch_row_data(list, text, on, cb, NULL);
 }
 
 static lv_obj_t *button(lv_obj_t *list, const char *text, uint32_t color, lv_event_cb_t cb, lv_obj_t **label_out)
@@ -372,6 +396,12 @@ static void drop(lv_obj_t *p)
         if (*pages[i] == p) {
             *pages[i] = NULL;
         }
+#if CONFIG_MUSE_OPENCLAW
+        if (p == s_companion) {
+            s_companion = NULL;
+            s_companion_list = s_companion_status = s_timer_status = NULL;
+        }
+#endif
     }
     lv_obj_delete_async(p);   /* we may be in one of its own events */
 }
@@ -417,6 +447,7 @@ static void on_nav(lv_event_t *e)
     if (!*page->obj) {
         page->build(s_tile);
     }
+    if (!*page->obj) return;
     show(*page->obj);
     muse_settings_ui_tick(true);   /* fill it in now, not at the next tick */
 }
@@ -1350,6 +1381,365 @@ static void build_power_page(lv_obj_t *tile)
 
 /* ---------- Home ---------- */
 
+#if CONFIG_MUSE_OPENCLAW
+static lv_obj_t *companion_note(lv_obj_t *list, const char *text)
+{
+    char shown[2048];
+    lv_obj_t *l = lv_label_create(list);
+    lv_obj_set_width(l, lv_pct(100));
+    lv_obj_set_style_text_font(l, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(l, lv_color_hex(COLOR_DIM), 0);
+    lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_WRAP);
+    lv_label_set_text(l, muse_text_showable(text, shown, sizeof(shown)));
+    return l;
+}
+
+static const char *json_text(cJSON *object, const char *key)
+{
+    cJSON *item = cJSON_GetObjectItemCaseSensitive(object, key);
+    return cJSON_IsString(item) ? item->valuestring : "";
+}
+
+static void send_companion(cJSON *body)
+{
+    char *json = body ? cJSON_PrintUnformatted(body) : NULL;
+    if (!json || !muse_openai_companion_command(json)) {
+        muse_state_set_caption("MAC REQUEST NOT QUEUED - TRY WHEN IDLE");
+        if (s_companion_status) set_text(s_companion_status, "Request not queued. Try when idle.");
+    } else if (s_companion_status) {
+        set_text(s_companion_status, "Request queued; waiting for Mac.");
+    }
+    free(json);
+    cJSON_Delete(body);
+}
+
+static cJSON *action_body(const char *action)
+{
+    cJSON *body = cJSON_CreateObject();
+    if (body && !cJSON_AddStringToObject(body, "action", action)) {
+        cJSON_Delete(body);
+        return NULL;
+    }
+    return body;
+}
+
+static void on_companion_action(lv_event_t *e)
+{
+    send_companion(action_body(lv_event_get_user_data(e)));
+}
+
+static unsigned minutes_value(const char *text)
+{
+    if (!text || !text[0] || strspn(text, "0123456789") != strlen(text)) return 0;
+    unsigned long value = strtoul(text, NULL, 10);
+    return value >= 1 && value <= 10080 ? (unsigned)value : 0;
+}
+
+static void timer_minutes_done(const char *text)
+{
+    unsigned minutes = minutes_value(text);
+    if (!minutes) {
+        muse_state_set_caption("ENTER 1 TO 10080 MINUTES");
+        return;
+    }
+    muse_timer_start(minutes * 60);
+}
+
+static void reminder_minutes_done(const char *text)
+{
+    unsigned minutes = minutes_value(text);
+    if (!minutes) {
+        muse_state_set_caption("ENTER 1 TO 10080 MINUTES");
+        return;
+    }
+    cJSON *body = action_body("reminder");
+    if (body) {
+        cJSON_AddStringToObject(body, "title", s_reminder_title);
+        cJSON_AddNumberToObject(body, "after_seconds", minutes * 60);
+    }
+    send_companion(body);
+}
+
+static void reminder_title_done(const char *text)
+{
+    if (!text || !text[0]) {
+        muse_state_set_caption("REMINDER TITLE REQUIRED");
+        return;
+    }
+    strlcpy(s_reminder_title, text, sizeof(s_reminder_title));
+    open_text("After minutes", "10", false, 5, "1 to 10080", reminder_minutes_done, s_companion);
+}
+
+static void on_quick_action(lv_event_t *e)
+{
+    intptr_t index = (intptr_t)lv_event_get_user_data(e);
+    if (index == 0 || index == 1) muse_timer_start(index == 0 ? 300 : 600);
+    else if (index == 2) open_text("Timer minutes", "5", false, 5, "1 to 10080", timer_minutes_done, s_companion);
+    else if (index == 3) open_text("Reminder title", "", false, 160, "What to remember", reminder_title_done, s_companion);
+    else if (index == 4) send_companion(action_body("briefing"));
+    else if (index == 5) send_companion(action_body("status"));
+}
+
+static void on_timer_dismiss(lv_event_t *e) { (void)e; muse_timer_dismiss(); }
+static void on_timer_replace(lv_event_t *e) { (void)e; muse_timer_confirm_replace(s_shown_replace_seconds); }
+static void on_timer_keep(lv_event_t *e) { (void)e; muse_timer_cancel_replace(); }
+
+static void on_companion_switch(lv_event_t *e)
+{
+    cJSON *body = action_body("settings");
+    cJSON *settings = body ? cJSON_AddObjectToObject(body, "settings") : NULL;
+    if (settings) cJSON_AddBoolToObject(settings, lv_event_get_user_data(e),
+                                     lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+    send_companion(body);
+}
+
+static void on_calendar_toggle(lv_event_t *e)
+{
+    intptr_t index = (intptr_t)lv_event_get_user_data(e);
+    cJSON *body = action_body("calendar_toggle");
+    if (body) {
+        cJSON_AddStringToObject(body, "id", s_calendar_ids[index]);
+        cJSON_AddBoolToObject(body, "enabled", lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+    }
+    send_companion(body);
+}
+
+static void on_favourite_toggle(lv_event_t *e)
+{
+    intptr_t index = (intptr_t)lv_event_get_user_data(e);
+    cJSON *body = action_body("favourite_toggle");
+    if (body) {
+        cJSON_AddStringToObject(body, "id", FAVOURITE_IDS[index]);
+        cJSON_AddBoolToObject(body, "enabled", lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+    }
+    send_companion(body);
+}
+
+static void on_draft_action(lv_event_t *e)
+{
+    const char *action = lv_event_get_user_data(e);
+    cJSON *body = action_body(action);
+    if (body) cJSON_AddStringToObject(body, "id", s_draft_id);
+    if (body && !strcmp(action, "reply_confirm")) {
+        cJSON *root = cJSON_Parse(s_companion_view);
+        cJSON *draft = cJSON_GetObjectItemCaseSensitive(root, "draft");
+        cJSON_AddStringToObject(body, "text", json_text(draft, "text"));
+        cJSON_AddStringToObject(body, "recipient", json_text(draft, "recipient"));
+        cJSON_Delete(root);
+    }
+    send_companion(body);
+}
+
+static void draft_edit_done(const char *text)
+{
+    cJSON *body = action_body("reply_edit");
+    if (body) {
+        cJSON_AddStringToObject(body, "id", s_draft_id);
+        cJSON_AddStringToObject(body, "text", text);
+    }
+    send_companion(body);
+}
+
+static void on_edit_draft(lv_event_t *e)
+{
+    (void)e;
+    cJSON *root = cJSON_Parse(s_companion_view);
+    open_text("Edit reply", json_text(cJSON_GetObjectItemCaseSensitive(root, "draft"), "text"),
+              false, 1800, "Review before sending", draft_edit_done, s_companion);
+    cJSON_Delete(root);
+}
+
+static void on_stop_latest_job(lv_event_t *e)
+{
+    (void)e;
+    cJSON *body = action_body("job_cancel");
+    if (body) cJSON_AddStringToObject(body, "id", s_latest_job);
+    send_companion(body);
+}
+
+static void fill_companion(void)
+{
+    int32_t scroll_y = lv_obj_get_scroll_y(s_companion_list);
+    lv_obj_t *draft_heading = NULL;
+    lv_obj_clean(s_companion_list);
+    cJSON *root = cJSON_Parse(s_companion_view);
+    cJSON *settings = cJSON_GetObjectItemCaseSensitive(root, "settings");
+    cJSON *favourites = cJSON_GetObjectItemCaseSensitive(settings, "favourites");
+    if (s_companion_detail[0]) companion_note(s_companion_list, s_companion_detail);
+    note(s_companion_list, "QUICK ACTIONS");
+    bool selected[6] = {0};
+    for (cJSON *item = favourites ? favourites->child : NULL; item; item = item->next) {
+        for (int i = 0; i < 6; i++) {
+            if (cJSON_IsString(item) && !strcmp(item->valuestring, FAVOURITE_IDS[i])) selected[i] = true;
+        }
+    }
+    if (!favourites) selected[0] = selected[1] = selected[4] = selected[5] = true;
+    for (int i = 0; i < 6; i++) {
+        if (selected[i]) row(s_companion_list, NULL, FAVOURITE_LABELS[i], NULL,
+                             on_quick_action, (void *)(intptr_t)i);
+    }
+    s_timer_status = companion_note(s_companion_list, "");
+    s_replace_timer_text = companion_note(s_companion_list, "");
+    s_replace_timer = button(s_companion_list, "Confirm timer replacement", COLOR_WARN, on_timer_replace, NULL);
+    s_cancel_replace = button(s_companion_list, "Keep existing timer", COLOR_TEXT, on_timer_keep, NULL);
+    lv_obj_add_flag(s_replace_timer_text, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_replace_timer, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(s_cancel_replace, LV_OBJ_FLAG_HIDDEN);
+    row(s_companion_list, NULL, "Custom timer", NULL, on_quick_action, (void *)(intptr_t)2);
+    button(s_companion_list, "Dismiss / cancel timer", COLOR_TEXT, on_timer_dismiss, NULL);
+    row(s_companion_list, NULL, "Add reminder", NULL, on_quick_action, (void *)(intptr_t)3);
+    cJSON *reminders = cJSON_GetObjectItemCaseSensitive(root, "reminders");
+    note(s_companion_list, "REMINDERS");
+    for (cJSON *item = reminders ? reminders->child : NULL; item; item = item->next) {
+        companion_note(s_companion_list, json_text(item, "title"));
+    }
+    cJSON *draft = cJSON_GetObjectItemCaseSensitive(root, "draft");
+    if (cJSON_IsObject(draft)) {
+        draft_heading = companion_note(s_companion_list, "REPLY - CHECK CONVERSATION AND FULL TEXT");
+        companion_note(s_companion_list, json_text(draft, "recipient"));
+        companion_note(s_companion_list, json_text(draft, "text"));
+        companion_note(s_companion_list, json_text(draft, "detail"));
+        strlcpy(s_draft_id, json_text(draft, "id"), sizeof(s_draft_id));
+        if (!strcmp(json_text(draft, "state"), "unconfirmed")) {
+            char shown[2048];
+            const char *text = json_text(draft, "text");
+            bool exact = !strcmp(text, muse_text_showable(text, shown, sizeof(shown)));
+            const char *recipient = json_text(draft, "recipient");
+            exact = exact && !strcmp(recipient, muse_text_showable(recipient, shown, sizeof(shown)));
+            if (exact) row(s_companion_list, NULL, "Confirm and send iMessage", NULL,
+                           on_draft_action, "reply_confirm");
+            else note(s_companion_list, "Unsupported characters: edit to plain text or use Messages. Sending is disabled.");
+            button(s_companion_list, "Edit draft", COLOR_TEXT, on_edit_draft, NULL);
+            row(s_companion_list, NULL, "Cancel draft - do not send", NULL, on_draft_action, "reply_cancel");
+        }
+    }
+    note(s_companion_list, "DASHBOARD");
+    note(s_companion_list, muse_wifi_connected() ? "Wi-Fi: connected" : "Wi-Fi: offline");
+    cJSON *connectivity = cJSON_GetObjectItemCaseSensitive(root, "connectivity");
+    char text[160];
+    snprintf(text, sizeof(text), "Gateway: %s\nNormal Chrome: %s\nChecks cached for up to 60 seconds.",
+             json_text(connectivity, "gateway"), json_text(connectivity, "browser"));
+    companion_note(s_companion_list, text);
+    cJSON *usage = cJSON_GetObjectItemCaseSensitive(root, "usage");
+    cJSON *cost = cJSON_GetObjectItemCaseSensitive(usage, "estimated_model_usd");
+    cJSON *unpriced = cJSON_GetObjectItemCaseSensitive(usage, "unpriced_jobs");
+    if (cJSON_IsNumber(cost)) snprintf(text, sizeof(text), "Known model estimate: $%.4f USD\nUnpriced / incomplete jobs: %.0f",
+                                     cost->valuedouble, cJSON_IsNumber(unpriced) ? unpriced->valuedouble : 0);
+    else strlcpy(text, "Tracked model estimate unavailable; unknown is not zero.", sizeof(text));
+    companion_note(s_companion_list, text);
+    companion_note(s_companion_list, "Not account billing. Mini voice model budget examples: STT about $0.003/min; "
+                   "TTS about $0.015/min. Voice usage is paid separately and not metered here.");
+    note(s_companion_list, muse_settings_speaker_on() ? "Speaker: enabled" : "Speaker: muted");
+    note(s_companion_list, muse_settings_openai_key_len() ? "Voice key: configured (not a connectivity test)" :
+                                                         "Voice key: not configured");
+    cJSON *job = cJSON_GetObjectItemCaseSensitive(root, "last_job");
+    if (cJSON_IsObject(job)) {
+        companion_note(s_companion_list, json_text(job, "detail"));
+        companion_note(s_companion_list, json_text(job, "reply"));
+        strlcpy(s_latest_job, json_text(job, "id"), sizeof(s_latest_job));
+        const char *state = json_text(job, "status");
+        if (!strcmp(state, "starting") || !strcmp(state, "running") || !strcmp(state, "stopping")) {
+            button(s_companion_list, "Stop active Mac job", COLOR_DANGER, on_stop_latest_job, NULL);
+        }
+    }
+    note(s_companion_list, "MORNING BRIEFING");
+    cJSON *briefing = cJSON_GetObjectItemCaseSensitive(root, "briefing");
+    companion_note(s_companion_list, json_text(briefing, "body"));
+    companion_note(s_companion_list, json_text(briefing, "state"));
+    row(s_companion_list, NULL, "Refresh / build briefing", NULL, on_companion_action, "briefing");
+    switch_row_data(s_companion_list, "Daily briefing", cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(settings, "briefing_enabled")), on_companion_switch, "briefing_enabled");
+    note(s_companion_list, "Schedule uses Mac local time; edit hour/minute in companion settings via the local helper.");
+    switch_row_data(s_companion_list, "Include calendars", cJSON_IsTrue(
+        cJSON_GetObjectItemCaseSensitive(settings, "calendars_enabled")), on_companion_switch, "calendars_enabled");
+    row(s_companion_list, NULL, "Refresh calendar list", NULL, on_companion_action, "calendars");
+    cJSON *calendars = cJSON_GetObjectItemCaseSensitive(root, "calendars");
+    int index = 0;
+    for (cJSON *item = calendars ? calendars->child : NULL; item && index < 32; item = item->next, index++) {
+        strlcpy(s_calendar_ids[index], json_text(item, "id"), sizeof(s_calendar_ids[index]));
+        switch_row_data(s_companion_list, json_text(item, "name"), cJSON_IsTrue(
+            cJSON_GetObjectItemCaseSensitive(item, "enabled")), on_calendar_toggle, (void *)(intptr_t)index);
+    }
+    if (cJSON_GetArraySize(calendars) > 32) {
+        companion_note(s_companion_list, "Showing the first 32 calendars; manage other selections with the Mac helper.");
+    }
+    note(s_companion_list, "FAVOURITE CARDS");
+    for (int i = 0; i < 6; i++) switch_row_data(s_companion_list, FAVOURITE_LABELS[i], selected[i],
+                                              on_favourite_toggle, (void *)(intptr_t)i);
+    s_companion_status = companion_note(s_companion_list, "Refresh status after changing settings.");
+    row(s_companion_list, NULL, "Refresh status", NULL, on_companion_action, "status");
+    lv_obj_update_layout(s_companion_list);
+    if (s_focus_draft && draft_heading) lv_obj_scroll_to_view(draft_heading, LV_ANIM_OFF);
+    else lv_obj_scroll_to_y(s_companion_list, scroll_y, LV_ANIM_OFF);
+    s_focus_draft = false;
+    cJSON_Delete(root);
+}
+
+static void build_companion_page(lv_obj_t *tile)
+{
+    if (!s_companion_view) {
+        s_companion_view = malloc(16384);
+        if (!s_companion_view) {
+            muse_state_set_caption("NO MEMORY FOR COMPANION PAGE");
+            return;
+        }
+        strlcpy(s_companion_view, "{}", 16384);
+    }
+    muse_openai_companion_snapshot(s_companion_view, 16384, &s_companion_view_version);
+    s_companion = page(tile, "COMPANION", true, &s_companion_list);
+    fill_companion();
+    muse_openai_companion_command("{\"action\":\"status\"}");
+    s_companion_refresh = esp_timer_get_time();
+}
+
+static void tick_companion(void)
+{
+    if (muse_openai_companion_snapshot(s_companion_view, 16384, &s_companion_view_version)) fill_companion();
+    unsigned seconds = 0;
+    muse_timer_state_t state = muse_timer_status(&seconds);
+    char text[96];
+    if (state == MUSE_TIMER_RUNNING) snprintf(text, sizeof(text), "Local timer: %u:%02u remaining", seconds / 60, seconds % 60);
+    else strlcpy(text, state == MUSE_TIMER_RINGING ? "LOCAL TIMER ALARM" :
+                 state == MUSE_TIMER_WAIT_CLOCK ? "Timer waiting for clock after restart" : "Local timer: off", sizeof(text));
+    set_text(s_timer_status, text);
+    s_shown_replace_seconds = muse_timer_pending();
+    if (s_shown_replace_seconds) {
+        snprintf(text, sizeof(text), "Replace the existing timer with %u:%02u? It will restart from confirmation.",
+                 s_shown_replace_seconds / 60, s_shown_replace_seconds % 60);
+        set_text(s_replace_timer_text, text);
+        lv_obj_remove_flag(s_replace_timer_text, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_replace_timer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_cancel_replace, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(s_replace_timer_text, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_replace_timer, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_cancel_replace, LV_OBJ_FLAG_HIDDEN);
+    }
+    muse_hatch_status_t status;
+    muse_hatch_status(&status);
+    if (status.state == MUSE_HATCH_UNREACHABLE) set_text(s_companion_status, status.detail);
+    int64_t now = esp_timer_get_time();
+    if (now - s_companion_refresh >= 5000000 && !muse_openai_companion_busy()) {
+        muse_openai_companion_command("{\"action\":\"status\"}");
+        s_companion_refresh = now;
+    }
+}
+
+void muse_settings_ui_open_companion(const char *detail)
+{
+    s_focus_draft = !detail;
+    strlcpy(s_companion_detail, detail ? detail : "", sizeof(s_companion_detail));
+    if (!s_companion) build_companion_page(s_tile);
+    else fill_companion();
+    if (s_companion) {
+        show(s_companion);
+        muse_ui_show_settings();
+    }
+}
+
+static const page_t COMPANION = { &s_companion, build_companion_page };
+#endif
+
 static const page_t WIFI = { &s_wifi, build_wifi_page };
 static const page_t HATCH = { &s_hatch, build_hatch_page };
 static const page_t BLE = { &s_ble, build_ble_page };
@@ -1366,6 +1756,7 @@ static void build_home(lv_obj_t *tile)
 #if CONFIG_MUSE_OPENAI
 #if CONFIG_MUSE_OPENCLAW
     row(list, LV_SYMBOL_HOME, "OpenClaw", &s_home_hatch, on_nav, (void *)&HATCH);
+    row(list, LV_SYMBOL_HOME, "Companion", NULL, on_nav, (void *)&COMPANION);
 #else
     row(list, LV_SYMBOL_HOME, "OpenAI", &s_home_hatch, on_nav, (void *)&HATCH);
 #endif
@@ -1455,6 +1846,11 @@ void muse_settings_ui_tick(bool visible)
     } else if (s_current == s_battery) {
         tick_battery();
     }
+#if CONFIG_MUSE_OPENCLAW
+    else if (s_current == s_companion) {
+        tick_companion();
+    }
+#endif
 }
 
 bool muse_settings_ui_in_subpage(void)

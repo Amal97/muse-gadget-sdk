@@ -47,6 +47,9 @@ typedef struct { int unused; } lv_obj_t;
 typedef struct { int unused; } lv_event_t;
 typedef struct { int unused; } page_t;
 static page_t WIFI, HATCH, BLE, SOUND, SLEEP, BATTERY, POWER;
+#if CONFIG_MUSE_OPENCLAW
+static page_t COMPANION;
+#endif
 static lv_obj_t object;
 static lv_obj_t *s_home, *s_hatch, *s_home_wifi, *s_home_hatch, *s_home_ble;
 static lv_obj_t *s_home_sound, *s_home_sleep, *s_home_battery, *s_about;

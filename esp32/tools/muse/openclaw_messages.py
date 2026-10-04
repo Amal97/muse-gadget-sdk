@@ -117,6 +117,30 @@ class MessageInbox:
             raise RuntimeError(error)
         return result
 
+    def reply_target(self, notification_id: str) -> dict[str, str]:
+        with self.lock, self.connect() as db:
+            row = db.execute("SELECT source_id FROM notifications WHERE id=?", (notification_id,)).fetchone()
+        if row is None:
+            raise ValueError("This message preview is no longer available for a bound reply.")
+        with closing(sqlite3.connect(self.messages_db.resolve().as_uri() + "?mode=ro", uri=True,
+                                     timeout=5)) as db:
+            chats = db.execute(
+                "SELECT DISTINCT c.ROWID,c.guid,c.service_name,c.display_name,c.chat_identifier "
+                "FROM chat c JOIN chat_message_join j ON j.chat_id=c.ROWID "
+                "WHERE j.message_id=?", (row[0],)).fetchall()
+            if len(chats) != 1 or chats[0][2] != "iMessage" or not isinstance(chats[0][1], str):
+                raise ValueError("The exact iMessage conversation cannot be safely resolved.")
+            chat_id, guid, _, name, chat_identifier = chats[0]
+            handles = [r[0] for r in db.execute(
+                "SELECT DISTINCT h.id FROM chat_handle_join j LEFT JOIN handle h ON j.handle_id=h.ROWID "
+                "WHERE j.chat_id=? ORDER BY h.id", (chat_id,))]
+        if not handles or any(not isinstance(handle, str) or not handle.strip() for handle in handles):
+            raise ValueError("Conversation participants are unavailable; reply in Messages instead.")
+        recipient = ((name + ": ") if isinstance(name, str) and name else "") + "; ".join(handles)
+        if not guid.startswith("iMessage;") or len(guid.encode()) > 512 or len(recipient.encode()) > 1023:
+            raise ValueError("Conversation cannot be fully confirmed on this device; use Messages instead.")
+        return {"chat_guid": guid, "recipient": recipient}
+
     def start(self) -> None:
         self.thread = threading.Thread(target=self.watch, name="imessage-watch", daemon=True)
         self.thread.start()

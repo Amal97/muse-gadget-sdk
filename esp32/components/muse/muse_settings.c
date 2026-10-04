@@ -40,6 +40,8 @@ static struct {
     uint16_t sleep_s;
     bool wifi_on;
     bool ble_on;
+    bool home_face;
+    int32_t home_offset;
     char ssid[MUSE_SSID_MAX + 1];
     char pass[MUSE_PASS_MAX + 1];
     char host[MUSE_HOST_MAX + 1];
@@ -56,6 +58,7 @@ static struct {
     .sleep_s = 120,
     .wifi_on = true,
     .host = DEFAULT_HOST,
+    .home_offset = INT32_MAX,
 };
 
 static SemaphoreHandle_t s_lock;
@@ -139,6 +142,13 @@ esp_err_t muse_settings_init(void)
     load_str("openai_key", s.openai_key, sizeof(s.openai_key));
     load_str("oc_url", s.openclaw_url, sizeof(s.openclaw_url));
     load_str("oc_token", s.openclaw_token, sizeof(s.openclaw_token));
+    esp_err_t home_err = nvs_get_u8(s_nvs, "home_face", &b);
+    if (home_err == ESP_OK && b <= 1) s.home_face = b;
+    else if (home_err != ESP_ERR_NVS_NOT_FOUND) ESP_LOGW(TAG, "Invalid saved home preference");
+    int32_t offset;
+    home_err = nvs_get_i32(s_nvs, "home_offset", &offset);
+    if (home_err == ESP_OK && offset >= -50400 && offset <= 50400 && offset % 60 == 0) s.home_offset = offset;
+    else if (home_err != ESP_ERR_NVS_NOT_FOUND) ESP_LOGW(TAG, "Invalid saved home timezone");
 
     s.volume = clampi(s.volume, 0, 100);
     s.mic_gain = clampi(s.mic_gain, 0, MUSE_MIC_GAIN_MAX);
@@ -161,6 +171,41 @@ int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
 bool muse_settings_wifi_on(void) { return s.wifi_on; }
 bool muse_settings_ble_on(void) { return s.ble_on; }
+
+bool muse_settings_home_face(void) { return s.home_face; }
+int32_t muse_settings_home_offset(void) { return s.home_offset; }
+
+esp_err_t muse_settings_set_home_face(bool face)
+{
+    esp_err_t err = ESP_OK;
+    LOCKED({
+        if (s.home_face != face) {
+            err = nvs_set_u8(s_nvs, "home_face", face);
+            if (err == ESP_OK) err = nvs_commit(s_nvs);
+            if (err == ESP_OK) s.home_face = face;
+        }
+    });
+    if (err != ESP_OK) ESP_LOGE(TAG, "Home preference save failed: %s", esp_err_to_name(err));
+    return err;
+}
+
+esp_err_t muse_settings_set_home_offset(int32_t seconds)
+{
+    if (seconds < -50400 || seconds > 50400 || seconds % 60) {
+        ESP_LOGE(TAG, "Invalid home timezone offset");
+        return ESP_ERR_INVALID_ARG;
+    }
+    esp_err_t err = ESP_OK;
+    LOCKED({
+        if (s.home_offset != seconds) {
+            err = nvs_set_i32(s_nvs, "home_offset", seconds);
+            if (err == ESP_OK) err = nvs_commit(s_nvs);
+            if (err == ESP_OK) s.home_offset = seconds;
+        }
+    });
+    if (err != ESP_OK) ESP_LOGE(TAG, "Home timezone save failed: %s", esp_err_to_name(err));
+    return err;
+}
 
 /* Home Link owns the saved networks (this is the first); the local copy is only a fallback. */
 void muse_settings_wifi(char ssid[MUSE_SSID_MAX + 1], char pass[MUSE_PASS_MAX + 1])

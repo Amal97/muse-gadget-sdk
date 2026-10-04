@@ -131,6 +131,20 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.request({}, path=bridge.CHAT_PATH + "?model=main")[0], 404)
         self.assertEqual(Upstream.records, [])
 
+    def test_response_limit_is_enforced_at_exact_byte_boundary(self) -> None:
+        companion = Mock()
+        overhead = len(json.dumps({"payload": ""}).encode())
+        with patch.object(self.server, "companion", companion):
+            companion.handle.return_value = {"payload": "x" * (bridge.JSON_CAP - overhead - 1)}
+            code, result = self.request({"action": "calendars"}, path=bridge.COMPANION_PATH)
+            self.assertEqual(code, 200)
+            self.assertEqual(len(json.dumps({"payload": result["payload"]}).encode()), bridge.JSON_CAP - 1)
+            companion.handle.return_value = {"payload": "x" * bridge.JSON_CAP}
+            with self.assertLogs(level="ERROR"):
+                code, result = self.request({"action": "calendars"}, path=bridge.COMPANION_PATH)
+            self.assertEqual(code, 413)
+            self.assertLess(len(json.dumps(result).encode()), bridge.JSON_CAP)
+
     def test_notification_endpoint_is_authenticated_local_and_opt_in(self) -> None:
         self.assertEqual(self.request({"ack": ""}, path=bridge.NOTIFICATION_PATH)[0], 404)
         inbox = Mock()
