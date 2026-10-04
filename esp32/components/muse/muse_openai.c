@@ -709,7 +709,11 @@ void muse_hatch_status(muse_hatch_status_t *out)
     portEXIT_CRITICAL(&s_status_lock);
     if (!muse_settings_openai_key_len()) {
         out->state = MUSE_HATCH_NOT_SET;
+#if CONFIG_MUSE_OPENCLAW
+        strlcpy(out->detail, "Set voice key in Settings > OpenClaw", sizeof(out->detail));
+#else
         strlcpy(out->detail, "Set API key in Settings > OpenAI", sizeof(out->detail));
+#endif
     } else if (!muse_wifi_connected()) {
         out->state = MUSE_HATCH_OFFLINE;
         strlcpy(out->detail, "Set up Wi-Fi in Settings", sizeof(out->detail));

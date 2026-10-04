@@ -302,15 +302,22 @@ Do not expose either service to the internet or enable router port forwarding.
    ```
 
    `--test` generates a short, billed model reply through the actual ESP32
-   connection. **Test API key** on the screen still tests OpenAI only.
+   connection. **Settings > OpenClaw > Test OpenAI key** tests OpenAI only.
    USB status reports `provider: "openai"` for the voice pipeline and
    `chat_provider: "openclaw"` for conversations.
 
 Your computer must remain awake and reachable on the same network. There
 is no automatic fallback to OpenAI chat when OpenClaw fails: failures are
-displayed explicitly. **Settings > OpenAI > Use direct OpenAI chat** or
-`openclaw_setup.py --port PORT --disable` explicitly removes the bridge
-settings and returns to the original standalone behavior.
+displayed explicitly. The OpenClaw build's settings are labeled **OpenClaw**:
+**Voice key** is the required OpenAI credential for speech recognition and
+spoken replies, and **Mac bridge** and **Bridge token** configure chat/tools.
+The standalone-backend switch is not shown, and leaving the bridge-address
+editor empty preserves the current connection. For an intentional advanced
+switch back to standalone chat, `openclaw_setup.py --port PORT --disable`
+explicitly removes the bridge settings. The separate direct-OpenAI and
+original Muse builds retain their existing settings.
+Host UI coverage executes the production settings builders for all three
+backends: `python3 -m unittest tests/test_muse_settings_ui.py`.
 
 The OpenAI key and bridge token remain unencrypted in device NVS. Audio
 goes to OpenAI; conversation text goes through the computer to OpenClaw's
@@ -375,7 +382,8 @@ subject to the device's existing request timeouts.
 To revoke computer control, restore the ESP32 agent's `tools.deny: ["*"]`,
 remove `--allow-computer-control` from the bridge service, and restart it.
 Restore that agent's previous exec-approval policy as well. Use the
-on-screen direct-OpenAI option to disconnect the board from OpenClaw entirely.
+USB `openclaw_setup.py --port PORT --disable` command to disconnect the board
+from OpenClaw entirely; the simplified OpenClaw settings omit that switch.
 
 #### Optional normal signed-in Chrome (macOS, Chrome 144+)
 

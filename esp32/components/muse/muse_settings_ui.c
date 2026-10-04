@@ -872,7 +872,11 @@ static void on_openai_key_done(const char *text)
 static void on_hatch_token(lv_event_t *e)
 {
     (void)e;
+#if CONFIG_MUSE_OPENCLAW
+    open_text("OpenAI voice key", "", true, MUSE_TOKEN_MAX, "Empty keeps the current one", on_openai_key_done, s_hatch);
+#else
     open_text("OpenAI API key", "", true, MUSE_TOKEN_MAX, "Empty keeps the current one", on_openai_key_done, s_hatch);
+#endif
 }
 
 static void on_openai_forget(lv_event_t *e)
@@ -891,7 +895,7 @@ static void on_openai_clear(lv_event_t *e)
 #if CONFIG_MUSE_OPENCLAW
 static void on_openclaw_url_done(const char *text)
 {
-    if (muse_settings_set_openclaw_url(text) != ESP_OK) {
+    if (text[0] && muse_settings_set_openclaw_url(text) != ESP_OK) {
         muse_state_set_caption("OPENCLAW HTTPS URL NOT SAVED");
     }
 }
@@ -902,7 +906,7 @@ static void on_openclaw_url(lv_event_t *e)
     char url[MUSE_OPENCLAW_URL_MAX + 1];
     muse_settings_openclaw(url, NULL);
     open_text("OpenClaw HTTPS URL", url, false, MUSE_OPENCLAW_URL_MAX,
-              "Empty uses direct OpenAI chat", on_openclaw_url_done, s_hatch);
+              "Empty keeps the current one", on_openclaw_url_done, s_hatch);
 }
 
 static void on_openclaw_token_done(const char *text)
@@ -919,14 +923,6 @@ static void on_openclaw_token(lv_event_t *e)
               "Empty keeps the current one", on_openclaw_token_done, s_hatch);
 }
 
-static void on_openclaw_forget(lv_event_t *e)
-{
-    (void)e;
-    if (muse_settings_set_openclaw_url("") != ESP_OK ||
-        muse_settings_set_openclaw_token("") != ESP_OK) {
-        muse_state_set_caption("OPENCLAW SETTINGS NOT REMOVED");
-    }
-}
 #endif
 #endif
 
@@ -956,23 +952,32 @@ static void build_hatch_page(lv_obj_t *tile)
 {
     lv_obj_t *list;
 #if CONFIG_MUSE_OPENAI
+#if CONFIG_MUSE_OPENCLAW
+    s_hatch = page(tile, "OPENCLAW", true, &list);
+    s_hatch_status = note(list, "");
+    row(list, NULL, "Voice key", &s_hatch_token, on_hatch_token, NULL);
+    button(list, "Test OpenAI key", COLOR_ACCENT, on_hatch_test, NULL);
+    button(list, "New conversation", COLOR_ACCENT, on_openai_clear, NULL);
+    row(list, NULL, "Mac bridge", &s_openclaw_url, on_openclaw_url, NULL);
+    row(list, NULL, "Bridge token", &s_openclaw_token, on_openclaw_token, NULL);
+    note(list, "OpenClaw handles chat and computer tools on your Mac. "
+               "OpenAI is still required for speech recognition and spoken replies. "
+               "The Mac must be awake and reachable.");
+    note(list, "The key test checks OpenAI, not the Mac bridge. "
+               "OpenAI API usage is billed; the voice is AI-generated. "
+               "Both credentials are stored on this device without encryption.");
+    button(list, "Remove voice key", COLOR_DANGER, on_openai_forget, NULL);
+#else
     s_hatch = page(tile, "OPENAI", true, &list);
     s_hatch_status = note(list, "");
     row(list, NULL, "API key", &s_hatch_token, on_hatch_token, NULL);
     button(list, "Test API key", COLOR_ACCENT, on_hatch_test, NULL);
     button(list, "New conversation", COLOR_ACCENT, on_openai_clear, NULL);
     button(list, "Remove API key", COLOR_DANGER, on_openai_forget, NULL);
-#if CONFIG_MUSE_OPENCLAW
-    row(list, NULL, "Chat backend", &s_openclaw_url, on_openclaw_url, NULL);
-    row(list, NULL, "Bridge token", &s_openclaw_token, on_openclaw_token, NULL);
-    button(list, "Use direct OpenAI chat", COLOR_ACCENT, on_openclaw_forget, NULL);
-    note(list, "OpenClaw sends chat to your computer; OpenAI still handles voice. "
-               "The computer must be awake. Set up its trusted HTTPS bridge over USB. "
-               "Both keys are stored on this device without encryption.");
-#endif
     note(list, "Hold the talk button, then release. Audio and text go to OpenAI. "
                "API usage is billed. The voice is AI-generated. "
                "The key is stored on this device without encryption.");
+#endif
 #else
     s_hatch = page(tile, "MUSE", true, &list);
     s_link_reset_armed_us = 0;
@@ -1023,7 +1028,7 @@ static void tick_hatch(void)
     snprintf(buf, sizeof(buf), n ? "Set (%u chars)" : "Not set", (unsigned)n);
     set_text(s_hatch_token, buf);
 #if CONFIG_MUSE_OPENCLAW
-    set_text(s_openclaw_url, muse_settings_openclaw_enabled() ? "OpenClaw" : "OpenAI");
+    set_text(s_openclaw_url, muse_settings_openclaw_enabled() ? "Configured" : "Not set");
     set_text(s_openclaw_token, muse_settings_openclaw_token_set() ? "Set" : "Not set");
 #endif
 }
@@ -1359,7 +1364,11 @@ static void build_home(lv_obj_t *tile)
     s_home = page(tile, "SETTINGS", false, &list);
     row(list, LV_SYMBOL_WIFI, "Wi-Fi", &s_home_wifi, on_nav, (void *)&WIFI);
 #if CONFIG_MUSE_OPENAI
+#if CONFIG_MUSE_OPENCLAW
+    row(list, LV_SYMBOL_HOME, "OpenClaw", &s_home_hatch, on_nav, (void *)&HATCH);
+#else
     row(list, LV_SYMBOL_HOME, "OpenAI", &s_home_hatch, on_nav, (void *)&HATCH);
+#endif
     lv_obj_add_flag(row(list, LV_SYMBOL_BLUETOOTH, "Bluetooth", &s_home_ble, on_nav, (void *)&BLE), LV_OBJ_FLAG_HIDDEN);
 #else
     row(list, LV_SYMBOL_HOME, "Muse", &s_home_hatch, on_nav, (void *)&HATCH);

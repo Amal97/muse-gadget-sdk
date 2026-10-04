@@ -449,8 +449,10 @@ static const char *not_ready_reason(void)
             !muse_settings_openclaw_token_set()) {
             return "SET OPENCLAW BRIDGE TOKEN";
         }
-#endif
+        return "SET VOICE KEY IN OPENCLAW SETTINGS";
+#else
         return "SET OPENAI API KEY IN SETTINGS";
+#endif
 #else
         return "SET UP MUSE FIRST";
 #endif

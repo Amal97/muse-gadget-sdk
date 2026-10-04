@@ -97,7 +97,11 @@ void muse_app_run(const muse_board_t *board)
     muse_wifi_apply();
     muse_ble_apply();
 #if CONFIG_MUSE_OPENAI
+#if CONFIG_MUSE_OPENCLAW
+    muse_state_set_caption("SWIPE LEFT TO SET UP WI-FI AND OPENCLAW");
+#else
     muse_state_set_caption("SWIPE LEFT TO SET UP WI-FI AND OPENAI");
+#endif
 #endif
     ESP_LOGI(TAG, "ready: free heap %u internal, %u psram",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),

@@ -122,12 +122,16 @@ live in NVS (`oc_url`, `oc_token`) and are not build-time secrets.
 Verify `device.chat_provider == "openclaw"` and run a real typed turn
 through the board to verify TLS, bridge authentication, model access and
 agent routing. The on-screen API-key test checks OpenAI, not OpenClaw.
+Hybrid settings are labeled OpenClaw; the Voice key remains necessary for
+STT/TTS. Keep legacy backend switching off that page; use the explicit USB
+`openclaw_setup.py --disable` operation when intentionally disconnecting.
 For computer-control mode, verify an actual harmless tool action through
 the board and independently check its result; a model's claim is not proof.
 Do not test on personal files, expose secrets, or grant root/TCC permissions.
 Retest direct OpenAI behavior with the bridge disabled. No automatic
 failure fallback is permitted. Host tests:
-`python3 -m unittest tests/test_muse_openai.py tests/test_muse_openclaw.py`.
+`python3 -m unittest tests/test_muse_settings_ui.py tests/test_muse_openai.py
+tests/test_muse_openclaw.py`.
 
 ### DevKitC-1 (default)
 
