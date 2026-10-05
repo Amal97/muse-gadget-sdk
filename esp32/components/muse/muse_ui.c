@@ -169,6 +169,9 @@ static lv_obj_t *s_stop_job;
 static lv_obj_t *s_notification_action, *s_notification_action_label, *s_notification_hint;
 static lv_obj_t *s_notification_details, *s_notification_dismiss;
 static lv_obj_t *s_notification_dismiss_label;
+static lv_obj_t *s_notification_choices, *s_notification_review;
+static lv_obj_t *s_notification_options[13], *s_notification_option_labels[13];
+static char s_copilot_tap_id[33];
 static char s_copilot_chimed[33];
 static bool s_notification_expanded;
 static char s_notification_text[2048];
@@ -1252,6 +1255,14 @@ static void stop_mac_job(lv_event_t *e)
 static void dismiss_notification(lv_event_t *e)
 {
     (void)e;
+    if (muse_voice_copilot_dictating()) {
+        muse_voice_copilot_finish(false);
+        return;
+    }
+    if (!strcmp(s_shown_notification.kind, "copilot_ask") && muse_openai_companion_busy()) {
+        muse_state_set_caption("ANSWER IN PROGRESS");
+        return;
+    }
     if (!strcmp(s_shown_notification.kind, "timer_replace")) {
         muse_timer_cancel_replace();
         return;
@@ -1277,6 +1288,63 @@ static void dismiss_notification(lv_event_t *e)
 }
 
 static void notification_content(void);
+
+static void copilot_option(lv_event_t *e)
+{
+    unsigned option = (uintptr_t)lv_event_get_user_data(e);
+    if (lv_event_get_code(e) == LV_EVENT_PRESSED) {
+        strlcpy(s_copilot_tap_id, s_shown_notification.id, sizeof(s_copilot_tap_id));
+        return;
+    }
+    if (strcmp(s_shown_notification.kind, "copilot_ask") || !s_shown_notification.respondable ||
+        strcmp(s_copilot_tap_id, s_shown_notification.id) ||
+        muse_voice_copilot_dictating() || muse_openai_companion_busy()) {
+        muse_state_set_caption("QUESTION BUSY OR NO LONGER AVAILABLE");
+        return;
+    }
+    if (option == 13) {
+        if (s_shown_notification.allow_freeform) muse_voice_copilot_dictate(s_shown_notification.id);
+        else muse_state_set_caption("FREE TEXT NOT OFFERED");
+        return;
+    }
+    if (!option || option > s_shown_notification.choice_count) {
+        muse_state_set_caption("OPTION NO LONGER AVAILABLE");
+        return;
+    }
+    cJSON *body = cJSON_CreateObject();
+    bool built = body && cJSON_AddStringToObject(body, "action", "copilot_choice") &&
+        cJSON_AddStringToObject(body, "id", s_shown_notification.id) &&
+        cJSON_AddNumberToObject(body, "option", option);
+    char *json = built ? cJSON_PrintUnformatted(body) : NULL;
+    bool queued = json && muse_openai_companion_command(json);
+    muse_state_set_caption(queued ? "SENDING ANSWER..." : "ANSWER NOT QUEUED - RETRY");
+    free(json);
+    cJSON_Delete(body);
+    muse_state_poke();
+}
+
+static void notification_choices(void)
+{
+    bool question = !strcmp(s_shown_notification.kind, "copilot_ask") &&
+        s_shown_notification.respondable && s_notification_expanded;
+    bool dictating = muse_voice_copilot_dictating();
+    lv_obj_set_flag(s_notification_choices, LV_OBJ_FLAG_HIDDEN, !question || dictating);
+    lv_obj_set_flag(s_notification_review, LV_OBJ_FLAG_HIDDEN, !question);
+    if (!question) return;
+    home_set_text(s_notification_review, s_shown_notification.body);
+    bool busy = muse_openai_companion_busy();
+    for (unsigned i = 0; i < 13; i++) {
+        bool offered = i < 12 ? i < s_shown_notification.choice_count : s_shown_notification.allow_freeform;
+        lv_obj_set_flag(s_notification_options[i], LV_OBJ_FLAG_HIDDEN, !offered);
+        if (!offered) continue;
+        if (busy) lv_obj_add_state(s_notification_options[i], LV_STATE_DISABLED);
+        else lv_obj_remove_state(s_notification_options[i], LV_STATE_DISABLED);
+        char label[256];
+        if (i < 12) snprintf(label, sizeof(label), "%u. %s", i + 1, s_shown_notification.choices[i]);
+        else strlcpy(label, "Free text - speak an answer", sizeof(label));
+        home_set_text(s_notification_option_labels[i], label);
+    }
+}
 
 static void notification_layout(bool expanded)
 {
@@ -1304,6 +1372,8 @@ static void notification_content(void)
 {
     const char *text = s_notification_expanded && s_shown_notification.body[0] ?
                        s_shown_notification.body : s_shown_notification.preview;
+    if (!strcmp(s_shown_notification.kind, "copilot_ask") && s_shown_notification.respondable)
+        text = s_shown_notification.preview;
     text = muse_text_showable(text, s_notification_text, sizeof(s_notification_text));
     if (strcmp(lv_label_get_text(s_notification_preview), text)) lv_label_set_text(s_notification_preview, text);
     lv_label_set_text(s_notification_hint, s_notification_expanded ?
@@ -1312,13 +1382,15 @@ static void notification_content(void)
                       "Hold talk to dictate; not sent" : "Tap text to read details");
     if (!strncmp(s_shown_notification.kind, "copilot_", 8)) {
         lv_label_set_text(s_notification_hint, !s_shown_notification.respondable ? "Review on computer" :
-            !strcmp(s_shown_notification.kind, "copilot_allow") ? "Hold Talk: approve / deny" : "Hold Talk: answer / option number");
+            !strcmp(s_shown_notification.kind, "copilot_allow") ? "Hold Talk: approve / deny" : "Tap an option / hold Talk to answer");
     }
+    notification_choices();
 }
 
 static void open_notification(lv_event_t *e)
 {
     (void)e;
+    if (muse_voice_copilot_dictating()) return;
     notification_layout(!s_notification_expanded);
     muse_state_poke();
 }
@@ -1326,6 +1398,10 @@ static void open_notification(lv_event_t *e)
 static void notification_action(lv_event_t *e)
 {
     (void)e;
+    if (muse_voice_copilot_dictating()) {
+        muse_voice_copilot_finish(true);
+        return;
+    }
     if (!strncmp(s_shown_notification.kind, "copilot_", 8)) {
         notification_layout(true);
         muse_state_poke();
@@ -1359,6 +1435,16 @@ static void notification_action(lv_event_t *e)
 
 static void update_notification(muse_mode_t mode, float now, bool visible)
 {
+    if (muse_voice_copilot_dictating()) {
+        lv_label_set_text(s_notification_hint, "Listening (15s max) - Send when done");
+        lv_label_set_text(s_notification_dismiss_label, "Cancel");
+        lv_label_set_text(s_notification_action_label, "Send");
+        lv_obj_remove_flag(s_notification_action, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(s_notification_choices, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
+        muse_state_poke();
+        return;
+    }
     if (muse_openai_job_active()) {
         lv_obj_remove_flag(s_stop_job, LV_OBJ_FLAG_HIDDEN);
     } else {
@@ -1381,7 +1467,11 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
         strcmp(notification.kind, s_shown_notification.kind) ||
         strcmp(notification.sender, s_shown_notification.sender) ||
         strcmp(notification.preview, s_shown_notification.preview) ||
-        strcmp(notification.body, s_shown_notification.body);
+        strcmp(notification.body, s_shown_notification.body) ||
+        notification.respondable != s_shown_notification.respondable ||
+        notification.allow_freeform != s_shown_notification.allow_freeform ||
+        notification.choice_count != s_shown_notification.choice_count ||
+        memcmp(notification.choices, s_shown_notification.choices, sizeof(notification.choices));
     s_shown_notification = notification;
     const char *action = !strcmp(notification.kind, "imessage") ? "Reply" :
         (!strcmp(notification.kind, "timer") || !strcmp(notification.kind, "reminder") ||
@@ -1410,7 +1500,7 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
     } else if (lv_obj_has_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN)) {
         elapsed = 0;
     }
-    if (content_changed) {
+    if (content_changed || copilot) {
         home_set_text(s_notification_sender, notification.sender);
         notification_content();
     }
@@ -1457,6 +1547,8 @@ static void build_notification(lv_obj_t *parent)
     lv_obj_set_width(s_notification_details, LV_PCT(100));
     lv_obj_align(s_notification_details, LV_ALIGN_TOP_MID, 0, s_small ? 17 : 26);
     lv_obj_set_scroll_dir(s_notification_details, LV_DIR_VER);
+    lv_obj_set_flex_flow(s_notification_details, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_notification_details, s_small ? 4 : 8, 0);
     lv_obj_set_style_width(s_notification_details, 3, LV_PART_SCROLLBAR);
     lv_obj_set_style_bg_color(s_notification_details, lv_color_hex(COLOR_ACCENT), LV_PART_SCROLLBAR);
     lv_obj_set_style_bg_opa(s_notification_details, LV_OPA_COVER, LV_PART_SCROLLBAR);
@@ -1469,6 +1561,31 @@ static void build_notification(lv_obj_t *parent)
     lv_obj_remove_flag(s_notification_preview, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_event_cb(s_notification_preview, open_notification, LV_EVENT_CLICKED, NULL);
     lv_obj_align(s_notification_preview, LV_ALIGN_TOP_MID, 0, 0);
+    s_notification_choices = lv_obj_create(s_notification_details);
+    lv_obj_remove_style_all(s_notification_choices);
+    lv_obj_set_size(s_notification_choices, LV_PCT(100), LV_SIZE_CONTENT);
+    lv_obj_set_flex_flow(s_notification_choices, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_style_pad_row(s_notification_choices, s_small ? 4 : 8, 0);
+    lv_obj_remove_flag(s_notification_choices, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_EVENT_BUBBLE);
+    for (unsigned i = 0; i < 13; i++) {
+        lv_obj_t *button = lv_button_create(s_notification_choices);
+        s_notification_options[i] = button;
+        lv_obj_set_size(button, LV_PCT(100), LV_SIZE_CONTENT);
+        lv_obj_set_style_min_height(button, s_small ? 28 : 48, 0);
+        lv_obj_set_style_bg_color(button, lv_color_hex(COLOR_RING_BG), 0);
+        lv_obj_set_style_border_color(button, lv_color_hex(COLOR_ACCENT), 0);
+        lv_obj_set_style_border_width(button, 1, 0);
+        lv_obj_set_style_pad_all(button, s_small ? 4 : 10, 0);
+        lv_obj_remove_flag(button, LV_OBJ_FLAG_EVENT_BUBBLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_event_cb(button, copilot_option, LV_EVENT_CLICKED, (void *)(uintptr_t)(i + 1));
+        lv_obj_add_event_cb(button, copilot_option, LV_EVENT_PRESSED, (void *)(uintptr_t)(i + 1));
+        s_notification_option_labels[i] = make_label(button, font, COLOR_CAPTION);
+        lv_obj_set_width(s_notification_option_labels[i], LV_PCT(100));
+        lv_label_set_long_mode(s_notification_option_labels[i], LV_LABEL_LONG_MODE_WRAP);
+    }
+    s_notification_review = make_label(s_notification_details, font, COLOR_DIM);
+    lv_obj_set_width(s_notification_review, LV_PCT(100));
+    lv_label_set_long_mode(s_notification_review, LV_LABEL_LONG_MODE_WRAP);
     s_notification_hint = make_label(s_notification_card, FONT_COMPACT, COLOR_DIM);
     lv_obj_align(s_notification_hint, LV_ALIGN_BOTTOM_MID, 0, s_small ? -22 : -76);
     lv_obj_add_flag(s_notification_hint, LV_OBJ_FLAG_CLICKABLE);

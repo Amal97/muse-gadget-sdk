@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #include "esp_heap_caps.h"
 #include "esp_log.h"
@@ -37,6 +38,9 @@
 #include "muse_settings.h"
 #include "muse_state.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_OPENCLAW
+#include "muse_openai.h"
+#endif
 
 static const char *TAG = "muse_voice";
 
@@ -73,6 +77,53 @@ static volatile float s_monitor_db = -100.0f;
 static volatile bool s_chirp;
 static volatile bool s_loopback;
 static volatile bool s_mp3test;
+#if CONFIG_MUSE_OPENCLAW
+enum { DICTATION_OFF, DICTATION_RESERVING, DICTATION_START, DICTATION_ACTIVE, DICTATION_SEND, DICTATION_CANCEL };
+static atomic_int s_dictation;
+static char s_dictation_target[33];
+#endif
+
+bool muse_voice_copilot_dictate(const char *id)
+{
+#if CONFIG_MUSE_OPENCLAW
+    int expected = DICTATION_OFF;
+    if (!s_queue || !id || strlen(id) != 32 || strspn(id, "0123456789abcdef") != 32 ||
+        muse_state_mode(NULL) != MUSE_MODE_IDLE || muse_state_asleep() ||
+        !atomic_compare_exchange_strong(&s_dictation, &expected, DICTATION_RESERVING)) {
+        ESP_LOGW(TAG, "Copilot dictation cannot start while unavailable or busy");
+        muse_state_set_caption("VOICE INPUT NOT READY - RETRY WHEN IDLE");
+        return false;
+    }
+    strlcpy(s_dictation_target, id, sizeof(s_dictation_target));
+    atomic_store(&s_dictation, DICTATION_START);
+    muse_state_poke();
+    return true;
+#else
+    (void)id;
+    return false;
+#endif
+}
+
+bool muse_voice_copilot_dictating(void)
+{
+#if CONFIG_MUSE_OPENCLAW
+    return atomic_load(&s_dictation) >= DICTATION_START;
+#else
+    return false;
+#endif
+}
+
+void muse_voice_copilot_finish(bool send)
+{
+#if CONFIG_MUSE_OPENCLAW
+    int expected = atomic_load(&s_dictation);
+    while ((send ? expected == DICTATION_ACTIVE :
+            expected >= DICTATION_START && expected != DICTATION_CANCEL) &&
+           !atomic_compare_exchange_weak(&s_dictation, &expected, send ? DICTATION_SEND : DICTATION_CANCEL)) {}
+#else
+    (void)send;
+#endif
+}
 
 /*
  * Pre-roll: while idle the mic keeps running into this ring, so a recording
@@ -246,11 +297,24 @@ static void take(rec_stats_t *st, const int16_t *pcm)
  * kept note to fall back on (why says what failed). There is no start chirp:
  * anything played now would land on top of the first words.
  */
-static bool record(bool barge_in, size_t *held, char *why, size_t cap)
+static bool record(bool barge_in, const char *dictation_target, size_t *held, char *why, size_t cap)
 {
     s_rec_n = s_sent = 0;
     s_live = s_tried = false;
     /* Capture the displayed response target before LISTENING hides its card. */
+    bool dictating = dictation_target[0] != '\0';
+#if CONFIG_MUSE_OPENCLAW
+    if (dictating) {
+        int expected = DICTATION_START;
+        if (!atomic_compare_exchange_strong(&s_dictation, &expected, DICTATION_ACTIVE) ||
+            !muse_openai_copilot_record_begin(dictation_target)) {
+            *held = 0;
+            strlcpy(why, "VOICE INPUT CANCELLED OR QUESTION UNAVAILABLE", cap);
+            return false;
+        }
+        s_live = s_tried = true;
+    } else
+#endif
     if (!s_rec || (muse_hatch_ready() && !s_held_count)) {
         go_live();
     }
@@ -317,11 +381,28 @@ static bool record(bool barge_in, size_t *held, char *why, size_t cap)
          * Capture runs 60-80 ms behind real time and people let go on their
          * last syllable, so keep going briefly after release.
          */
-        if (!released && got_event(MUSE_PTT_UP)) {
+        bool release = got_event(MUSE_PTT_UP);
+#if CONFIG_MUSE_OPENCLAW
+        if (dictating) {
+            int decision = atomic_load(&s_dictation);
+            if (decision == DICTATION_CANCEL) {
+                ok = false;
+                strlcpy(why, "ANSWER CANCELLED - NOT SENT", cap);
+                break;
+            }
+            release = decision == DICTATION_SEND;
+        }
+#endif
+        if (!released && release) {
             released = true;
             stop_at = n + TAIL_FRAMES < MAX_FRAMES ? n + TAIL_FRAMES : MAX_FRAMES;
         }
     }
+    if (dictating && !released && ok) {
+        ok = false;
+        strlcpy(why, "RECORDING LIMIT - ANSWER NOT SENT", cap);
+    }
+    if (dictating && !ok) muse_hatch_turn_cancel();
     muse_state_set_level(0);
     *held = n - pre;
 
@@ -815,6 +896,7 @@ static void voice_task(void *arg)
     muse_audio_selftest();
     for (;;) {
         bool wake = false;
+        char dictation_target[33] = "";
         if (!pending_down) {
             muse_input_event_t ev;
             bool asleep = muse_state_asleep();
@@ -873,27 +955,51 @@ static void voice_task(void *arg)
             }
             /* The 20 ms read paces this loop. */
             idle_capture();
-            if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
+#if CONFIG_MUSE_OPENCLAW
+            int dictation = atomic_load(&s_dictation);
+            if (dictation == DICTATION_CANCEL) {
+                atomic_store(&s_dictation, DICTATION_OFF);
                 continue;
             }
-            muse_state_poke();
-            if (ev.type != MUSE_PTT_DOWN) {
-                continue;
+            if (dictation == DICTATION_START) {
+                strlcpy(dictation_target, s_dictation_target, sizeof(dictation_target));
+            } else
+#endif
+            {
+                if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
+                    continue;
+                }
+                muse_state_poke();
+                if (ev.type != MUSE_PTT_DOWN) {
+                    continue;
+                }
+                wake = ev.wake;
             }
-            wake = ev.wake;
         }
         if (wake && !held_on_waking()) {
             continue;   /* a tap: it only woke Muse */
         }
         muse_wifi_power(MUSE_WIFI_FULL);
         if (!can_record()) {
+#if CONFIG_MUSE_OPENCLAW
+            if (dictation_target[0]) atomic_store(&s_dictation, DICTATION_OFF);
+#endif
             pending_down = false;
             continue;
         }
         size_t held;
         char why[96];
-        bool ok = record(pending_down, &held, why, sizeof(why));
+        bool ok = record(pending_down, dictation_target, &held, why, sizeof(why));
+#if CONFIG_MUSE_OPENCLAW
+        if (dictation_target[0]) atomic_store(&s_dictation, DICTATION_OFF);
+#endif
         pending_down = false;
+        if (!ok && dictation_target[0]) {
+            drop_rec();
+            pre_reset();
+            go_idle(why);
+            continue;
+        }
         if (held < MIN_HELD_FRAMES && !wake) {
             muse_hatch_turn_cancel();
             drop_rec();

@@ -332,7 +332,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if server.companion is None:
                     self.reject(404, "Device companion features are not enabled.")
                     return
-                if isinstance(body, dict) and body.get("action") == "copilot_voice":
+                if isinstance(body, dict) and body.get("action") in ("copilot_voice", "copilot_choice"):
                     if server.copilot is None:
                         raise RuntimeError("Copilot companion is not enabled.")
                     result = server.copilot.device(body)
@@ -419,7 +419,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             messages = validate_messages(body)
         except (ValueError, UnicodeError) as error:
-            if controller or (isinstance(body, dict) and body.get("action") == "copilot_voice"):
+            if controller or (isinstance(body, dict) and body.get("action") in ("copilot_voice", "copilot_choice")):
                 logging.warning("Invalid or stale Copilot request: %s", error)
                 self.reject(400, str(error))
                 return

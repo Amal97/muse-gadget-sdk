@@ -161,6 +161,21 @@ class BridgeTest(unittest.TestCase):
                     code, result = self.request(response, path=bridge.COMPANION_PATH)
                 self.assertEqual(code, 400)
                 self.assertIn("no longer waiting", result["error"]["message"])
+                request.update(id="e" * 32, kind="question", choices=["Brief", "Detailed"], allow_freeform=True)
+                self.assertEqual(self.request(request, path=bridge.COPILOT_CONTROLLER_PATH, token=store.token)[0], 200)
+                notice = self.request({"ack": ""}, path=bridge.NOTIFICATION_PATH)[1]["notification"]
+                self.assertEqual(notice["choices"], ["Brief", "Detailed"])
+                self.assertTrue(notice["allow_freeform"])
+                response = {"action": "copilot_choice", "id": "e" * 32, "option": 2}
+                self.assertEqual(self.request(response, path=bridge.COMPANION_PATH, token=store.token)[0], 401)
+                self.assertEqual(self.request(response, path=bridge.COMPANION_PATH)[0], 200)
+                take["id"] = "e" * 32
+                self.assertEqual(self.request(take, path=bridge.COPILOT_CONTROLLER_PATH, token=store.token)[1]["result"],
+                                 {"answer": "Detailed", "wasFreeform": False})
+                with self.assertLogs(level="WARNING"):
+                    code, result = self.request(response, path=bridge.COMPANION_PATH)
+                self.assertEqual(code, 400)
+                self.assertIn("no longer waiting", result["error"]["message"])
                 self.assertEqual(Upstream.records, [])
 
     def test_invalid_copilot_producer_payload_returns_an_explicit_error_not_a_crash(self) -> None:

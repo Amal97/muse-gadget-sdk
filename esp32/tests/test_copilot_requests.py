@@ -50,6 +50,35 @@ class CopilotRequestsTest(unittest.TestCase):
         self.assertTrue(notice["respondable"])
         self.assertEqual(notice["expires_at"], self.now + 600)
         self.assertTrue(self.store.owns_ack(notice["id"]))
+        self.assertEqual(notice["choices"], [])
+        self.assertFalse(notice["allow_freeform"])
+
+    def test_touch_choices_preserve_labels_and_validate_request_scope(self):
+        self.create(kind="question", choices=["Brief", "Detailed", "Third"], allow_freeform=True)
+        notice = self.store.poll()["notification"]
+        self.assertEqual(notice["choices"], ["Brief", "Detailed", "Third"])
+        self.assertTrue(notice["allow_freeform"])
+        for option in (0, 4, -1, True, 2.0, "2"):
+            with self.assertRaises(ValueError):
+                self.store.device({"action": "copilot_choice", "id": "b" * 32, "option": option})
+        with self.assertLogs(level="INFO") as logs:
+            self.store.device({"action": "copilot_choice", "id": "b" * 32, "option": 2})
+        self.assertIn("(touch)", logs.output[0])
+        self.assertEqual(self.take()["result"], {"answer": "Detailed", "wasFreeform": False})
+        with self.assertRaises(ValueError):
+            self.store.device({"action": "copilot_choice", "id": "b" * 32, "option": 1})
+
+    def test_touch_cannot_approve_permissions_or_answer_opaque_questions(self):
+        self.create()
+        with self.assertRaises(ValueError):
+            self.store.device({"action": "copilot_choice", "id": "b" * 32, "option": 1})
+        self.create("c" * 32, kind="question", choices=["Brief"], allow_freeform=True, respondable=False)
+        self.store.poll("b" * 32)
+        notice = self.store.poll()["notification"]
+        self.assertEqual(notice["choices"], [])
+        self.assertFalse(notice["allow_freeform"])
+        with self.assertRaises(ValueError):
+            self.store.device({"action": "copilot_choice", "id": "c" * 32, "option": 1})
 
     def test_only_explicit_approval_returns_approve_once_and_consumes_once(self):
         self.create()

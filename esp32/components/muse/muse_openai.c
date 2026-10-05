@@ -505,6 +505,14 @@ static bool companion_result(const job_t *job, cJSON *body, char *why, size_t ca
     cJSON *root = cJSON_Parse(response);
     cJSON *request_action = cJSON_GetObjectItemCaseSensitive(body, "action");
     bool preparing = cJSON_IsString(request_action) && !strcmp(request_action->valuestring, "reply_prepare");
+    bool choosing = cJSON_IsString(request_action) && !strcmp(request_action->valuestring, "copilot_choice");
+    cJSON *choice_id = cJSON_GetObjectItemCaseSensitive(body, "id");
+    cJSON *decision = cJSON_GetObjectItemCaseSensitive(root, "copilot");
+    cJSON *decision_id = cJSON_GetObjectItemCaseSensitive(decision, "id");
+    cJSON *decision_state = cJSON_GetObjectItemCaseSensitive(decision, "state");
+    bool valid_choice = cJSON_IsString(choice_id) && cJSON_IsString(decision_id) &&
+        !strcmp(choice_id->valuestring, decision_id->valuestring) && cJSON_IsString(decision_state) &&
+        !strcmp(decision_state->valuestring, "answered");
     cJSON *draft_result = cJSON_GetObjectItemCaseSensitive(root, "draft");
     bool resetting = cJSON_IsString(request_action) &&
         (!strcmp(request_action->valuestring, "conversation_reset") ||
@@ -526,7 +534,7 @@ static bool companion_result(const job_t *job, cJSON *body, char *why, size_t ca
         && cJSON_IsString(recipient) && recipient->valuestring[0]
         && strlen(recipient->valuestring) < 1024;
     if (!cJSON_IsObject(root) || cJSON_GetObjectItemCaseSensitive(root, "error")
-        || (preparing && !valid_draft) || (resetting && !valid_reset)) {
+        || (preparing && !valid_draft) || (resetting && !valid_reset) || (choosing && !valid_choice)) {
         cJSON_Delete(root);
         free(response);
         strlcpy(why, "COMPANION RESPONSE INVALID", cap);
@@ -546,6 +554,11 @@ static bool companion_result(const job_t *job, cJSON *body, char *why, size_t ca
     char *encoded = ok ? cJSON_PrintUnformatted(merged) : NULL;
     if (!encoded || strlen(encoded) >= JSON_CAP) ok = false;
     if (ok) {
+        if (choosing) {
+            if (!strcmp(s_notification.id, choice_id->valuestring)) memset(&s_notification, 0, sizeof(s_notification));
+            if (!strcmp(s_copilot_focus, choice_id->valuestring)) s_copilot_focus[0] = '\0';
+            muse_state_set_caption("ANSWER SUBMITTED");
+        }
         strlcpy(s_companion_json, encoded, JSON_CAP);
         s_companion_version++;
         if (resetting) atomic_store(&s_clear_history, true);
@@ -985,7 +998,8 @@ static void poll_notifications(void)
     }
     cJSON *root = cJSON_Parse(response);
     cJSON *notification = cJSON_GetObjectItemCaseSensitive(root, "notification");
-    muse_notification_t next = {0};
+    static muse_notification_t next;
+    memset(&next, 0, sizeof(next));
     bool valid = cJSON_IsNull(notification);
     if (cJSON_IsObject(notification)) {
         cJSON *id = cJSON_GetObjectItemCaseSensitive(notification, "id");
@@ -995,6 +1009,8 @@ static void poll_notifications(void)
         cJSON *full = cJSON_GetObjectItemCaseSensitive(notification, "body");
         cJSON *expires = cJSON_GetObjectItemCaseSensitive(notification, "expires_at");
         cJSON *respondable = cJSON_GetObjectItemCaseSensitive(notification, "respondable");
+        cJSON *choices = cJSON_GetObjectItemCaseSensitive(notification, "choices");
+        cJSON *freeform = cJSON_GetObjectItemCaseSensitive(notification, "allow_freeform");
         bool copilot = cJSON_IsString(kind) && !strncmp(kind->valuestring, "copilot_", 8);
         valid = cJSON_IsString(id) && strlen(id->valuestring) == 32
             && strspn(id->valuestring, "0123456789abcdef") == 32
@@ -1021,6 +1037,28 @@ static void poll_notifications(void)
             strlcpy(next.body, full ? full->valuestring : text->valuestring, sizeof(next.body));
             if (!strcmp(next.kind, "calendar") || copilot) next.expires_at = (int64_t)expires->valuedouble;
             next.respondable = copilot && cJSON_IsTrue(respondable);
+            if (copilot && (!cJSON_IsArray(choices) || cJSON_GetArraySize(choices) > 12 || !cJSON_IsBool(freeform))) {
+                valid = false;
+            } else if (copilot) {
+                next.allow_freeform = cJSON_IsTrue(freeform);
+                next.choice_count = (uint8_t)cJSON_GetArraySize(choices);
+                for (unsigned i = 0; i < next.choice_count; i++) {
+                    cJSON *choice = cJSON_GetArrayItem(choices, i);
+                    if (!cJSON_IsString(choice) || !choice->valuestring[0] ||
+                        strlen(choice->valuestring) >= sizeof(next.choices[i])) {
+                        valid = false;
+                        break;
+                    }
+                    strlcpy(next.choices[i], choice->valuestring, sizeof(next.choices[i]));
+                    for (const unsigned char *c = (const unsigned char *)next.choices[i]; *c; c++) {
+                        if (*c < 32 || *c > 126) valid = false;
+                    }
+                }
+                if (!strcmp(next.kind, "copilot_allow") && (next.choice_count || next.allow_freeform)) valid = false;
+                if (!next.respondable && (next.choice_count || next.allow_freeform)) valid = false;
+                if (!strcmp(next.kind, "copilot_ask") && next.respondable &&
+                    !next.choice_count && !next.allow_freeform) valid = false;
+            }
             if (next.respondable) {
                 for (const unsigned char *c = (const unsigned char *)next.body; *c; c++) {
                     if ((*c < 32 && *c != '\n') || *c > 126) valid = false;
@@ -1131,6 +1169,11 @@ static void worker(void *arg)
 #if CONFIG_MUSE_OPENCLAW
         if (job.kind == JOB_COMPANION) {
             cJSON *body = cJSON_Parse(job.text);
+            cJSON *action = cJSON_GetObjectItemCaseSensitive(body, "action");
+            cJSON *id = cJSON_GetObjectItemCaseSensitive(body, "id");
+            if (cJSON_IsString(action) && !strcmp(action->valuestring, "copilot_choice") && cJSON_IsString(id)) {
+                strlcpy(job.copilot_target, id->valuestring, sizeof(job.copilot_target));
+            }
             bool ok = cJSON_IsObject(body) && companion_result(&job, body, why, sizeof(why));
             cJSON_Delete(body);
             if (!ok) goto failed;
@@ -1333,9 +1376,9 @@ void muse_hatch_test(void)
     }
 }
 
-void muse_hatch_turn_begin(void)
+static bool recording_begin(void)
 {
-    if (!begin_job()) return;
+    if (!begin_job()) return false;
     xSemaphoreTake(s_data, portMAX_DELAY);
     free(s_record);
     s_record = heap_caps_malloc(RECORD_FRAMES * sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -1355,8 +1398,35 @@ void muse_hatch_turn_begin(void)
         emit(&job, MUSE_HATCH_EV_ERROR, "NO MEMORY FOR RECORDING");
         atomic_store(&s_busy, false);
         ESP_LOGE(TAG, "no memory for recording");
+        return false;
     }
+    return true;
 }
+
+void muse_hatch_turn_begin(void)
+{
+    recording_begin();
+}
+
+#if CONFIG_MUSE_OPENCLAW
+bool muse_openai_copilot_record_begin(const char *id)
+{
+    if (!id || !s_data || !recording_begin()) return false;
+    xSemaphoreTake(s_data, portMAX_DELAY);
+    bool valid = s_record && !strcmp(s_notification.id, id) &&
+        !strcmp(s_notification.kind, "copilot_ask") && s_notification.respondable &&
+        s_notification.allow_freeform && s_notification.expires_at > time(NULL) &&
+        !s_record_reply[0] && muse_timer_status(NULL) != MUSE_TIMER_RINGING && !muse_timer_pending();
+    if (valid) strlcpy(s_record_copilot, id, sizeof(s_record_copilot));
+    xSemaphoreGive(s_data);
+    if (!valid) {
+        muse_hatch_turn_cancel();
+        ESP_LOGW(TAG, "Copilot dictation target no longer available");
+        muse_state_set_caption("QUESTION NO LONGER AVAILABLE");
+    }
+    return valid;
+}
+#endif
 
 size_t muse_hatch_turn_audio_wait(const int16_t *pcm, size_t frames, int wait_ms)
 {

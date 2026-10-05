@@ -30,11 +30,12 @@ class CalendarNotificationTest(unittest.TestCase):
 typedef struct { unsigned generation; } job_t;
 static int s_data=1;
 static unsigned s_companion_version;
-static char s_companion_json[JSON_CAP],s_notification_ack[33];
+static char s_companion_json[JSON_CAP],s_notification_ack[33],s_copilot_focus[33];
 static muse_notification_t s_notification,s_draft_notice;
 static atomic_bool s_clear_history;
 static bool same_generation=true;
 static const char *response;
+static void muse_state_set_caption(const char *format,...){(void)format;}
 static void xSemaphoreTake(int s,int timeout){(void)s;(void)timeout;}
 static void xSemaphoreGive(int s){(void)s;}
 static bool current(unsigned generation){(void)generation;return same_generation;}
@@ -74,6 +75,20 @@ int main(void){
     assert(companion_result(&job,body,why,sizeof(why)));
     assert(!s_notification.id[0] && !strcmp(s_notification_ack,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
     assert(!atomic_load(&s_clear_history));
+    cJSON_Delete(body);
+    body=cJSON_Parse("{\"action\":\"copilot_choice\",\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"option\":2}");
+    strcpy(s_notification.id,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    strcpy(s_copilot_focus,s_notification.id);
+    response="{\"copilot\":{\"id\":\"cccccccccccccccccccccccccccccccc\",\"state\":\"answered\"}}";
+    assert(!companion_result(&job,body,why,sizeof(why)) && s_notification.id[0] && s_copilot_focus[0]);
+    response="{\"copilot\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"state\":\"pending\"}}";
+    assert(!companion_result(&job,body,why,sizeof(why)) && s_notification.id[0]);
+    response="{\"copilot\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"state\":\"answered\"}}";
+    assert(companion_result(&job,body,why,sizeof(why)) && !s_notification.id[0] && !s_copilot_focus[0]);
+    strcpy(s_notification.id,"cccccccccccccccccccccccccccccccc");
+    strcpy(s_copilot_focus,s_notification.id);
+    assert(companion_result(&job,body,why,sizeof(why)));
+    assert(!strcmp(s_notification.id,"cccccccccccccccccccccccccccccccc") && s_copilot_focus[0]);
     cJSON_Delete(body);
     return 0;
 }
@@ -155,7 +170,7 @@ int main(void){
     response="{\"notification\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
         "\"kind\":\"copilot_allow\",\"sender\":\"Copilot approval\",\"preview\":\"Review work\","
         "\"body\":\"Workspace: /safe/project\\nprintf harmless\","
-        "\"expires_at\":1700000600,\"respondable\":true}}";
+        "\"expires_at\":1700000600,\"respondable\":true,\"choices\":[],\"allow_freeform\":false}}";
     strlcpy(s_reply_arm,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",sizeof(s_reply_arm));
     watch=true;asleep=true;poll_notifications();
     assert(!asleep && !s_reply_arm[0]);
@@ -169,6 +184,22 @@ int main(void){
         "\"kind\":\"copilot_allow\",\"sender\":\"Copilot approval\",\"preview\":\"Review work\","
         "\"body\":\"hidden \\u202ecommand\",\"expires_at\":1700000600,\"respondable\":true}}";
     old_warnings=warnings;poll_notifications();assert(warnings==old_warnings+1);
+    response="{\"notification\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+        "\"kind\":\"copilot_ask\",\"sender\":\"Copilot question\",\"preview\":\"Question\","
+        "\"body\":\"Full question\",\"expires_at\":1700000600,\"respondable\":true,"
+        "\"choices\":[\"Brief\",\"Detailed\",\"Third\"],\"allow_freeform\":true}}";
+    poll_notifications();assert(muse_openai_notification(&out));
+    assert(out.choice_count==3 && out.allow_freeform && !strcmp(out.choices[1],"Detailed"));
+    const char *bad_choices[]={"{}", "[1]", "[\"hidden\\u202echoice\"]", "[\"\"]"};
+    for(unsigned i=0;i<sizeof(bad_choices)/sizeof(bad_choices[0]);i++){
+        char payload[1024];snprintf(payload,sizeof(payload),
+            "{\"notification\":{\"id\":\"cccccccccccccccccccccccccccccccc\","
+            "\"kind\":\"copilot_ask\",\"sender\":\"Copilot question\",\"preview\":\"Question\","
+            "\"body\":\"Question\",\"expires_at\":1700000600,\"respondable\":true,"
+            "\"choices\":%s,\"allow_freeform\":true}}",bad_choices[i]);
+        response=payload;old_warnings=warnings;poll_notifications();
+        assert(warnings==old_warnings+1 && !strcmp(s_notification.id,"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
+    }
     watch=false;
     response="{\"notification\":null}";poll_notifications();
     assert(!muse_openai_notification(&out));

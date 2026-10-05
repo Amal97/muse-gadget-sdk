@@ -229,13 +229,23 @@ class CopilotRequests:
         return {"copilot": {"id": row["id"], "state": "answered", "message": message}}
 
     def device(self, body: dict) -> dict:
-        if not isinstance(body, dict) or body.get("action") != "copilot_voice" or set(body) != {"action", "id", "text"}:
-            raise ValueError("Expected a request-scoped Copilot voice response.")
+        if not isinstance(body, dict) or not (
+            body.get("action") == "copilot_voice" and set(body) == {"action", "id", "text"}
+            or body.get("action") == "copilot_choice" and set(body) == {"action", "id", "option"}
+        ):
+            raise ValueError("Expected a request-scoped Copilot response.")
         with self.lock, self.connect() as db:
             self._expire(db)
             row = db.execute("SELECT * FROM requests WHERE id=?", (identifier(body["id"]),)).fetchone()
             if row is None:
                 raise ValueError("Unknown Copilot request; no decision was sent.")
+            if body["action"] == "copilot_choice":
+                choices = json.loads(row["choices"])
+                option = body["option"]
+                if (row["kind"] != "question" or not row["respondable"] or
+                        type(option) is not int or not 1 <= option <= len(choices)):
+                    raise ValueError("That option was not offered for this question. No answer was sent.")
+                return self._answer(db, row, choices[option - 1], desktop=False, source="touch")
             return self._answer(db, row, body["text"], desktop=False)
 
     def owns_ack(self, ack: str) -> bool:
@@ -264,4 +274,6 @@ class CopilotRequests:
                 "sender": "Copilot approval" if row["kind"] == "permission" else "Copilot question",
                 "preview": preview(row["body"], 256), "body": row["body"],
                 "expires_at": int(row["expires"]), "respondable": bool(row["respondable"]),
+                "choices": json.loads(row["choices"]) if row["respondable"] else [],
+                "allow_freeform": bool(row["freeform"] and row["respondable"]),
             }}

@@ -656,7 +656,14 @@ in the expanded scrollable card, with one chime per request.
 Copilot cards also appear over Settings. Review it, **hold Talk**, then say
 **"approve"** or **"deny"** for a permission. Approval is **once-only**, never
 "always allow". For a question, speak the exact offered choice, **"option two"**,
-or a freeform answer when allowed. Ambiguous permission speech (including an
+or tap a numbered choice button to send that exact offered label without using
+speech APIs. Scroll the card for more choices and the complete request details.
+When the question allows freeform answers, **Free text - speak an answer** starts
+recording immediately: speak, then tap **Send**; **Cancel** discards the recording
+and leaves the question waiting. Recording is limited to 15 seconds; reaching
+that limit without Send cancels rather than automatically submitting. Holding
+Talk still supports choices or freeform answers when allowed.
+Ambiguous permission speech (including an
 unqualified "yes") never approves work. Question answers retain their original
 choice labels. **Deny** rejects the displayed operation; **Skip** declines a
 question without fabricating an answer. Desktop fallback commands are shown

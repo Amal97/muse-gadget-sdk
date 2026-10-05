@@ -17,6 +17,7 @@ class NotificationUITest(unittest.TestCase):
         source = r'''
 #include <assert.h>
 #include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,8 +37,12 @@ class NotificationUITest(unittest.TestCase):
 #define LV_ANIM_OFF 0
 #define MUSE_MODE_IDLE 0
 #define MUSE_MODE_THINKING 1
+#define MUSE_MODE_LISTENING 2
+#define LV_EVENT_PRESSED 1
+#define LV_EVENT_CLICKED 2
+#define LV_STATE_DISABLED 4
 typedef int muse_mode_t;
-typedef struct { int unused; } lv_event_t;
+typedef struct { uintptr_t data; int code; } lv_event_t;
 typedef struct { int w,h,flags,mode,scroll_y; char text[2048]; } lv_obj_t;
 static lv_obj_t backdrop,card,sender,preview,details,dismiss,dismiss_label,action,action_label,hint,stop;
 static lv_obj_t *s_notification_backdrop=&backdrop;
@@ -45,6 +50,12 @@ static lv_obj_t *s_notification_card=&card,*s_notification_sender=&sender,*s_not
 static lv_obj_t *s_notification_details=&details,*s_notification_dismiss=&dismiss,*s_notification_action=&action;
 static lv_obj_t *s_notification_action_label=&action_label,*s_notification_hint=&hint,*s_stop_job=&stop;
 static lv_obj_t *s_notification_dismiss_label=&dismiss_label;
+static lv_obj_t choices,review,options[13],option_labels[13];
+static lv_obj_t *s_notification_choices=&choices,*s_notification_review=&review;
+static lv_obj_t *s_notification_options[13],*s_notification_option_labels[13];
+static char s_copilot_tap_id[33],command[256],dictation_id[33];
+static bool busy,dictating;
+static int sends,cancels,commands;
 static int s_w=466,s_h=466;
 static bool s_small,s_notification_expanded,available=true;
 static char s_notification_text[2048],s_notification_id[33],s_copilot_chimed[33],focused[33];
@@ -59,6 +70,10 @@ static void lv_obj_set_width(lv_obj_t *o,int w){o->w=w;}
 static void lv_obj_set_flag(lv_obj_t *o,int flag,bool enabled){if(enabled)o->flags|=flag;else o->flags&=~flag;}
 static void lv_obj_add_flag(lv_obj_t *o,int flag){o->flags|=flag;}
 static void lv_obj_remove_flag(lv_obj_t *o,int flag){o->flags&=~flag;}
+static void lv_obj_add_state(lv_obj_t *o,int state){o->flags|=state;}
+static void lv_obj_remove_state(lv_obj_t *o,int state){o->flags&=~state;}
+static void *lv_event_get_user_data(lv_event_t *e){return (void *)e->data;}
+static int lv_event_get_code(lv_event_t *e){return e->code;}
 static bool lv_obj_has_flag(lv_obj_t *o,int flag){return (o->flags&flag)!=0;}
 static void lv_obj_set_scrollbar_mode(lv_obj_t *o,int mode){(void)o;(void)mode;}
 static void lv_label_set_long_mode(lv_obj_t *o,int mode){o->mode=mode;}
@@ -70,6 +85,12 @@ static void home_set_text(lv_obj_t *o,const char *s){lv_label_set_text(o,s);}
 static void muse_state_poke(void){pokes++;}
 static bool muse_settings_speaker_on(void){return speaker;}
 static void muse_voice_request_chirp(void){chirps++;}
+static bool muse_voice_copilot_dictating(void){return dictating;}
+static bool muse_voice_copilot_dictate(const char *id){
+    dictating=true;snprintf(dictation_id,sizeof(dictation_id),"%s",id);return true;
+}
+static void muse_voice_copilot_finish(bool send){if(send)sends++;else cancels++;}
+static bool muse_openai_companion_busy(void){return busy;}
 void muse_openai_copilot_focus(const char *id){snprintf(focused,sizeof(focused),"%s",id?id:"");}
 static size_t fake_strlcpy(char *out,const char *text,size_t cap){
     size_t n=strlen(text);if(cap)snprintf(out,cap,"%s",text);return n;
@@ -81,13 +102,20 @@ bool muse_openai_notification(muse_notification_t *out){*out=incoming;return ava
 void muse_settings_ui_open_companion(const char *text){(void)text;navigations++;}
 bool muse_openai_reply_begin(const char *id){(void)id;return true;}
 bool muse_timer_snooze(unsigned seconds){(void)seconds;return false;}
-bool muse_openai_companion_command(const char *text){(void)text;return false;}
+bool muse_openai_companion_command(const char *text){
+    commands++;snprintf(command,sizeof(command),"%s",text);return true;
+}
 static void muse_state_set_caption(const char *format,...){(void)format;}
-static void dismiss_notification(lv_event_t *e){(void)e;dismissed++;available=false;}
+void muse_openai_notification_dismiss(void){dismissed++;available=false;}
+static void muse_timer_cancel_replace(void){}
+static int muse_timer_status(void *out){(void)out;return 0;}
+#define MUSE_TIMER_RINGING 1
 static void notification_content(void);
 ''' + "\n".join(function(ui, name) for name in (
-            "notification_layout", "notification_content", "open_notification", "notification_action", "update_notification")) + r'''
+            "dismiss_notification", "copilot_option", "notification_choices", "notification_layout",
+            "notification_content", "open_notification", "notification_action", "update_notification")) + r'''
 int main(void){
+    for(int i=0;i<13;i++){s_notification_options[i]=&options[i];s_notification_option_labels[i]=&option_labels[i];}
     strcpy(incoming.id,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
     strcpy(incoming.kind,"imessage");strcpy(incoming.sender,"Sender");
     strcpy(incoming.preview,"Preview");
@@ -156,7 +184,38 @@ int main(void){
     update_notification(MUSE_MODE_IDLE,128,false);assert(chirps==2 && focused[0]);
     speaker=false;strcpy(incoming.id,"ffffffffffffffffffffffffffffffff");strcpy(incoming.kind,"copilot_ask");
     update_notification(MUSE_MODE_IDLE,129,false);
-    assert(!strcmp(dismiss_label.text,"Skip") && chirps==2 && strstr(hint.text,"option number"));
+    assert(!strcmp(dismiss_label.text,"Skip") && chirps==2 && strstr(hint.text,"Tap an option"));
+    incoming.choice_count=3;
+    strcpy(incoming.choices[0],"Brief");strcpy(incoming.choices[1],"Detailed");strcpy(incoming.choices[2],"Third");
+    incoming.allow_freeform=false;
+    update_notification(MUSE_MODE_IDLE,130,false);
+    assert(!(choices.flags&LV_OBJ_FLAG_HIDDEN) && !(options[2].flags&LV_OBJ_FLAG_HIDDEN));
+    assert(options[3].flags&LV_OBJ_FLAG_HIDDEN && options[12].flags&LV_OBJ_FLAG_HIDDEN);
+    assert(!strcmp(option_labels[1].text,"2. Detailed") && !strcmp(review.text,incoming.body));
+    lv_event_t tap={.data=2,.code=LV_EVENT_PRESSED};copilot_option(&tap);
+    tap.code=LV_EVENT_CLICKED;copilot_option(&tap);
+    assert(commands==1 && strstr(command,"copilot_choice") && strstr(command,"\"option\":2"));
+    assert(strstr(command,incoming.id) && !dictating);
+    busy=true;update_notification(MUSE_MODE_IDLE,131,false);
+    assert(options[1].flags&LV_STATE_DISABLED);copilot_option(&tap);dismiss_notification(NULL);
+    assert(commands==1 && available);busy=false;
+    /* Changing the request between press and release cannot answer the new question. */
+    tap.code=LV_EVENT_PRESSED;copilot_option(&tap);
+    strcpy(incoming.id,"11111111111111111111111111111111");update_notification(MUSE_MODE_IDLE,132,false);
+    tap.code=LV_EVENT_CLICKED;copilot_option(&tap);assert(commands==1);
+    incoming.allow_freeform=true;update_notification(MUSE_MODE_IDLE,133,false);
+    assert(!(options[12].flags&LV_OBJ_FLAG_HIDDEN));
+    tap.data=13;tap.code=LV_EVENT_PRESSED;copilot_option(&tap);
+    tap.code=LV_EVENT_CLICKED;copilot_option(&tap);
+    assert(dictating && !strcmp(dictation_id,incoming.id) && commands==1);
+    update_notification(MUSE_MODE_LISTENING,134,false);
+    assert(!(card.flags&LV_OBJ_FLAG_HIDDEN) && choices.flags&LV_OBJ_FLAG_HIDDEN);
+    assert(!strcmp(action_label.text,"Send") && !strcmp(dismiss_label.text,"Cancel"));
+    notification_action(NULL);assert(sends==1);
+    dismiss_notification(NULL);assert(cancels==1 && available);
+    dictating=false;update_notification(MUSE_MODE_IDLE,135,false);
+    assert(!strcmp(dismiss_label.text,"Skip") && !strcmp(action_label.text,"Review"));
+    assert(!(choices.flags&LV_OBJ_FLAG_HIDDEN) && strstr(hint.text,"Tap an option"));
     s_small=true;s_w=s_h=240;
     notification_layout(false);
     assert(card.h==96 && details.h==32 && dismiss.w==56);
