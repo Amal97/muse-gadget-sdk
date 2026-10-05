@@ -198,7 +198,41 @@ class BridgeTest(unittest.TestCase):
                              expected)
         self.assertEqual(self.request({"messages": [{"role": "tool", "content": "test"}]})[0], 400)
         self.assertEqual(self.request({"messages": [{"role": "user", "content": "x"}] * 11})[0], 400)
-        self.assertEqual(self.request({"padding": "x" * 16384})[0], 413)
+        self.assertEqual(self.request({"padding": "x" * bridge.JSON_CAP})[0], 413)
+
+    def test_personal_memory_and_conversation_routes_are_authenticated_and_strict(self):
+        companion = bridge.Companion(self.state)
+        companion.put("endpoint", f"https://127.0.0.1:{self.server.server_port}{bridge.COMPANION_PATH}")
+        jobs = bridge.JobManager(self.state, Mock(), self.server.chat_lock, durable_conversation=True)
+        try:
+            with patch.object(self.server, "companion", companion), patch.object(self.server, "jobs", jobs):
+                path = bridge.COMPANION_PATH
+                self.assertEqual(self.request({"action": "memory_add", "text": "TEST_MEMORY"},
+                                              path=path, token="wrong")[0], 401)
+                self.assertEqual(jobs.personal_status()["memory_count"], 0)
+                code, saved = self.request({"action": "memory_add", "text": "TEST_MEMORY"}, path=path)
+                self.assertEqual(code, 200)
+                self.assertEqual(saved["memory_count"], 1)
+                code, status = self.request({"action": "status"}, path=path)
+                self.assertEqual(code, 200)
+                self.assertEqual(status["memories"][0]["text"], "TEST_MEMORY")
+                self.assertTrue(status["conversation"]["persistent"])
+                for body in ({"action": "memory_add"}, {"action": "memory_list", "offset": True},
+                             {"action": "conversation_reset", "extra": 1}):
+                    self.assertEqual(self.request(body, path=path)[0], 400)
+                cli = load_tool("companion_cli")
+                with self.assertRaisesRegex(RuntimeError, "HTTP 400: Invalid personal companion request fields"):
+                    cli.call({"action": "memory_add", "content": "Wrong field"}, self.state)
+                before = status["conversation"]["id"]
+                code, result = self.request({"action": "memory_forget", "id": saved["memory"]["id"]}, path=path)
+                self.assertEqual(code, 200)
+                self.assertEqual(result["memory_count"], 0)
+                self.assertNotEqual(result["conversation"]["id"], before)
+                self.assertEqual(self.request({"action": "conversation_reset"}, path=path)[0], 200)
+                self.assertEqual(Upstream.records, [])
+        finally:
+            jobs.close()
+            companion.close()
 
     def test_upstream_errors_and_invalid_replies_are_explicit(self) -> None:
         body = {"messages": [{"role": "user", "content": "Hi"}]}

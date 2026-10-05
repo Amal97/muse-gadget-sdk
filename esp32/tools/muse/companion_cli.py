@@ -14,6 +14,7 @@ import sys
 from urllib.parse import urlsplit
 
 STATE = Path.home() / ".openclaw/muse-esp32"
+JSON_CAP = 32768
 
 
 def call(body: dict, state: Path = STATE) -> dict:
@@ -40,14 +41,18 @@ def call(body: dict, state: Path = STATE) -> dict:
         connection.request("POST", endpoint.path, json.dumps(body).encode(), {
             "Content-Type": "application/json", "Authorization": "Bearer " + config["device_token"]})
         response = connection.getresponse()
-        data = response.read(16384)
-        if response.status != 200:
-            raise RuntimeError(f"Companion HTTP {response.status}; check bridge state and permissions.")
-        if len(data) >= 16384:
+        data = response.read(JSON_CAP)
+        if len(data) >= JSON_CAP:
             raise ValueError("Companion response exceeds the supported limit.")
         value = json.loads(data)
         if not isinstance(value, dict):
             raise ValueError("Invalid companion response.")
+        if response.status != 200:
+            error = value.get("error")
+            message = error.get("message") if isinstance(error, dict) else None
+            if not isinstance(message, str) or not message.strip():
+                raise RuntimeError(f"Companion HTTP {response.status}; invalid bridge error response.")
+            raise RuntimeError(f"Companion HTTP {response.status}: {message}")
         return value
     finally:
         connection.close()
@@ -59,7 +64,7 @@ def main() -> int:
     parser.add_argument("--state", type=Path, default=STATE)
     args = parser.parse_args()
     try:
-        body = json.loads(args.request if args.request else sys.stdin.read(16384))
+        body = json.loads(args.request if args.request else sys.stdin.read(JSON_CAP))
         if not isinstance(body, dict):
             raise ValueError("Expected one JSON request object.")
         print(json.dumps(call(body, args.state), ensure_ascii=False))

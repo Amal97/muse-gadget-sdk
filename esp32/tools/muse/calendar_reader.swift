@@ -115,7 +115,8 @@ do {
             try output(["events": events.sorted { $0.startDate < $1.startDate }.map {
                 ["title": $0.title ?? "(Untitled event)", "start": $0.startDate.timeIntervalSince1970,
                  "end": $0.endDate.timeIntervalSince1970, "all_day": $0.isAllDay,
-                 "calendar": $0.calendar.title] as [String: Any]
+                 "calendar": $0.calendar.title, "calendar_id": $0.calendar.calendarIdentifier,
+                 "id": $0.calendarItemIdentifier, "cancelled": $0.status == .canceled] as [String: Any]
             }])
         } else {
             throw NSError(domain: "MuseCalendar", code: 4, userInfo: [

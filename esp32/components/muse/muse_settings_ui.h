@@ -34,3 +34,5 @@ void muse_settings_ui_tick(bool visible);
 /* True when a sub-page is open (the tileview must not steal horizontal swipes). */
 bool muse_settings_ui_in_subpage(void);
 void muse_settings_ui_open_companion(const char *detail);
+void muse_settings_ui_open_companion_reminders(void);
+void muse_settings_ui_open_companion_briefing(const char *detail);

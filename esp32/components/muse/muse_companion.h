@@ -2,6 +2,7 @@
 #pragma once
 #include <stdbool.h>
 #include <stddef.h>
+#define MUSE_COMPANION_SNAPSHOT_CAP 32768
 
 typedef enum { MUSE_TIMER_OFF, MUSE_TIMER_RUNNING, MUSE_TIMER_RINGING, MUSE_TIMER_WAIT_CLOCK } muse_timer_state_t;
 void muse_companion_start(void);

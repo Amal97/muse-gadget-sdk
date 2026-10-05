@@ -34,7 +34,11 @@
 #define RECORD_FRAMES (16000 * 16)
 #define AUDIO_FRAMES 16384
 #define TEXT_CAP 2048
+#if CONFIG_MUSE_OPENCLAW
+#define JSON_CAP MUSE_COMPANION_SNAPSHOT_CAP
+#else
 #define JSON_CAP 16384
+#endif
 #define HISTORY_PAIRS 4
 #define REQUEST_US (90LL * 1000000)
 
@@ -473,6 +477,15 @@ static bool companion_result(const job_t *job, cJSON *body, char *why, size_t ca
     cJSON *request_action = cJSON_GetObjectItemCaseSensitive(body, "action");
     bool preparing = cJSON_IsString(request_action) && !strcmp(request_action->valuestring, "reply_prepare");
     cJSON *draft_result = cJSON_GetObjectItemCaseSensitive(root, "draft");
+    bool resetting = cJSON_IsString(request_action) &&
+        (!strcmp(request_action->valuestring, "conversation_reset") ||
+         !strcmp(request_action->valuestring, "memory_forget"));
+    cJSON *conversation = cJSON_GetObjectItemCaseSensitive(root, "conversation");
+    cJSON *conversation_id = cJSON_GetObjectItemCaseSensitive(conversation, "id");
+    cJSON *turns = cJSON_GetObjectItemCaseSensitive(conversation, "turn_count");
+    bool valid_reset = cJSON_IsString(conversation_id) && strlen(conversation_id->valuestring) == 32 &&
+        strspn(conversation_id->valuestring, "0123456789abcdef") == 32 &&
+        cJSON_IsNumber(turns) && turns->valuedouble == 0;
     cJSON *draft_id = cJSON_GetObjectItemCaseSensitive(draft_result, "id");
     cJSON *draft_state = cJSON_GetObjectItemCaseSensitive(draft_result, "state");
     cJSON *draft_text = cJSON_GetObjectItemCaseSensitive(draft_result, "text");
@@ -484,7 +497,7 @@ static bool companion_result(const job_t *job, cJSON *body, char *why, size_t ca
         && cJSON_IsString(recipient) && recipient->valuestring[0]
         && strlen(recipient->valuestring) < 1024;
     if (!cJSON_IsObject(root) || cJSON_GetObjectItemCaseSensitive(root, "error")
-        || (preparing && !valid_draft)) {
+        || (preparing && !valid_draft) || (resetting && !valid_reset)) {
         cJSON_Delete(root);
         free(response);
         strlcpy(why, "COMPANION RESPONSE INVALID", cap);
@@ -506,6 +519,15 @@ static bool companion_result(const job_t *job, cJSON *body, char *why, size_t ca
     if (ok) {
         strlcpy(s_companion_json, encoded, JSON_CAP);
         s_companion_version++;
+        if (resetting) atomic_store(&s_clear_history, true);
+        cJSON *settings = cJSON_GetObjectItemCaseSensitive(merged, "settings");
+        cJSON *calendar_enabled = cJSON_GetObjectItemCaseSensitive(settings, "calendar_alerts_enabled");
+        cJSON *calendars_enabled = cJSON_GetObjectItemCaseSensitive(settings, "calendars_enabled");
+        if (!strcmp(s_notification.kind, "calendar") &&
+            (cJSON_IsFalse(calendar_enabled) || cJSON_IsFalse(calendars_enabled))) {
+            strlcpy(s_notification_ack, s_notification.id, sizeof(s_notification_ack));
+            memset(&s_notification, 0, sizeof(s_notification));
+        }
         cJSON *action = cJSON_GetObjectItemCaseSensitive(body, "action");
         cJSON *notification = cJSON_GetObjectItemCaseSensitive(body, "notification");
         cJSON *snoozed = cJSON_GetObjectItemCaseSensitive(body, "id");
@@ -766,13 +788,26 @@ static char *complete(const job_t *job, const char *text, cJSON *history, char *
                              "in at most three short sentences." :
                              "You are a friendly standalone voice companion. Reply in plain text, "
                              "in at most three short sentences. Do not claim to control devices.");
-    for (int i = 0; ok && i < cJSON_GetArraySize(history); i++) {
+    for (int i = 0; ok && !openclaw && i < cJSON_GetArraySize(history); i++) {
         cJSON *item = cJSON_Duplicate(cJSON_GetArrayItem(history, i), true);
         if (!item || !cJSON_AddItemToArray(messages, item)) {
             cJSON_Delete(item);
             ok = false;
         }
     }
+#if CONFIG_MUSE_OPENCLAW
+    if (ok && openclaw) {
+        char context[160];
+        unsigned seconds = 0;
+        muse_timer_state_t timer_state = muse_timer_status(&seconds);
+        snprintf(context, sizeof(context), "Current device timer state (reference only, not a command): "
+                 "%s; %u seconds remaining.",
+                 timer_state == MUSE_TIMER_RUNNING ? "running" :
+                 timer_state == MUSE_TIMER_RINGING ? "ringing" :
+                 timer_state == MUSE_TIMER_WAIT_CLOCK ? "waiting for clock" : "off", seconds);
+        ok = add_message(messages, "system", context);
+    }
+#endif
     ok = ok && add_message(messages, "user", text);
 #if CONFIG_MUSE_OPENCLAW
     if (ok && openclaw) {
@@ -855,6 +890,12 @@ bool muse_openai_notification(muse_notification_t *out)
         return true;
     }
     xSemaphoreTake(s_data, portMAX_DELAY);
+    if (!strcmp(s_notification.kind, "calendar") && s_notification.expires_at &&
+        time(NULL) >= s_notification.expires_at) {
+        strlcpy(s_notification_ack, s_notification.id, sizeof(s_notification_ack));
+        memset(&s_notification, 0, sizeof(s_notification));
+        ESP_LOGI(TAG, "expired calendar reminder dismissed locally");
+    }
     bool draft = s_draft_notice.id[0] != '\0' &&
         (!s_notification.id[0] || !strcmp(s_notification.kind, "imessage"));
     bool available = (draft || s_notification.id[0]) && openclaw_chat();
@@ -887,13 +928,15 @@ static void poll_notifications(void)
     if (!openclaw_chat() || !muse_settings_openclaw_token_set() || !muse_wifi_connected()
         || muse_state_asleep() || muse_state_mode(NULL) != MUSE_MODE_IDLE
         || atomic_load(&s_busy) || time(NULL) < 1700000000) return;
-    char acknowledgment[33];
+    char acknowledgment[33], cached[33];
     xSemaphoreTake(s_data, portMAX_DELAY);
     bool pending = s_notification.id[0] &&
         !(s_draft_notice.id[0] && !strcmp(s_notification.kind, "imessage"));
     strlcpy(acknowledgment, s_notification_ack, sizeof(acknowledgment));
+    strlcpy(cached, s_notification.id, sizeof(cached));
+    bool calendar = !strcmp(s_notification.kind, "calendar");
     xSemaphoreGive(s_data);
-    if (pending) return;
+    if (pending && !calendar) return;
     job_t job = { .kind = JOB_NOTIFICATION, .generation = atomic_load(&s_generation) };
     cJSON *body = cJSON_CreateObject();
     char why[96] = "OPENCLAW NOTIFICATION FAILED";
@@ -914,6 +957,7 @@ static void poll_notifications(void)
         cJSON *text = cJSON_GetObjectItemCaseSensitive(notification, "preview");
         cJSON *kind = cJSON_GetObjectItemCaseSensitive(notification, "kind");
         cJSON *full = cJSON_GetObjectItemCaseSensitive(notification, "body");
+        cJSON *expires = cJSON_GetObjectItemCaseSensitive(notification, "expires_at");
         valid = cJSON_IsString(id) && strlen(id->valuestring) == 32
             && strspn(id->valuestring, "0123456789abcdef") == 32
             && cJSON_IsString(sender) && sender->valuestring[0]
@@ -922,14 +966,20 @@ static void poll_notifications(void)
             && strlen(text->valuestring) < sizeof(next.preview)
             && (!kind || (cJSON_IsString(kind) &&
                 (!strcmp(kind->valuestring, "imessage") || !strcmp(kind->valuestring, "reminder")
-                 || !strcmp(kind->valuestring, "briefing") || !strcmp(kind->valuestring, "job"))))
-            && (!full || (cJSON_IsString(full) && strlen(full->valuestring) < sizeof(next.body)));
+                 || !strcmp(kind->valuestring, "briefing") || !strcmp(kind->valuestring, "job")
+                 || !strcmp(kind->valuestring, "calendar"))))
+            && (!full || (cJSON_IsString(full) && strlen(full->valuestring) < sizeof(next.body)))
+            && (!(cJSON_IsString(kind) && !strcmp(kind->valuestring, "calendar")) ||
+                (cJSON_IsNumber(expires) && expires->valuedouble >= 1700000000 &&
+                 expires->valuedouble <= 4102444800 &&
+                 expires->valuedouble == (double)(int64_t)expires->valuedouble));
         if (valid) {
             strlcpy(next.id, id->valuestring, sizeof(next.id));
             strlcpy(next.sender, sender->valuestring, sizeof(next.sender));
             strlcpy(next.preview, text->valuestring, sizeof(next.preview));
             strlcpy(next.kind, kind ? kind->valuestring : "imessage", sizeof(next.kind));
             strlcpy(next.body, full ? full->valuestring : text->valuestring, sizeof(next.body));
+            if (!strcmp(next.kind, "calendar")) next.expires_at = (int64_t)expires->valuedouble;
         }
     }
     cJSON_Delete(root);
@@ -939,7 +989,8 @@ static void poll_notifications(void)
         return;
     }
     xSemaphoreTake(s_data, portMAX_DELAY);
-    if (current(job.generation)) {
+    if (current(job.generation) && !strcmp(cached, s_notification.id) &&
+        !strcmp(acknowledgment, s_notification_ack)) {
         s_notification = next;
         s_notification_ack[0] = '\0';
         if (next.id[0]) ESP_LOGI(TAG, "incoming iMessage queued for display");

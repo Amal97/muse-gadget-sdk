@@ -826,7 +826,7 @@ static void home_detail(lv_event_t *event)
                  muse_home_text(weather, "error"));
         muse_settings_ui_open_companion(detail);
     } else if (card == 1) {
-        muse_settings_ui_open_companion("REMINDERS & TIMERS\nView your gadget reminders and local timer below.");
+        muse_settings_ui_open_companion_reminders();
     } else {
         const cJSON *briefing = cJSON_GetObjectItemCaseSensitive(s_home_data, "briefing");
         const char *body = muse_home_text(briefing, "body");
@@ -834,8 +834,8 @@ static void home_detail(lv_event_t *event)
             if (!muse_openai_companion_command("{\"action\":\"briefing\"}")) {
                 muse_state_set_caption("BRIEFING NOT QUEUED - MAC MAY BE BUSY");
             }
-            muse_settings_ui_open_companion("DAILY BRIEFING\nYour refreshed briefing appears below when ready.");
-        } else muse_settings_ui_open_companion(body);
+            muse_settings_ui_open_companion_briefing("Your refreshed briefing appears here when ready.");
+        } else muse_settings_ui_open_companion_briefing(body);
     }
 }
 
@@ -899,7 +899,7 @@ static void build_home(void)
     lv_obj_set_width(s_home_footer, s_w * 56 / 100);
     lv_label_set_long_mode(s_home_footer, LV_LABEL_LONG_DOT);
     lv_obj_align(s_home_footer, LV_ALIGN_TOP_MID, 0, s_h * 89 / 100);
-    s_home_json = malloc(16384);
+    s_home_json = malloc(MUSE_COMPANION_SNAPSHOT_CAP);
     if (!s_home_json) {
         ESP_LOGE(TAG, "Home status buffer allocation failed");
         muse_state_set_caption("HOME STATUS MEMORY UNAVAILABLE");
@@ -937,7 +937,7 @@ static void update_home(float now)
 {
     if (!s_home || now < s_home_tick) return;
     s_home_tick = now + 1;
-    if (s_home_json && muse_openai_companion_snapshot(s_home_json, 16384, &s_home_version)) {
+    if (s_home_json && muse_openai_companion_snapshot(s_home_json, MUSE_COMPANION_SNAPSHOT_CAP, &s_home_version)) {
         cJSON *root = cJSON_Parse(s_home_json);
         if (cJSON_IsObject(root)) {
             cJSON_Delete(s_home_data);
@@ -1328,7 +1328,8 @@ static void notification_action(lv_event_t *e)
             s_notification_id[0] = '\0';
             lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
         }
-    } else if (!strcmp(s_shown_notification.kind, "reminder")) {
+    } else if (!strcmp(s_shown_notification.kind, "reminder") ||
+               !strcmp(s_shown_notification.kind, "calendar")) {
         cJSON *body = cJSON_CreateObject();
         if (body) {
             cJSON_AddStringToObject(body, "action", "snooze");
@@ -1371,7 +1372,8 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
         strcmp(notification.body, s_shown_notification.body);
     s_shown_notification = notification;
     const char *action = !strcmp(notification.kind, "imessage") ? "Reply" :
-        (!strcmp(notification.kind, "timer") || !strcmp(notification.kind, "reminder")) ? "Snooze 5m" :
+        (!strcmp(notification.kind, "timer") || !strcmp(notification.kind, "reminder") ||
+         !strcmp(notification.kind, "calendar")) ? "Snooze 5m" :
         (!strcmp(notification.kind, "reply") || !strcmp(notification.kind, "timer_replace")) ? "Review" : NULL;
     if (action) {
         lv_label_set_text(s_notification_action_label, action);

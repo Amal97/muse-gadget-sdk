@@ -14,6 +14,49 @@ sys.path.pop(0)
 
 
 class HomeTest(unittest.TestCase):
+    def test_home_cards_open_their_companion_sections(self):
+        ui = (ROOT / "components/muse/muse_ui.c").read_text()
+        source = r'''
+#include <assert.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <time.h>
+#include "muse_home.h"
+typedef struct { intptr_t data; } lv_event_t;
+typedef struct { int state; } muse_wifi_status_t;
+#define MUSE_WIFI_CONNECTED 1
+static cJSON *s_home_data;
+static int destination,build_requests;
+static char detail_text[1024];
+static void *lv_event_get_user_data(lv_event_t *event){return (void *)event->data;}
+static void muse_wifi_status(muse_wifi_status_t *status){status->state=MUSE_WIFI_CONNECTED;}
+static int muse_settings_home_offset(void){return 0;}
+static void muse_settings_ui_open_companion(const char *text){
+    destination=1;snprintf(detail_text,sizeof(detail_text),"%s",text);
+}
+static void muse_settings_ui_open_companion_reminders(void){destination=2;}
+static void muse_settings_ui_open_companion_briefing(const char *text){
+    destination=3;snprintf(detail_text,sizeof(detail_text),"%s",text);
+}
+static bool muse_openai_companion_command(const char *text){(void)text;build_requests++;return true;}
+static void muse_state_set_caption(const char *text){(void)text;}
+''' + function(ui, "home_detail") + r'''
+int main(void){
+    s_home_data=cJSON_Parse("{}");lv_event_t event={0};
+    home_detail(&event);assert(destination==1 && strstr(detail_text,"WEATHER"));
+    event.data=1;home_detail(&event);assert(destination==2);
+    event.data=2;home_detail(&event);assert(destination==3 && build_requests==1);
+    cJSON_Delete(s_home_data);
+    s_home_data=cJSON_Parse("{\"briefing\":{\"state\":\"ready\",\"body\":\"Test daily digest\"}}");
+    home_detail(&event);
+    assert(destination==3 && !strcmp(detail_text,"Test daily digest") && build_requests==1);
+    cJSON_Delete(s_home_data);
+    return 0;
+}
+'''
+        self.compile_case(source)
+
     def compile_case(self, source):
         cjson = ROOT / "managed_components/espressif__cjson/cJSON"
         with tempfile.TemporaryDirectory() as directory:

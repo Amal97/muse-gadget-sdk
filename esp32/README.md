@@ -322,9 +322,10 @@ backends: `python3 -m unittest tests/test_muse_settings_ui.py`.
 The OpenAI key and bridge token remain unencrypted in device NVS. Audio
 goes to OpenAI; conversation text goes through the computer to OpenClaw's
 configured provider. OpenClaw may save transcripts/session files on the
-computer. The firmware sends its bounded history with each turn and the
-bridge creates an independent OpenClaw session, so **New conversation**
-clears active device context, not previously saved computer logs. Existing
+computer. In companion mode the Mac supplies bounded durable reference
+history, while each task uses an independent OpenClaw session.
+**New conversation** clears recent context, not explicitly saved personal
+memories or previously saved computer logs. Existing
 OpenClaw tools are unavailable in the default chat-only configuration.
 Provider availability, billing, and regional restrictions still apply.
 The generated server certificate expires after 825 days; renew it using
@@ -579,7 +580,7 @@ completed conversation history and include the installed companion helper's
 exact path and JSON protocol; old commands are not presented as pending work.
 Native model cost metadata is an **estimate**, not account billing;
 missing steps and potentially truncated histories are marked incomplete,
-not zero. API responses at or above the 16,384-byte device limit are explicitly
+not zero. API responses at or above the 32,768-byte OpenClaw device limit are explicitly
 rejected, never delivered as a clipped successful response. The dashboard separately states
 that direct OpenAI voice usage is not metered and shows budgeting rates.
 Browser connectivity checks invoke a read-only tool on normal Chrome;
@@ -587,6 +588,13 @@ daemon liveness alone is not treated as browser connectivity.
 
 Open **Settings > Companion** for configurable favourite cards, timer
 controls, gadget reminders, reply review, connectivity, and briefing settings.
+Companion opens a compact menu grouped into **Personal AI**, **Daily tools**,
+and **Device**. Conversation, Personal memory, Timers, Reminders, Daily briefing,
+Calendars & alerts, Replies, Favourite cards, and Connection & costs each have
+their own page. Back (or swipe right) returns to the Companion menu, then Settings.
+Each section retains its scroll position while Companion stays open, including
+live Mac refreshes and returning from text entry. Home reminder/briefing cards
+and pending reply/timer-replacement prompts open the relevant section directly.
 Favourites currently select from six deterministic actions: five- and
 ten-minute timers, a custom timer, adding a reminder, the briefing, and
 the dashboard. They do not require a model call.
@@ -608,6 +616,55 @@ Install `tools/muse/companion-skill/SKILL.md` as
 `tools/muse/companion_cli.py` to the private bridge state directory.
 The authenticated local helper supports reminders and briefing requests;
 do not substitute OpenClaw cron or a Mac sleep command for local timers.
+
+### Personal memory and durable conversations
+
+OpenClaw companion mode keeps the last eight completed request/reply pairs in
+private Mac SQLite state, with a 24,000-byte serialized reference-context budget.
+The gadget and Mac can restart without losing follow-up context. Failed,
+cancelled and interrupted tasks are excluded; old jobs without stored requests
+are not imported. Each task retains a separate cancellable native session.
+Previous turns are reference data, never permission to replay a computer action.
+Current local timer state is supplied separately, so timer follow-ups still work.
+
+Say **"Remember that I prefer short answers"** to explicitly save a personal
+fact, or use **Settings > Companion > Personal memory > Add a memory**. No automatic learning from
+chat, messages, calendars or browsing is performed. Saved facts are sent to the
+model as reference context on future OpenClaw turns. Do not store credentials.
+There are at most 50 facts of 240 UTF-8 bytes each, shown six per page. Adding an
+exact duplicate is idempotent. **Forget** requires two taps on the same item
+within 15 seconds.
+
+**Conversation > Start a new conversation** resets recent context but keeps saved memories.
+Forgetting a fact also resets recent context to prevent old replies from
+reintroducing it. These actions do **not** erase historical job records,
+OpenClaw/provider transcripts or backups. Memory/context controls require the
+reachable Mac and report success only after confirmation. Standalone OpenAI
+builds retain their existing RAM-only conversation behavior.
+
+### Proactive calendar alerts
+
+In **Settings > Companion > Calendars & alerts**, enable heads-ups for the currently selected
+calendars. The initial lead is 30 minutes; the gadget cycles 5/15/30 minutes.
+Quiet hours default to **22:00-08:00 in the Mac's local timezone** and can be
+disabled. All-day and cancelled events are excluded. This is a read-only feature:
+it creates neither calendar events nor OpenClaw cron jobs and makes no AI calls.
+Keep the Mac awake and reachable for delivery.
+
+The next 24 hours are refreshed every two minutes. A missing, unavailable or
+five-minute-stale agenda generates no new alerts. Rescheduled/cancelled
+occurrences invalidate old queued heads-ups; cached gadget calendar alerts
+are rechecked while awake and expire locally at event start, including offline.
+The same occurrence is not repeatedly announced across bridge restarts.
+Five-minute Snooze is rejected if it would reach or exceed event start.
+Quiet hours suppress new calendar alerts only; a still-future event can receive
+a delayed heads-up after quiet hours end. Manual reminders and local timer
+alarms retain their existing behavior.
+
+When upgrading, reinstall the read-only calendar helper and refresh the installed
+companion skill and private CLI copy. The helper now supplies stable calendar and
+occurrence identifiers; an older helper is explicitly reported unavailable for
+proactive alerts rather than scheduling unreliable duplicates.
 
 Tap **Reply** on an incoming iMessage, hold Talk to dictate, then review the
 exact conversation participants and full text in Companion. Edit, cancel,

@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta
 import json
+import hashlib
 import logging
 import math
 import os
@@ -24,7 +25,9 @@ from openclaw_jobs import identifier
 
 DEFAULTS = {"briefing_enabled": False, "calendars_enabled": False, "calendar_ids": [],
             "hour": 8, "minute": 0, "weather": None,
-            "favourites": ["timer_5", "timer_10", "briefing", "dashboard"]}
+            "favourites": ["timer_5", "timer_10", "briefing", "dashboard"],
+            "calendar_alerts_enabled": False, "calendar_lead_minutes": 30,
+            "quiet_start_hour": 22, "quiet_end_hour": 8}
 FAVOURITES = ("timer_5", "timer_10", "timer_custom", "reminder", "briefing", "dashboard")
 
 
@@ -38,6 +41,8 @@ class Companion:
         self.brief_thread: threading.Thread | None = None
         self.reply_thread: threading.Thread | None = None
         self.weather_thread: threading.Thread | None = None
+        self.calendar_thread: threading.Thread | None = None
+        self.calendar_lock = threading.Lock()
         self.weather_lock = threading.Lock()
         self.calendars: list[dict] = []
         fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
@@ -50,6 +55,13 @@ class Companion:
             db.execute("CREATE TABLE IF NOT EXISTS alerts "
                        "(seq INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,kind TEXT NOT NULL,"
                        "title TEXT NOT NULL,body TEXT NOT NULL,reference TEXT NOT NULL)")
+            alert_columns = {row["name"] for row in db.execute("PRAGMA table_info(alerts)")}
+            if "expires_at" not in alert_columns:
+                db.execute("ALTER TABLE alerts ADD COLUMN expires_at REAL")
+            db.execute("CREATE TABLE IF NOT EXISTS alert_receipts (id TEXT PRIMARY KEY)")
+            db.execute("CREATE TABLE IF NOT EXISTS calendar_events "
+                       "(key TEXT PRIMARY KEY,start REAL NOT NULL,end REAL NOT NULL,title TEXT NOT NULL,"
+                       "calendar TEXT NOT NULL,state TEXT NOT NULL,due REAL NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS drafts "
                        "(id TEXT PRIMARY KEY,chat_guid TEXT NOT NULL,recipient TEXT NOT NULL,"
                        "text TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL)")
@@ -57,8 +69,10 @@ class Companion:
                        ("Bridge restarted during send; check Messages. No automatic retry.",))
             for key, value in (("settings", DEFAULTS), ("calendars", []), ("last_ack", ""),
                                ("briefing_date", ""), ("briefing", {"state": "not_requested"}),
-                               ("weather", {"state": "not_configured"})):
+                               ("weather", {"state": "not_configured"}),
+                               ("calendar_alerts", {"state": "disabled"})):
                 db.execute("INSERT OR IGNORE INTO metadata VALUES (?,?)", (key, json.dumps(value)))
+        self.put("settings", {**DEFAULTS, **self.get("settings")})
         self.calendars = self.get("calendars")
         previous = self.get("briefing")
         if previous.get("state") == "building":
@@ -123,12 +137,15 @@ class Companion:
             raise ValueError("Unknown companion setting.")
         with self.lock:
             settings = {**self.get("settings"), **changes}
-            for field in ("briefing_enabled", "calendars_enabled"):
+            for field in ("briefing_enabled", "calendars_enabled", "calendar_alerts_enabled"):
                 if type(settings[field]) is not bool:
                     raise ValueError("Expected a boolean setting.")
-            for field, maximum in (("hour", 23), ("minute", 59)):
+            for field, maximum in (("hour", 23), ("minute", 59),
+                                   ("quiet_start_hour", 23), ("quiet_end_hour", 23)):
                 if type(settings[field]) is not int or not 0 <= settings[field] <= maximum:
                     raise ValueError("Invalid briefing time.")
+            if type(settings["calendar_lead_minutes"]) is not int or not 1 <= settings["calendar_lead_minutes"] <= 120:
+                raise ValueError("Calendar alert lead must be 1 to 120 minutes.")
             favourites = settings["favourites"]
             if not isinstance(favourites, list) or not 0 <= len(favourites) <= len(FAVOURITES) or any(
                     f not in FAVOURITES for f in favourites) or len(set(favourites)) != len(favourites):
@@ -154,7 +171,121 @@ class Companion:
                     if type(value) not in (int, float) or not math.isfinite(value) or abs(value) > maximum:
                         raise ValueError("Invalid weather coordinates.")
             self.put("settings", settings)
+            if not settings["calendar_alerts_enabled"] or not settings["calendars_enabled"]:
+                with self.connect() as db:
+                    self.expire_calendar_alerts(db, time.time(), set())
             return settings
+
+    @staticmethod
+    def quiet_time(now: float, settings: dict) -> bool:
+        hour = datetime.fromtimestamp(now).hour
+        start, end = settings["quiet_start_hour"], settings["quiet_end_hour"]
+        return start <= hour < end if start < end else (
+            hour >= start or hour < end if start > end else False)
+
+    @staticmethod
+    def expire_calendar_alerts(db: sqlite3.Connection, now: float,
+                               valid: set[str] | None = None) -> None:
+        for row in db.execute("SELECT id,reference,expires_at FROM alerts WHERE kind='calendar'").fetchall():
+            if row["expires_at"] <= now or (valid is not None and row["reference"] not in valid):
+                # A device can still acknowledge its cached copy after expiry or cancellation.
+                db.execute("INSERT OR IGNORE INTO alert_receipts VALUES (?)", (row["id"],))
+                db.execute("DELETE FROM alerts WHERE id=?", (row["id"],))
+
+    def refresh_calendar_alerts(self) -> dict:
+        with self.calendar_lock:
+            settings = self.get("settings")
+            now = time.time()
+            if not settings["calendar_alerts_enabled"] or not settings["calendars_enabled"]:
+                return {"state": "disabled"}
+            try:
+                events = self.calendar_query("events", {"ids": settings["calendar_ids"],
+                    "start": now, "end": now + 86400}).get("events")
+                if not isinstance(events, list) or len(events) > 1000:
+                    raise ValueError("Invalid or oversized calendar reminder agenda.")
+                upcoming = {}
+                for event in events:
+                    if not isinstance(event, dict) or any(
+                            not isinstance(event.get(field), str) or not event[field]
+                            or len(event[field].encode()) > 4096
+                            for field in ("id", "calendar_id")) or any(
+                            not isinstance(event.get(field), str) or len(event[field].encode()) > 4096
+                            for field in ("title", "calendar")) or any(
+                            type(event.get(field)) is not bool for field in ("all_day", "cancelled")) or any(
+                            type(event.get(field)) not in (int, float) or not math.isfinite(event[field])
+                            or not 0 <= event[field] <= 4102444800 for field in ("start", "end")):
+                        raise ValueError("Invalid calendar occurrence; update the read-only calendar helper.")
+                    if event["end"] < event["start"] or event["calendar_id"] not in settings["calendar_ids"]:
+                        raise ValueError("Invalid calendar occurrence or selection.")
+                    if event["all_day"] or event["cancelled"] or not now < event["start"] < now + 86400:
+                        continue
+                    key = hashlib.sha256(json.dumps(
+                        [event["calendar_id"], event["id"], event["start"]]).encode()).hexdigest()
+                    upcoming[key] = event
+                result = {"state": "ready", "checked_at": now, "selection": settings["calendar_ids"],
+                          "event_count": len(upcoming)}
+                if upcoming:
+                    first = min(upcoming.values(), key=lambda event: event["start"])
+                    result["next_event"] = {"title": preview(first["title"] or "(Untitled event)", 160),
+                                            "start": first["start"]}
+                with self.lock, self.connect() as db:
+                    current = self.get("settings")
+                    if current["calendar_ids"] != settings["calendar_ids"] or not (
+                            current["calendar_alerts_enabled"] and current["calendars_enabled"]):
+                        return {"state": "pending"}
+                    self.expire_calendar_alerts(db, now, set(upcoming))
+                    for previous in db.execute("SELECT key FROM calendar_events WHERE start>?", (now,)).fetchall():
+                        if previous["key"] not in upcoming:
+                            db.execute("UPDATE calendar_events SET state='cancelled' WHERE key=?", (previous["key"],))
+                    for key, event in upcoming.items():
+                        db.execute("INSERT INTO calendar_events VALUES (?,?,?,?,?,'scheduled',?) "
+                                   "ON CONFLICT(key) DO UPDATE SET end=excluded.end,title=excluded.title,"
+                                   "calendar=excluded.calendar,state=CASE WHEN calendar_events.state='cancelled' "
+                                   "THEN 'scheduled' ELSE calendar_events.state END",
+                                   (key, event["start"], event["end"], event["title"], event["calendar"],
+                                    event["start"] - settings["calendar_lead_minutes"] * 60))
+                    db.execute("DELETE FROM calendar_events WHERE start<?", (now - 30 * 86400,))
+                    db.execute("INSERT OR REPLACE INTO metadata VALUES ('calendar_alerts',?)", (json.dumps(result),))
+                return result
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError,
+                    subprocess.TimeoutExpired, sqlite3.Error):
+                logging.error("Calendar reminders unavailable; inspect reader permissions and calendar selections.")
+                result = {"state": "unavailable", "checked_at": now, "selection": settings["calendar_ids"],
+                          "error": "Calendar alerts unavailable; check reader access and enabled calendars."}
+                self.put("calendar_alerts", result)
+                return result
+
+    def calendar_alert_status(self, settings: dict) -> dict:
+        if not settings["calendar_alerts_enabled"] or not settings["calendars_enabled"]:
+            return {"state": "disabled"}
+        value = self.get("calendar_alerts")
+        if value.get("selection") != settings["calendar_ids"]:
+            return {"state": "pending"}
+        if value["state"] == "ready" and time.time() - value["checked_at"] >= 300:
+            value = {**value, "state": "stale"}
+        return {key: field for key, field in value.items() if key != "selection"}
+
+    def fire_calendar_alerts(self, now: float) -> None:
+        with self.lock, self.connect() as db:
+            settings = self.get("settings")
+            status = self.calendar_alert_status(settings)
+            self.expire_calendar_alerts(db, now)
+            if status["state"] != "ready" or self.quiet_time(now, settings):
+                return
+            for event in db.execute("SELECT * FROM calendar_events WHERE start>? "
+                                    "AND state IN ('scheduled','snoozed') ORDER BY start", (now,)).fetchall():
+                due = event["due"] if event["state"] == "snoozed" else (
+                    event["start"] - settings["calendar_lead_minutes"] * 60)
+                if due > now:
+                    continue
+                if db.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] >= 200:
+                    raise RuntimeError("Calendar alert queue is full.")
+                title = datetime.fromtimestamp(event["start"]).strftime("%H:%M")
+                body = f'{event["title"] or "(Untitled event)"}\nStarts at {title}\nCalendar: {event["calendar"]}'
+                db.execute("INSERT INTO alerts (id,kind,title,body,reference,expires_at) VALUES (?,?,?,?,?,?)",
+                           (uuid.uuid4().hex, "calendar", "Upcoming calendar event", preview(body, 2047),
+                            event["key"], math.ceil(event["start"])))
+                db.execute("UPDATE calendar_events SET state='notified' WHERE key=?", (event["key"],))
 
     def reminders(self) -> list[dict]:
         with self.connect() as db:
@@ -182,25 +313,33 @@ class Companion:
 
     def owns_ack(self, ack: str) -> bool:
         with self.connect() as db:
-            return bool(db.execute("SELECT 1 FROM alerts WHERE id=?", (ack,)).fetchone()) or (
+            return bool(db.execute("SELECT 1 FROM alerts WHERE id=?", (ack,)).fetchone()) or bool(
+                db.execute("SELECT 1 FROM alert_receipts WHERE id=?", (ack,)).fetchone()) or (
                 bool(ack) and ack == self.get("last_ack"))
 
     def poll(self, ack: str = "") -> dict:
         if ack:
             identifier(ack)
         with self.lock, self.connect() as db:
+            self.expire_calendar_alerts(db, time.time())
             head = db.execute("SELECT * FROM alerts ORDER BY seq LIMIT 1").fetchone()
             if ack and ack != self.get("last_ack"):
-                if head is None or head["id"] != ack:
+                receipt = db.execute("SELECT 1 FROM alert_receipts WHERE id=?", (ack,)).fetchone()
+                if not receipt and (head is None or head["id"] != ack):
                     raise ValueError("Only the delivered companion alert may be dismissed.")
-                db.execute("DELETE FROM alerts WHERE id=?", (ack,))
-                if head["kind"] == "reminder":
-                    db.execute("UPDATE reminders SET state='done' WHERE id=?", (head["reference"],))
+                if not receipt:
+                    db.execute("DELETE FROM alerts WHERE id=?", (ack,))
+                    if head["kind"] == "reminder":
+                        db.execute("UPDATE reminders SET state='done' WHERE id=?", (head["reference"],))
+                    elif head["kind"] == "calendar":
+                        db.execute("UPDATE calendar_events SET state='dismissed' WHERE key=?", (head["reference"],))
+                        db.execute("INSERT OR IGNORE INTO alert_receipts VALUES (?)", (ack,))
                 db.execute("UPDATE metadata SET value=? WHERE key='last_ack'", (json.dumps(ack),))
                 head = db.execute("SELECT * FROM alerts ORDER BY seq LIMIT 1").fetchone()
             return {"notification": {"id": head["id"], "kind": head["kind"],
                     "sender": head["title"], "preview": preview(head["body"], 256),
-                    "body": head["body"]} if head else None}
+                    "body": head["body"], **({"expires_at": head["expires_at"]} if head["kind"] == "calendar" else {})}
+                    if head else None}
 
     def snooze(self, alert_id: object, seconds: object) -> None:
         alert_id = identifier(alert_id)
@@ -208,10 +347,19 @@ class Companion:
             raise ValueError("Invalid snooze interval.")
         with self.lock, self.connect() as db:
             row = db.execute("SELECT kind,reference FROM alerts WHERE id=?", (alert_id,)).fetchone()
-            if row is None or row["kind"] != "reminder":
-                raise ValueError("Only gadget reminders can be snoozed.")
-            db.execute("UPDATE reminders SET due=?,state='pending' WHERE id=?",
-                       (time.time() + seconds, row["reference"]))
+            if row is None or row["kind"] not in ("reminder", "calendar"):
+                raise ValueError("Only gadget or calendar reminders can be snoozed.")
+            now = time.time()
+            if row["kind"] == "calendar":
+                event = db.execute("SELECT start FROM calendar_events WHERE key=?", (row["reference"],)).fetchone()
+                if event is None or now + seconds >= event["start"]:
+                    raise ValueError("The event starts before this snooze would end.")
+                db.execute("UPDATE calendar_events SET due=?,state='snoozed' WHERE key=?",
+                           (now + seconds, row["reference"]))
+                db.execute("INSERT OR IGNORE INTO alert_receipts VALUES (?)", (alert_id,))
+            else:
+                db.execute("UPDATE reminders SET due=?,state='pending' WHERE id=?",
+                           (now + seconds, row["reference"]))
             db.execute("DELETE FROM alerts WHERE id=?", (alert_id,))
             db.execute("UPDATE metadata SET value=? WHERE key='last_ack'", (json.dumps(alert_id),))
 
@@ -379,7 +527,8 @@ class Companion:
             {"id": c["id"], "name": preview(c["name"], 96),
              "enabled": c["id"] in settings["calendar_ids"]} for c in self.calendars],
             "reminders": reminders[:12], "reminder_count": len(reminders),
-            "briefing": self.get("briefing"), "draft": draft}
+            "briefing": self.get("briefing"), "draft": draft,
+            "calendar_alerts": self.calendar_alert_status(settings)}
 
     def prepare_reply(self, inbox, notification: object, text: object) -> dict:
         identifier(notification)
@@ -528,7 +677,16 @@ class Companion:
         while not self.stop.is_set():
             try:
                 self.fire_due(time.time())
+                self.fire_calendar_alerts(time.time())
                 settings = self.get("settings")
+                calendar = self.get("calendar_alerts")
+                if settings["calendar_alerts_enabled"] and settings["calendars_enabled"] and (
+                        calendar.get("selection") != settings["calendar_ids"] or
+                        time.time() - calendar.get("checked_at", 0) >= 120) and (
+                        not self.calendar_thread or not self.calendar_thread.is_alive()):
+                    self.calendar_thread = threading.Thread(target=self.refresh_calendar_alerts,
+                                                            name="gadget-calendar", daemon=True)
+                    self.calendar_thread.start()
                 cached_weather = self.get("weather")
                 weather_due = settings["weather"] and (
                     cached_weather.get("location") != settings["weather"] or
@@ -550,7 +708,7 @@ class Companion:
 
     def close(self) -> None:
         self.stop.set()
-        for thread in (self.thread, self.brief_thread, self.reply_thread, self.weather_thread):
+        for thread in (self.thread, self.brief_thread, self.reply_thread, self.weather_thread, self.calendar_thread):
             if thread:
                 thread.join(timeout=30)
                 if thread.is_alive():

@@ -30,7 +30,7 @@ CHAT_PATH = "/v1/chat/completions"
 NOTIFICATION_PATH = "/v1/notifications"
 JOB_PATHS = ("/v1/jobs/start", "/v1/jobs/status", "/v1/jobs/cancel")
 COMPANION_PATH = "/v1/companion"
-JSON_CAP = 16384
+JSON_CAP = 32768
 TEXT_CAP = 2048
 
 
@@ -170,6 +170,7 @@ class BridgeServer(ThreadingHTTPServer):
                 self.companion.put("endpoint", f"https://{host}:{self.server_address[1]}{COMPANION_PATH}")
                 self.jobs = JobManager(
                     state, GatewayRPC(config_path, self.verify_jobs), self.chat_lock,
+                    durable_conversation=True,
                     notify=lambda job_id, status, text: self.companion.alert(
                         "job", "Task completed" if status == "completed" else "Task needs attention",
                         text, job_id))
@@ -317,8 +318,28 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     if set(body) != {"action", "id"} or server.jobs is None:
                         raise ValueError("Invalid job cancellation request.")
                     result = {"last_job": server.jobs.cancel(body["id"])}
+                elif isinstance(body, dict) and body.get("action") in (
+                        "memory_add", "memory_forget", "memory_list", "conversation_reset"):
+                    if server.jobs is None:
+                        raise RuntimeError("Personal companion features are not enabled.")
+                    action = body["action"]
+                    if action == "memory_add" and set(body) == {"action", "text"}:
+                        result = server.jobs.memory_add(body["text"])
+                    elif action == "memory_forget" and set(body) == {"action", "id"}:
+                        result = server.jobs.memory_forget(body["id"])
+                    elif action == "memory_list" and set(body) == {"action", "offset"}:
+                        result = server.jobs.memory_page(body["offset"])
+                    elif action == "conversation_reset" and set(body) == {"action"}:
+                        result = server.jobs.reset_conversation()
+                    else:
+                        expected = {"memory_add": "action,text", "memory_forget": "action,id",
+                                    "memory_list": "action,offset", "conversation_reset": "action"}[action]
+                        self.reject(400, "Invalid personal companion request fields. Expected: " + expected)
+                        return
                 else:
                     result = server.companion.handle(body, server.inbox)
+                if server.jobs is not None:
+                    result.update(server.jobs.personal_status())
                 if isinstance(body, dict) and body.get("action") == "status":
                     result.update({"connectivity": server.connectivity,
                                    "served_at": time.time(),
