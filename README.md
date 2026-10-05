@@ -684,6 +684,9 @@ for privacy permissions, queue behavior, and sending limitations.
 This is a separate opt-in that exposes existing signed-in sites and tabs.
 It requires Chrome 144+, the pinned Chrome tools, explicit browser-wide
 remote-debugging consent, and the dedicated normal-Chrome skill.
+The local structured Chrome plugin passes browser actions directly to the
+helper without shell quoting; enable its `normal_chrome` tool only for the
+dedicated `esp32` agent.
 
 Install and configure it using the
 [normal-Chrome guide](esp32/README.md#optional-normal-signed-in-chrome-macos-chrome-144).

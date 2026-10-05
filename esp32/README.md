@@ -439,18 +439,31 @@ or disable Chrome's permission checks.
    The official CLI interface is experimental and pinned to version 1.10.1.
    Upgrades require checking CLI/daemon-client syntax and output and rerunning
    the adapter tests.
-2. Copy `tools/muse/normal-chrome-skill/SKILL.md` into the **ESP32 agent's**
-   workspace at `skills/normal-chrome/SKILL.md`. Add an agent instruction to
-   require `python3 "$HOME/.openclaw/muse-esp32/normal_chrome.py"` with JSON
-   parameters for every browser action and to read the skill for actual
-   command names, such as `new_page` and `evaluate_script`, rather than
-   executing placeholders like `TOOL`. Instruct it not to substitute
-   AppleScript, `osascript`, `open`, or direct Chrome launch commands if the
-   helper fails. These are model instructions, not permission boundaries
-   under unrestricted exec access. Add `"browser"` to **only that agent's**
-   existing `tools.deny` list, preserving other denied tools, to prevent native
-   isolated-profile fallback. Keep its full/exec tool access and the main
-   agent's/global browser settings unchanged. Restart the gateway.
+2. Install the local structured Chrome plugin:
+
+   ```sh
+   openclaw plugins install ./tools/muse/chrome-plugin
+   ```
+
+   Copy `tools/muse/normal-chrome-skill/SKILL.md` into the **ESP32 agent's**
+   workspace at `skills/normal-chrome/SKILL.md`. Add `normal_chrome` to
+   **only that agent's** `tools.alsoAllow`, preserving existing entries.
+   Keep `"browser"` in its `tools.deny` list to prevent isolated-profile
+   fallback, alongside its other intentional denials. Keep its full tool
+   profile and the main agent's/global browser settings unchanged.
+   Instruct the agent to use the structured `normal_chrome` tool, not browser
+   shell commands. Restart the gateway.
+
+   The optional plugin is restricted to the `esp32` agent with computer
+   control enabled and the tool explicitly allowed. It sends parameters to
+   the existing helper over stdin without a shell, avoiding nested
+   JavaScript/JSON quoting failures. It requires real snapshot IDs before
+   typing/clicking and blocks submission after a failed fill until typing
+   succeeds. Its gadget-only hooks redirect legacy browser exec calls to
+   the structured tool; other agents and unrelated shell tasks are unchanged.
+   This does not add new account permissions or bypass Chrome consent.
+   As with all full-exec configurations, these tool rules are not an OS-level
+   security sandbox.
 3. In your ordinary signed-in Chrome, enable
    `chrome://inspect/#remote-debugging`. Keep Chrome open and click **Allow**
    when Chrome requests the browser-wide connection. Chrome may require fresh
@@ -472,8 +485,25 @@ calls reuse the connection. Opening a tab exposes only the new tab's
 metadata to the agent; closing a tab does not disclose the newly selected
 unrelated tab. New tabs open in the foreground. Explicitly listing tabs
 returns their titles/URLs, so do not request or log unrelated browser data.
-Tool parameters are supplied as a JSON object, not the native CLI's positional
-arguments. Actions use the pinned package's existing-daemon client directly,
+The agent calls `normal_chrome` with `command` and named parameters, such as
+`{"command":"fill","pageId":1,"uid":"ACTUAL_SNAPSHOT_UID","value":"search text"}`.
+Use actual returned IDs, not example values.
+For manual diagnostics, helper parameters are supplied as a JSON object,
+not the native CLI's positional arguments. For text or scripts containing quotes, use the helper's shell-safe
+stdin format instead of wrapping JSON in shell single quotes:
+
+```sh
+python3 "$HOME/.openclaw/muse-esp32/normal_chrome.py" fill - <<'MUSE_CHROME_JSON'
+{"pageId":1,"uid":"ACTUAL_SNAPSHOT_UID","value":"The requested search text"}
+MUSE_CHROME_JSON
+```
+
+Replace the example page ID and UID with values returned by the current
+page snapshot. The quoted heredoc delimiter prevents shell expansion; valid
+JSON escaping is still required. The original single-JSON-argument interface
+remains supported. Prefer snapshot-based `fill`, `click`, and `press_key` for
+searching, and take a fresh snapshot to verify results.
+Actions use the pinned package's existing-daemon client directly,
 so losing the daemon cannot trigger the CLI's default isolated-browser launch.
 
 Test with `python3 tools/muse/normal_chrome.py status`. A running daemon
@@ -481,9 +511,12 @@ does not by itself prove Chrome consent or connectivity: also perform a safe
 blank-tab action. `python3 tools/muse/normal_chrome.py stop` disconnects the
 adapter without closing normal Chrome. To revoke access, disable remote
 debugging in Chrome and stop the adapter. Restore the ESP32 agent's former
-browser policy and clear the firmware opt-in if returning to the isolated
+browser policy, remove its `normal_chrome` opt-in, and disable the plugin with
+`openclaw plugins disable muse-normal-chrome` followed by a gateway restart.
+Clear the firmware opt-in if returning to the isolated
 setup. Host coverage: `python3 -m unittest tests/test_normal_chrome.py
-tests/test_muse_openai.py`.
+tests/test_muse_openai.py`; structured-tool coverage:
+`npm --prefix tools/muse/chrome-plugin test`.
 
 #### Optional iMessage sending and incoming previews (macOS)
 

@@ -138,6 +138,15 @@ try {
     return response
 
 
+def json_input_help(command: str) -> str:
+    return ("Use one JSON object, not positional arguments or flags. For shell-safe input:\n"
+            f'python3 "$HOME/.openclaw/muse-esp32/normal_chrome.py" {command} - <<\'MUSE_CHROME_JSON\'\n'
+            '{"pageId":1}\n'
+            "MUSE_CHROME_JSON\n"
+            "Replace the example object with this tool's parameters and actual returned IDs. "
+            "Keep the delimiter quoted and on its own final line; do not shell-quote the JSON.")
+
+
 def execute(command: str, arguments: list[str]) -> str:
     if not re.fullmatch(r"[a-z][a-z0-9_]*", command):
         raise ChromeError("Invalid Chrome tool name. Use real commands such as new_page, "
@@ -145,7 +154,10 @@ def execute(command: str, arguments: list[str]) -> str:
                           "close_page, or list_pages. Read the normal-chrome skill for "
                           "their JSON parameters; TOOL and OPEN_TAB are not commands.")
     if arguments == ["--help"]:
-        return invoke([command, "--help"], timeout=10)
+        native_help = invoke([command, "--help"], timeout=10)
+        return (json_input_help(command) +
+                "\n\nUnderlying CLI schema (translate its positional parameters into JSON keys):\n" +
+                native_help)
     if command == "stop":
         if arguments:
             raise ChromeError("stop takes no arguments.")
@@ -159,11 +171,21 @@ def execute(command: str, arguments: list[str]) -> str:
     if command == "start":
         raise ChromeError("No explicit start is needed; tools connect to normal Chrome automatically.")
     if len(arguments) > 1:
-        raise ChromeError("Pass tool parameters as one JSON object, not positional arguments or flags.")
+        raise ChromeError("No browser action ran: the shell split the tool parameters into "
+                          f"{len(arguments)} arguments. " + json_input_help(command))
+    if arguments == ["-"]:
+        if sys.stdin.isatty():
+            raise ChromeError("JSON stdin input requires a pipe or quoted heredoc. " + json_input_help(command))
+        raw = sys.stdin.read(65537)
+        if len(raw) > 65536:
+            raise ChromeError("JSON stdin input exceeds 65536 characters; no browser action ran.")
+    else:
+        raw = arguments[0] if arguments else "{}"
     try:
-        parameters = json.loads(arguments[0]) if arguments else {}
+        parameters = json.loads(raw)
     except ValueError as error:
-        raise ChromeError("Tool parameters must be a JSON object.") from error
+        raise ChromeError("Tool parameters must be a valid JSON object; no browser action ran. " +
+                          json_input_help(command)) from error
     if not isinstance(parameters, dict):
         raise ChromeError("Tool parameters must be a JSON object.")
     if any(key in RESERVED for key in parameters):
@@ -175,7 +197,7 @@ def execute(command: str, arguments: list[str]) -> str:
     if result.get("isError"):
         hint = (" evaluate_script.function must be a callable JavaScript function, "
                 "such as () => document.title, not a bare assignment. Read the "
-                "normal-chrome skill for JSON-escaped string examples."
+                "normal-chrome skill and use quoted-heredoc JSON input."
                 if command == "evaluate_script" else "")
         raise ChromeError("Chrome tool failed: " + json.dumps(result.get("content", [])) + hint)
     structured = result.get("structuredContent")
@@ -207,7 +229,8 @@ def execute(command: str, arguments: list[str]) -> str:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", help="Chrome tool, status, or stop")
-    parser.add_argument("arguments", nargs=argparse.REMAINDER, help="one JSON parameter object, or --help")
+    parser.add_argument("arguments", nargs=argparse.REMAINDER,
+                        help="one JSON parameter object, '-' to read JSON from stdin, or --help")
     args = parser.parse_args()
     try:
         print(execute(args.command, args.arguments))

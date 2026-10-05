@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -122,10 +124,51 @@ class NormalChromeTest(unittest.TestCase):
     def test_help_and_stop_do_not_require_or_start_a_browser(self) -> None:
         self.discovery.unlink()
         with patch.object(chrome, "invoke", return_value="Usage") as invoke:
-            self.assertEqual(chrome.execute("click", ["--help"]), "Usage")
+            help_text = chrome.execute("click", ["--help"])
+            self.assertIn("click - <<'MUSE_CHROME_JSON'", help_text)
+            self.assertIn("not positional arguments", help_text)
+            self.assertIn("Usage", help_text)
             self.assertEqual(chrome.execute("stop", []), "Usage")
         self.assertEqual(invoke.call_args_list[0].args[0], ["click", "--help"])
         self.assertEqual(invoke.call_args_list[1].args[0], ["stop"])
+
+    def test_stdin_preserves_script_quotes_without_shell_interpretation(self) -> None:
+        parameters = {"pageId": 2, "function": "() => document.querySelector('input').value"}
+        with patch.object(chrome.sys, "stdin", io.StringIO(json.dumps(parameters))), \
+                patch.object(chrome, "invoke", return_value=running()), \
+                patch.object(chrome, "submit_tool", return_value={
+                    "structuredContent": {"result": "test"}}) as submit:
+            chrome.execute("evaluate_script", ["-"])
+        submit.assert_called_once_with("evaluate_script", parameters)
+
+    def test_stdin_preserves_search_text_and_existing_privacy_guards(self) -> None:
+        parameters = {"pageId": 2, "uid": "1_3", "value": "O'Brien \"test\" $HOME $(not-a-command)"}
+        with patch.object(chrome.sys, "stdin", io.StringIO(json.dumps(parameters))), \
+                patch.object(chrome, "invoke", return_value=running()), \
+                patch.object(chrome, "submit_tool", return_value={
+                    "structuredContent": {}}) as submit:
+            chrome.execute("fill", ["-"])
+        submit.assert_called_once_with("fill", parameters)
+        for data in ("", "not JSON", "[]", '{"browserUrl":"http://other"}',
+                     '{"background":true}', " " * 65537):
+            with patch.object(chrome.sys, "stdin", io.StringIO(data)), \
+                    patch.object(chrome, "invoke") as invoke, \
+                    patch.object(chrome, "submit_tool") as submit:
+                with self.assertRaises(chrome.ChromeError):
+                    chrome.execute("new_page", ["-"])
+                invoke.assert_not_called()
+                submit.assert_not_called()
+
+    def test_shell_split_json_has_stdin_recovery_guidance_without_execution(self) -> None:
+        arguments = shlex.split(
+            """'{"pageId":2,"function":"() => document.querySelector('input').value = 'test text'"}'""")
+        self.assertGreater(len(arguments), 1)
+        with patch.object(chrome, "invoke") as invoke, \
+                patch.object(chrome, "submit_tool") as submit:
+            with self.assertRaisesRegex(chrome.ChromeError, "MUSE_CHROME_JSON"):
+                chrome.execute("evaluate_script", arguments)
+            invoke.assert_not_called()
+            submit.assert_not_called()
 
     def test_placeholder_tool_names_explain_real_commands_without_execution(self) -> None:
         for command in ("TOOL", "OPEN_TAB", "New_Page"):
