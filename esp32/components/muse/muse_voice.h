@@ -37,6 +37,7 @@ float muse_voice_monitor_db(void);
 
 /* Plays a short chirp at the current volume (when idle). */
 void muse_voice_request_chirp(void);
+void muse_voice_request_copilot_chirp(bool failed);
 
 bool muse_voice_copilot_dictate(const char *id);
 bool muse_voice_copilot_dictating(void);

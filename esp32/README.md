@@ -291,8 +291,16 @@ Do not expose either service to the internet or enable router port forwarding.
 
    The default bind is loopback, which is useful for local tests but is not
    reachable from the ESP32. Allow the bridge port (8765) through your local
-   firewall only on trusted networks. Reserve the computer's LAN address
-   in your router, or update the bridge bind and board URL when it changes.
+   firewall only on trusted networks. For DHCP recovery on macOS, use
+   `serve --bind 0.0.0.0 --bonjour` instead. Provision the board URL with
+   `https://$(scutil --get LocalHostName).local:8765/v1/chat/completions`
+   and keep the other service flags unchanged. Bonjour mode accepts only
+   loopback/RFC1918 IPv4 clients; the helper rejects non-private DNS results.
+   Certificate verification still uses `muse-openclaw.local`, with the same
+   embedded CA and credentials. It never falls back to HTTP or insecure TLS.
+   The Mac and gadget must share a network that permits Bonjour/mDNS.
+   Without Bonjour, reserve the computer's LAN address in your router or
+   update the bridge bind and board URL when it changes.
 5. With the existing OpenAI key and Wi-Fi saved on the board, provision
    the separate bridge token privately over USB:
 
@@ -590,7 +598,8 @@ daemon liveness alone is not treated as browser connectivity.
 Open **Settings > Companion** for configurable favourite cards, timer
 controls, gadget reminders, reply review, connectivity, and briefing settings.
 Companion opens a compact menu grouped into **Personal AI**, **Daily tools**,
-and **Device**. Conversation, Personal memory, Timers, Reminders, Daily briefing,
+and **Device**. Conversation, Personal memory, Copilot tasks, Tasks, Personal
+routines, Timers, Reminders, Daily briefing,
 Calendars & alerts, Replies, Favourite cards, and Connection & costs each have
 their own page. Back (or swipe right) returns to the Companion menu, then Settings.
 Each section retains its scroll position while Companion stays open, including
@@ -694,6 +703,12 @@ IDs and invalid responses fail closed; old approvals are never resumed.
 "Approval submitted" confirms transport, not completion of the coding work.
 Cancelling a voice turn cannot revoke a decision already delivered; stop the
 Copilot session if you need to interrupt work that has already been approved.
+The controller automatically retries connectivity with a fresh lease and a
+fresh SDK session. Previous work is interrupted, not resumed; old SDK events
+and authorization callbacks cannot answer or complete a new session's task.
+SDK shutdown is bounded to twenty seconds. If graceful shutdown fails, the
+controller reports the failure, force-stops its own SDK transport, and exits
+nonzero. This cannot undo previously approved operations; review them on the Mac.
 A separate private desktop producer credential prevents the device token from
 creating work requests. Both use the existing verified local HTTPS channel.
 Private `copilot.sqlite` stores request previews and responses; terminal records
@@ -705,6 +720,50 @@ an agent that already has full access to your Mac.
 Controller validation: `npm --prefix esp32/tools/muse/copilot test`. Application
 TypeScript is strict; transitive SDK declaration checking is skipped for the
 SDK's older JSON-RPC iterator declarations with current TypeScript/Node types.
+
+### Copilot task dashboard and connection health
+
+**Settings > Companion > Copilot tasks** shows six recent dedicated-session
+tasks: project, reviewed title, working/waiting/stopping state, tool progress,
+and the final reply. The Home briefing card temporarily shows an active or
+recent task and opens this dashboard. Completion and failure use distinct
+chimes; result cards are never voice-approval targets.
+
+**Stop this task** is bound to that exact task and owning SDK session. It
+cancels waiting authorizations immediately and queues an SDK abort for the
+next desktop heartbeat. `stopping` is not proof of an acknowledged abort;
+disconnects are shown as interrupted. Finished means the SDK turn ended,
+not that every requested edit, build or test succeeded. Review the result
+and terminal. Results remain available for seven days; result notifications
+are visible for ten minutes and can be dismissed independently.
+
+Home and Connection & costs distinguish bridge HTTPS contact/authentication
+from OpenAI speech failures. When the Mac sleeps or the network is lost,
+the gadget continues local timers; Mac tasks, saves and routines require
+the bridge. Wake/reconnect does not replay work or approvals.
+
+### Personal routines and local priorities
+
+**Settings > Companion > Personal routines** enables morning/evening summaries,
+edits their HH:MM schedules, and builds either summary on demand. New
+installations default to disabled, with 08:00 and 20:00 Mac-local schedules.
+Scheduled routines run once per local day, catch up only within one hour,
+and respect the existing calendar quiet hours (default 22:00–08:00).
+Routine/calendar alerts are held during quiet hours; explicit reminders
+remain deliverable and dismissible. The Mac must be awake and running the
+bridge; this is not a wake-from-sleep scheduler.
+
+**Tasks** provides reviewed local priorities, complete/reopen, pagination,
+and double-tap deletion. Up to 100 open/200 total tasks persist on the Mac.
+Morning summaries include open priorities; evening summaries include unfinished
+priorities, reminders through tomorrow, and tomorrow's selected-calendar
+agenda. Calendar/weather failures remain explicit, including partial digests.
+These deterministic summaries and task controls do not invoke an AI model.
+
+Meeting preparation lets you edit a note for one upcoming selected-calendar
+occurrence. With existing calendar heads-ups enabled, the note is added to
+that event's alert and expires at event start. It is not shared with later
+occurrences or used to take actions automatically.
 
 ### Personal memory and durable conversations
 
@@ -730,6 +789,20 @@ reintroducing it. These actions do **not** erase historical job records,
 OpenClaw/provider transcripts or backups. Memory/context controls require the
 reachable Mac and report success only after confirmation. Standalone OpenAI
 builds retain their existing RAM-only conversation behavior.
+
+After a completed OpenClaw turn, **Save...** opens Conversation with its
+reviewable source. Choose **Remember this preference**, **Make a reminder**,
+or **Save as a task**, edit the suggested user-request text, and explicitly
+confirm. Reminder saves also require an interval. There is no automatic
+learning or automatic execution. The source must still belong to the current
+completed conversation; stale/reset sources are rejected.
+
+Save retries are idempotent. The target and its receipt commit atomically
+across the private SQLite stores. **Undo last save** removes only the exact
+newly-created item; a deduplicated, pre-existing memory cannot be deleted by
+Undo. Undoing a new memory also starts a fresh conversation, just like Forget.
+It does not erase provider transcripts or backups. These controls use the
+authenticated local bridge and do not need speech/model API calls.
 
 ### Proactive calendar alerts
 

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Controller } from "../dist/controller.js";
+import { Controller, boundedText } from "../dist/controller.js";
 
-function fixture(result = { kind: "approve-once" }, customize) {
+function fixture(result = { kind: "approve-once" }, customize, events) {
     const records = [], logs = [], notices = [];
     let controller;
     const transport = async (body) => {
@@ -14,9 +14,106 @@ function fixture(result = { kind: "approve-once" }, customize) {
         if (body.action === "take") return { id: body.id, state: "answered", result };
         return {};
     };
-    controller = new Controller(transport, "/safe/project", (value) => notices.push(value), (value) => logs.push(value), 1);
+    controller = new Controller(transport, "/safe/project", (value) => notices.push(value), (value) => logs.push(value), 1, events);
     return { controller, records, logs, notices };
 }
+
+test("recovery uses a fresh lease and closed controllers cannot reopen", async () => {
+    let offline = false, disconnected = 0, reconnected = 0;
+    const f = fixture(undefined, (body) => {
+        if (offline && body.action === "heartbeat") throw new Error("Bridge restarted");
+    }, { disconnected: async () => { disconnected++; }, stop: async () => {},
+        reconnected: async () => { reconnected++; } });
+    await f.controller.start();
+    const old = f.controller.id;
+    offline = true;
+    await f.controller.checkConnection();
+    assert.equal(disconnected, 1);
+    assert.throws(() => f.controller.resume(), /disconnected/);
+    offline = false;
+    await f.controller.checkConnection();
+    assert.notEqual(f.controller.id, old);
+    assert.equal(reconnected, 1);
+    f.controller.resume();
+    await f.controller.close();
+    const count = f.records.length;
+    await f.controller.checkConnection();
+    assert.equal(f.records.length, count);
+    await assert.rejects(f.controller.start(), /closed/);
+});
+
+test("an old authorization cannot cross a reconnect, including cleanup ownership", async () => {
+    let failHeartbeat = false, once = true;
+    const f = fixture(undefined, async (body, controller) => {
+        if (body.action === "heartbeat" && failHeartbeat) throw new Error("Lost lease");
+        if (body.action === "take" && once) {
+            once = false;
+            failHeartbeat = true;
+            await controller.checkConnection();
+            failHeartbeat = false;
+            await controller.checkConnection();
+        }
+    });
+    await f.controller.start();
+    const old = f.controller.id;
+    try {
+        assert.equal((await f.controller.permission({ kind: "shell" }, "old-session")).kind, "reject");
+        assert.notEqual(f.controller.id, old);
+        assert.ok(f.records.filter((body) => ["take", "cancel"].includes(body.action))
+            .every((body) => body.controller === old));
+        assert.equal((await f.controller.permission({ kind: "shell" }, "fresh-session")).kind, "approve-once");
+    } finally { await f.controller.close(); }
+});
+
+test("task stop commands preserve exact IDs; malformed commands disconnect", async () => {
+    const stopped = [];
+    let commands = ["a".repeat(32), "b".repeat(32)], disconnected = 0;
+    const f = fixture(undefined, (body) => body.action === "heartbeat" ? { stop_tasks: commands } : undefined,
+        { disconnected: async () => { disconnected++; }, stop: async (id) => { stopped.push(id); } });
+    await f.controller.start();
+    try {
+        await f.controller.checkConnection();
+        assert.deepEqual(stopped, commands);
+        commands = ["wrong"];
+        await f.controller.checkConnection();
+        assert.equal(disconnected, 1);
+        assert.equal(stopped.length, 2);
+    } finally { await f.controller.close(); }
+});
+
+test("task registration and progress require exact acknowledgment and UTF-8 bounds", async () => {
+    let wrong = false;
+    const f = fixture(undefined, (body) => {
+        if (body.action === "task_begin") return { id: body.id, status: "working" };
+        if (body.action === "task_update") return { id: wrong ? "bad" : body.id, status: "stopping" };
+    });
+    await f.controller.start();
+    try {
+        const id = await f.controller.beginTask("session", "\u{1f680}".repeat(500));
+        await f.controller.updateTask(id, "working", "\u{1f680}".repeat(1000));
+        for (const body of f.records) {
+            if (body.title) assert.ok(Buffer.byteLength(body.title) <= 240 && !body.title.includes("\ufffd"));
+            if (body.summary) assert.ok(Buffer.byteLength(body.summary) <= 2047 && !body.summary.includes("\ufffd"));
+        }
+        wrong = true;
+        await assert.rejects(f.controller.updateTask(id, "completed", "Done"), /acknowledged/);
+        assert.equal(boundedText("test\u0000\u202e\nok", 20), "test  \nok");
+    } finally { await f.controller.close(); }
+});
+
+test("closing during SDK recovery never restores an accepting controller", async () => {
+    let fail = true;
+    const f = fixture(undefined, (body) => {
+        if (body.action === "heartbeat" && fail) throw new Error("Offline");
+    }, { disconnected: async () => {}, stop: async () => {},
+        reconnected: async () => { await f.controller.close(); } });
+    await f.controller.start();
+    await f.controller.checkConnection();
+    fail = false;
+    await f.controller.checkConnection();
+    assert.throws(() => f.controller.resume(), /disconnected/);
+    assert.equal(f.records.at(-1).action, "close");
+});
 
 test("permission callback returns only SDK approve-once, with complete scope", async () => {
     const f = fixture();

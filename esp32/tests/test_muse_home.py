@@ -36,6 +36,7 @@ static void muse_settings_ui_open_companion(const char *text){
     destination=1;snprintf(detail_text,sizeof(detail_text),"%s",text);
 }
 static void muse_settings_ui_open_companion_reminders(void){destination=2;}
+static void muse_settings_ui_open_copilot(void){destination=4;}
 static void muse_settings_ui_open_companion_briefing(const char *text){
     destination=3;snprintf(detail_text,sizeof(detail_text),"%s",text);
 }
@@ -51,6 +52,12 @@ int main(void){
     s_home_data=cJSON_Parse("{\"briefing\":{\"state\":\"ready\",\"body\":\"Test daily digest\"}}");
     home_detail(&event);
     assert(destination==3 && !strcmp(detail_text,"Test daily digest") && build_requests==1);
+    cJSON_Delete(s_home_data);
+    s_home_data=cJSON_Parse("{\"copilot\":{\"state\":\"connected\",\"tasks\":["
+        "{\"project\":\"fixture\",\"status\":\"working\",\"summary\":\"Running tests\"}]}}");
+    home_detail(&event);assert(destination==4 && build_requests==1);
+    muse_home_view_t view;muse_home_format(&view,s_home_data,time(NULL),0,true);
+    assert(view.task_visible && strstr(view.copilot,"fixture / working") && strstr(view.copilot,"Running tests"));
     cJSON_Delete(s_home_data);
     return 0;
 }

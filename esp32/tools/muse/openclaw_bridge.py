@@ -7,6 +7,7 @@ import argparse
 import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import ipaddress
 import logging
 import os
 from pathlib import Path
@@ -143,7 +144,7 @@ class BridgeServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], state: Path, config_path: Path, *,
                  allow_computer_control: bool = False, imessages: bool = False,
-                 companion: bool = False) -> None:
+                 companion: bool = False, bonjour: bool = False) -> None:
         gateway_credentials(config_path, allow_computer_control=allow_computer_control)
         token = read_object(state / "bridge.json").get("device_token")
         if not isinstance(token, str) or len(token) < 32 or not token.isascii():
@@ -160,6 +161,18 @@ class BridgeServer(ThreadingHTTPServer):
         self.monitor_stop = threading.Event()
         self.monitor_thread = None
         self.connectivity = {"gateway": "Not checked", "browser": "Not checked", "checked_at": None}
+        self.private_clients = bonjour
+        endpoint_host = address[0]
+        if bonjour:
+            if address[0] != "0.0.0.0":
+                raise ValueError("Bonjour recovery requires --bind 0.0.0.0; only private clients are accepted.")
+            result = subprocess.run(["/usr/sbin/scutil", "--get", "LocalHostName"], capture_output=True,
+                                    text=True, timeout=5, check=True)
+            hostname = result.stdout.strip()
+            if not hostname or len(hostname) > 63 or any(c not in
+                    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" for c in hostname):
+                raise ValueError("Invalid Mac Bonjour hostname.")
+            endpoint_host = hostname + ".local"
         if companion:
             self.verify_jobs()
         self.tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -170,7 +183,7 @@ class BridgeServer(ThreadingHTTPServer):
             try:
                 self.companion = Companion(state)
                 self.copilot = CopilotRequests(state)
-                host = f"[{address[0]}]" if ":" in address[0] else address[0]
+                host = f"[{endpoint_host}]" if ":" in endpoint_host else endpoint_host
                 self.companion.put("endpoint", f"https://{host}:{self.server_address[1]}{COMPANION_PATH}")
                 self.jobs = JobManager(
                     state, GatewayRPC(config_path, self.verify_jobs), self.chat_lock,
@@ -193,6 +206,15 @@ class BridgeServer(ThreadingHTTPServer):
                 raise
         if self.inbox is not None:
             self.inbox.start()
+
+    def verify_request(self, request, client_address) -> bool:
+        if self.private_clients:
+            address = ipaddress.ip_address(client_address[0])
+            if not (address.is_loopback or any(address in ipaddress.ip_network(network)
+                    for network in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))):
+                logging.warning("Rejected a non-private bridge client.")
+                return False
+        return super().verify_request(request, client_address)
 
     def verify_jobs(self) -> tuple[int, str]:
         credentials = gateway_credentials(
@@ -261,6 +283,9 @@ class BridgeServer(ThreadingHTTPServer):
 
     def get_request(self) -> tuple[ssl.SSLSocket, tuple[str, int]]:
         connection, address = super().get_request()
+        if self.private_clients and not self.verify_request(connection, address):
+            connection.close()
+            raise ConnectionAbortedError("Non-private bridge client rejected.")
         connection.settimeout(15)
         try:
             return self.tls.wrap_socket(connection, server_side=True), address
@@ -336,6 +361,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     if server.copilot is None:
                         raise RuntimeError("Copilot companion is not enabled.")
                     result = server.copilot.device(body)
+                elif isinstance(body, dict) and body.get("action") == "copilot_stop":
+                    if server.copilot is None or set(body) != {"action", "id"}:
+                        raise ValueError("Expected the exact Copilot task to stop.")
+                    result = server.copilot.stop_task(body["id"])
+                elif isinstance(body, dict) and body.get("action") in ("save_shortcut", "undo_save"):
+                    if server.jobs is None:
+                        raise RuntimeError("Personal conversation is not enabled.")
+                    if body["action"] == "save_shortcut":
+                        result = server.companion.save_shortcut(body, server.jobs)
+                    elif set(body) == {"action", "id"}:
+                        result = server.companion.undo_save(body["id"], server.jobs)
+                    else:
+                        raise ValueError("Undo requires the exact saved action.")
                 elif isinstance(body, dict) and body.get("action") == "job_cancel":
                     if set(body) != {"action", "id"} or server.jobs is None:
                         raise ValueError("Invalid job cancellation request.")
@@ -367,6 +405,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                    "served_at": time.time(),
                                    "last_job": server.jobs.latest() if server.jobs else None,
                                    "usage": server.jobs.costs() if server.jobs else None})
+                    result["copilot"] = server.copilot.status() if server.copilot else {"state": "disabled", "tasks": []}
                 self.send_json(200, json.dumps(result, ensure_ascii=False).encode())
                 return
             if self.path in JOB_PATHS:
@@ -419,8 +458,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 return
             messages = validate_messages(body)
         except (ValueError, UnicodeError) as error:
-            if controller or (isinstance(body, dict) and body.get("action") in ("copilot_voice", "copilot_choice")):
-                logging.warning("Invalid or stale Copilot request: %s", error)
+            if controller or (isinstance(body, dict) and body.get("action") in (
+                    "copilot_voice", "copilot_choice", "copilot_stop", "save_shortcut", "undo_save",
+                    "task_add", "task_done", "task_reopen", "task_delete", "meeting_note")):
+                logging.warning("Invalid or stale companion/Copilot request: %s", error)
                 self.reject(400, str(error))
                 return
             self.reject(400, "Invalid bridge request.")
@@ -492,6 +533,8 @@ def main() -> int:
     parser.add_argument("--state", type=Path, default=STATE)
     parser.add_argument("--openclaw-config", type=Path, default=GATEWAY_CONFIG)
     parser.add_argument("--bind", default="127.0.0.1", help="LAN IP for device access; default loopback")
+    parser.add_argument("--bonjour", action="store_true",
+                        help="Mac .local endpoint and private-client-only DHCP recovery; requires --bind 0.0.0.0")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--allow-computer-control", action="store_true",
                         help="explicitly permit the ESP32 agent's full computer-control tool profile")
@@ -507,7 +550,7 @@ def main() -> int:
         else:
             with BridgeServer((args.bind, args.port), args.state, args.openclaw_config,
                               allow_computer_control=args.allow_computer_control,
-                              imessages=args.imessages, companion=args.companion) as server:
+                              imessages=args.imessages, companion=args.companion, bonjour=args.bonjour) as server:
                 if args.allow_computer_control:
                     logging.warning("Computer control enabled: device requests can run tools on this computer.")
                 logging.info("Muse HTTPS chat bridge listening on %s:%d", args.bind, args.port)

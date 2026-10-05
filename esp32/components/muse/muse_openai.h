@@ -25,3 +25,4 @@ void muse_openai_notification_dismiss(void);
 void muse_openai_copilot_focus(const char *id);
 bool muse_openai_copilot_record_begin(const char *id);
 bool muse_openai_job_active(void);
+const char *muse_openai_bridge_status(void);

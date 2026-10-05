@@ -66,6 +66,8 @@ static char *s_companion_view;
 static char s_companion_detail[2048],s_companion_shown[2048],s_draft_id[33],s_latest_job[33];
 static char s_calendar_ids[32][257];
 static char s_memory_ids[6][33];
+static char s_undo_save[33],s_copilot_task_ids[6][33],s_task_ids[12][33],s_meeting_keys[6][65];
+static int s_task_offset;
 static char s_forget_memory[33],last_action[64],last_memory[33];
 static int64_t s_forget_memory_us,now_us=1;
 static int s_memory_offset,commands,last_offset;
@@ -120,6 +122,7 @@ static size_t fake_strlcpy(char *out,const char *text,size_t cap){
 static bool muse_wifi_connected(void){return true;}
 static bool muse_settings_speaker_on(void){return true;}
 static bool muse_settings_copilot_watch(void){return true;}
+static const char *muse_openai_bridge_status(void){return "HTTPS reachable";}
 static unsigned muse_settings_openai_key_len(void){return 1;}
 #define CALLBACK(name) static void name(lv_event_t *e){(void)e;}
 CALLBACK(on_quick_action)
@@ -133,6 +136,15 @@ CALLBACK(on_copilot_watch)
 CALLBACK(on_companion_action)
 CALLBACK(on_companion_switch)
 CALLBACK(on_calendar_toggle)
+CALLBACK(on_save_shortcut)
+CALLBACK(on_undo_save)
+CALLBACK(on_stop_copilot)
+CALLBACK(on_task_add)
+CALLBACK(on_task_state)
+CALLBACK(on_task_delete)
+CALLBACK(on_task_page)
+CALLBACK(on_routine_time)
+CALLBACK(on_meeting_note)
 CALLBACK(on_favourite_toggle)
 CALLBACK(on_memory_add)
 CALLBACK(on_calendar_lead)
@@ -179,7 +191,7 @@ int main(void){
     assert(strlen(object.text)==2047 && !strcmp(object.text,long_text));
     companion_note(&object,"short");assert(!strcmp(object.text,"short"));
     s_companion_view="{}";fill_companion();
-    assert(row_count==9 && !strcmp(rows[0],"Conversation") && !strcmp(rows[8],"Connection & costs"));
+    assert(row_count==12 && !strcmp(rows[0],"Conversation") && !strcmp(rows[11],"Connection & costs"));
     assert(s_timer_status==NULL && s_replace_timer==NULL);
     row_count=0;s_companion_section=COMPANION_REPLIES;
     s_companion_view="{\"draft\":{\"id\":\"abc\",\"state\":\"unconfirmed\","
@@ -215,7 +227,7 @@ int main(void){
     assert(!s_forget_memory[0]);
     assert(s_companion_scroll[COMPANION_MEMORY]==37 && fake_scroll==0);
     fake_scroll=99;row_count=0;go_back();
-    assert(row_count==9 && s_timer_status==NULL && s_replace_timer_text==NULL && s_cancel_replace==NULL);
+    assert(row_count==12 && s_timer_status==NULL && s_replace_timer_text==NULL && s_cancel_replace==NULL);
     assert(s_current==s_companion && s_companion_section==COMPANION_MENU);
     fake_scroll_limit=0;
     row_count=0;on_companion_section(&nav);assert(fake_scroll==99);
@@ -228,10 +240,11 @@ int main(void){
         assert(s_companion_section==(companion_section_t)section);
         assert((s_timer_status!=NULL)==(section==COMPANION_TIMERS));
         if(section!=COMPANION_REPLIES)assert(confirmations==0);
-        const int expected_rows[]={9,1,3,6,2,0,2,1,4,1,0};
+        const int expected_rows[]={12,1,3,6,2,0,2,1,4,1,0,1,1,4};
         assert(row_count==expected_rows[section]);
         assert(switch_count==(section==COMPANION_STATUS?1:section==COMPANION_CALENDARS?3:
-                             section==COMPANION_BRIEFING?1:section==COMPANION_FAVOURITES?6:0));
+                             section==COMPANION_BRIEFING?1:section==COMPANION_FAVOURITES?6:
+                             section==COMPANION_ROUTINES?3:0));
         tick_companion();
     }
     assert(mac_refreshes>0);

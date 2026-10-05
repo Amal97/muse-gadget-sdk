@@ -2,7 +2,7 @@
 """Private local reminders, calendar preferences and deterministic briefings."""
 from __future__ import annotations
 
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from datetime import datetime, timedelta
 import json
 import hashlib
@@ -27,7 +27,9 @@ DEFAULTS = {"briefing_enabled": False, "calendars_enabled": False, "calendar_ids
             "hour": 8, "minute": 0, "weather": None,
             "favourites": ["timer_5", "timer_10", "briefing", "dashboard"],
             "calendar_alerts_enabled": False, "calendar_lead_minutes": 30,
-            "quiet_start_hour": 22, "quiet_end_hour": 8}
+            "quiet_start_hour": 22, "quiet_end_hour": 8,
+            "evening_enabled": False, "evening_hour": 20, "evening_minute": 0,
+            "meeting_prep_enabled": False}
 FAVOURITES = ("timer_5", "timer_10", "timer_custom", "reminder", "briefing", "dashboard")
 
 
@@ -42,6 +44,7 @@ class Companion:
         self.reply_thread: threading.Thread | None = None
         self.weather_thread: threading.Thread | None = None
         self.calendar_thread: threading.Thread | None = None
+        self.evening_thread: threading.Thread | None = None
         self.calendar_lock = threading.Lock()
         self.weather_lock = threading.Lock()
         self.calendars: list[dict] = []
@@ -65,10 +68,18 @@ class Companion:
             db.execute("CREATE TABLE IF NOT EXISTS drafts "
                        "(id TEXT PRIMARY KEY,chat_guid TEXT NOT NULL,recipient TEXT NOT NULL,"
                        "text TEXT NOT NULL,state TEXT NOT NULL,detail TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS tasks "
+                       "(id TEXT PRIMARY KEY,title TEXT NOT NULL,state TEXT NOT NULL,created REAL NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS meeting_notes (key TEXT PRIMARY KEY,text TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS saved_items "
+                       "(id TEXT PRIMARY KEY,payload TEXT NOT NULL,kind TEXT NOT NULL,target TEXT NOT NULL,"
+                       "text TEXT NOT NULL,created INTEGER NOT NULL,state TEXT NOT NULL,stamp REAL NOT NULL)")
             db.execute("UPDATE drafts SET state='uncertain',detail=? WHERE state='sending'",
                        ("Bridge restarted during send; check Messages. No automatic retry.",))
-            for key, value in (("settings", DEFAULTS), ("calendars", []), ("last_ack", ""),
+            for key, value in (("settings", DEFAULTS), ("calendars", []), ("last_ack", ""), ("last_delivered", ""),
+                               ("task_offset", 0),
                                ("briefing_date", ""), ("briefing", {"state": "not_requested"}),
+                               ("evening_date", ""), ("evening", {"state": "not_requested"}),
                                ("weather", {"state": "not_configured"}),
                                ("calendar_alerts", {"state": "disabled"})):
                 db.execute("INSERT OR IGNORE INTO metadata VALUES (?,?)", (key, json.dumps(value)))
@@ -77,6 +88,8 @@ class Companion:
         previous = self.get("briefing")
         if previous.get("state") == "building":
             self.put("briefing", {"state": "interrupted", "body": "Briefing interrupted by bridge restart."})
+        if self.get("evening").get("state") == "building":
+            self.put("evening", {"state": "interrupted", "body": "Evening summary interrupted by bridge restart."})
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -137,10 +150,12 @@ class Companion:
             raise ValueError("Unknown companion setting.")
         with self.lock:
             settings = {**self.get("settings"), **changes}
-            for field in ("briefing_enabled", "calendars_enabled", "calendar_alerts_enabled"):
+            for field in ("briefing_enabled", "calendars_enabled", "calendar_alerts_enabled",
+                          "evening_enabled", "meeting_prep_enabled"):
                 if type(settings[field]) is not bool:
                     raise ValueError("Expected a boolean setting.")
             for field, maximum in (("hour", 23), ("minute", 59),
+                                   ("evening_hour", 23), ("evening_minute", 59),
                                    ("quiet_start_hour", 23), ("quiet_end_hour", 23)):
                 if type(settings[field]) is not int or not 0 <= settings[field] <= maximum:
                     raise ValueError("Invalid briefing time.")
@@ -186,6 +201,8 @@ class Companion:
     @staticmethod
     def expire_calendar_alerts(db: sqlite3.Connection, now: float,
                                valid: set[str] | None = None) -> None:
+        db.execute("DELETE FROM meeting_notes WHERE key NOT IN "
+                   "(SELECT key FROM calendar_events WHERE start>? AND state!='cancelled')", (now,))
         for row in db.execute("SELECT id,reference,expires_at FROM alerts WHERE kind='calendar'").fetchall():
             if row["expires_at"] <= now or (valid is not None and row["reference"] not in valid):
                 # A device can still acknowledge its cached copy after expiry or cancellation.
@@ -282,6 +299,9 @@ class Companion:
                     raise RuntimeError("Calendar alert queue is full.")
                 title = datetime.fromtimestamp(event["start"]).strftime("%H:%M")
                 body = f'{event["title"] or "(Untitled event)"}\nStarts at {title}\nCalendar: {event["calendar"]}'
+                if settings["meeting_prep_enabled"]:
+                    note = db.execute("SELECT text FROM meeting_notes WHERE key=?", (event["key"],)).fetchone()
+                    body += "\nMeeting prep:\n" + (note[0] if note else "No preparation note saved for this occurrence.")
                 db.execute("INSERT INTO alerts (id,kind,title,body,reference,expires_at) VALUES (?,?,?,?,?,?)",
                            (uuid.uuid4().hex, "calendar", "Upcoming calendar event", preview(body, 2047),
                             event["key"], math.ceil(event["start"])))
@@ -292,13 +312,99 @@ class Companion:
             return [dict(row) for row in db.execute(
                 "SELECT * FROM reminders WHERE state!='done' ORDER BY due LIMIT 100")]
 
-    def add_reminder(self, title: object, due: object) -> dict:
+    def tasks(self) -> list[dict]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM tasks WHERE state='open' ORDER BY created LIMIT 100")]
+
+    def add_task(self, title: object, *, task_id: str | None = None,
+                 connection: sqlite3.Connection | None = None) -> dict:
+        if not isinstance(title, str) or not 0 < len(title.strip().encode()) <= 160 or any(ord(c) < 32 for c in title):
+            raise ValueError("Task title must contain 1-160 UTF-8 bytes without control characters.")
+        task = {"id": identifier(task_id) if task_id else uuid.uuid4().hex,
+                "title": title.strip(), "state": "open", "created": time.time()}
+        with self.lock, (self.connect() if connection is None else nullcontext(connection)) as db:
+            previous = db.execute("SELECT * FROM tasks WHERE id=?", (task["id"],)).fetchone()
+            if previous:
+                if previous["title"] != task["title"]:
+                    raise ValueError("Task identifier already belongs to another title.")
+                return dict(previous)
+            if db.execute("SELECT COUNT(*) FROM tasks WHERE state='open'").fetchone()[0] >= 100:
+                raise RuntimeError("Task list is full; complete or delete a task first.")
+            if db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] >= 200:
+                raise RuntimeError("Task archive is full; delete a task before adding another.")
+            db.execute("INSERT INTO tasks VALUES (?,?,?,?)", tuple(task.values()))
+        return task
+
+    def save_shortcut(self, body: dict, jobs) -> dict:
+        if not isinstance(body, dict):
+            raise ValueError("Expected a reviewed conversation save.")
+        kind = body.get("kind")
+        fields = {"action", "id", "turn", "kind", "text"}
+        if kind == "reminder":
+            fields.add("after_seconds")
+        if set(body) != fields or kind not in ("memory", "reminder", "task"):
+            raise ValueError("Invalid conversation save fields.")
+        saved_id = identifier(body["id"])
+        payload = json.dumps(body, sort_keys=True)
+        with self.lock, self.connect() as db:
+            previous = db.execute("SELECT payload FROM saved_items WHERE id=?", (saved_id,)).fetchone()
+            if previous:
+                if previous[0] != payload:
+                    raise ValueError("A saved action cannot be rebound to different text.")
+                return self.status()
+            with jobs.reviewed_transaction(db, body["turn"]):
+                if kind == "memory":
+                    memory, created = jobs.reviewed_memory(db, body["text"])
+                    target = memory["id"]
+                elif kind == "task":
+                    result = self.add_task(body["text"], task_id=saved_id, connection=db)
+                    target, created = result["id"], True
+                else:
+                    seconds = body["after_seconds"]
+                    if type(seconds) is not int or not 1 <= seconds <= 365 * 86400:
+                        raise ValueError("Invalid reminder interval.")
+                    result = self.add_reminder(body["text"], time.time() + seconds,
+                                               reminder_id=saved_id, connection=db)
+                    target, created = result["id"], True
+                db.execute("INSERT INTO saved_items VALUES (?,?,?,?,?,?,'saved',?)",
+                           (saved_id, payload, kind, target, body["text"].strip(), int(created), time.time()))
+        return self.status()
+
+    def undo_save(self, saved_id: object, jobs) -> dict:
+        saved_id = identifier(saved_id)
+        with self.lock, self.connect() as db:
+            row = db.execute("SELECT * FROM saved_items WHERE id=?", (saved_id,)).fetchone()
+            if row is None:
+                raise ValueError("Unknown saved action.")
+            if row["state"] == "undone":
+                return self.status()
+            if not row["created"]:
+                raise ValueError("That memory already existed; Undo will not delete an earlier saved preference.")
+            with jobs.reviewed_transaction(db):
+                if row["kind"] == "memory":
+                    jobs.undo_reviewed_memory(db, row["target"])
+                elif row["kind"] == "task":
+                    db.execute("DELETE FROM tasks WHERE id=?", (row["target"],))
+                else:
+                    db.execute("UPDATE reminders SET state='done' WHERE id=?", (row["target"],))
+                    db.execute("DELETE FROM alerts WHERE reference=?", (row["target"],))
+                db.execute("UPDATE saved_items SET state='undone' WHERE id=?", (saved_id,))
+        return self.status()
+
+    def add_reminder(self, title: object, due: object, *, reminder_id: str | None = None,
+                     connection: sqlite3.Connection | None = None) -> dict:
         if not isinstance(title, str) or not 0 < len(title.strip().encode()) <= 160:
             raise ValueError("Reminder title must contain 1-160 UTF-8 bytes.")
         if type(due) not in (float, int) or not math.isfinite(due) or not time.time() < due < time.time() + 366 * 86400:
             raise ValueError("Reminder time must be within the next year.")
-        reminder = {"id": uuid.uuid4().hex, "title": title.strip(), "due": due, "state": "pending"}
-        with self.lock, self.connect() as db:
+        reminder = {"id": identifier(reminder_id) if reminder_id else uuid.uuid4().hex,
+                    "title": title.strip(), "due": due, "state": "pending"}
+        with self.lock, (self.connect() if connection is None else nullcontext(connection)) as db:
+            previous = db.execute("SELECT * FROM reminders WHERE id=?", (reminder["id"],)).fetchone()
+            if previous:
+                if previous["title"] != reminder["title"]:
+                    raise ValueError("Reminder identifier already belongs to another title.")
+                return dict(previous)
             if db.execute("SELECT COUNT(*) FROM reminders WHERE state!='done'").fetchone()[0] >= 100:
                 raise RuntimeError("Reminder list is full; dismiss or delete reminders first.")
             db.execute("INSERT INTO reminders VALUES (?,?,?,?)", tuple(reminder.values()))
@@ -325,17 +431,24 @@ class Companion:
             head = db.execute("SELECT * FROM alerts ORDER BY seq LIMIT 1").fetchone()
             if ack and ack != self.get("last_ack"):
                 receipt = db.execute("SELECT 1 FROM alert_receipts WHERE id=?", (ack,)).fetchone()
-                if not receipt and (head is None or head["id"] != ack):
+                acknowledged = db.execute("SELECT * FROM alerts WHERE id=?", (ack,)).fetchone()
+                if not receipt and (acknowledged is None or
+                        ((head is None or head["id"] != ack) and ack != self.get("last_delivered"))):
                     raise ValueError("Only the delivered companion alert may be dismissed.")
                 if not receipt:
                     db.execute("DELETE FROM alerts WHERE id=?", (ack,))
-                    if head["kind"] == "reminder":
-                        db.execute("UPDATE reminders SET state='done' WHERE id=?", (head["reference"],))
-                    elif head["kind"] == "calendar":
-                        db.execute("UPDATE calendar_events SET state='dismissed' WHERE key=?", (head["reference"],))
+                    if acknowledged["kind"] == "reminder":
+                        db.execute("UPDATE reminders SET state='done' WHERE id=?", (acknowledged["reference"],))
+                    elif acknowledged["kind"] == "calendar":
+                        db.execute("UPDATE calendar_events SET state='dismissed' WHERE key=?", (acknowledged["reference"],))
                         db.execute("INSERT OR IGNORE INTO alert_receipts VALUES (?)", (ack,))
                 db.execute("UPDATE metadata SET value=? WHERE key='last_ack'", (json.dumps(ack),))
                 head = db.execute("SELECT * FROM alerts ORDER BY seq LIMIT 1").fetchone()
+            if self.quiet_time(time.time(), self.get("settings")):
+                head = db.execute("SELECT * FROM alerts WHERE kind NOT IN ('briefing','calendar') "
+                                  "ORDER BY seq LIMIT 1").fetchone()
+            if head is not None:
+                db.execute("UPDATE metadata SET value=? WHERE key='last_delivered'", (json.dumps(head["id"]),))
             return {"notification": {"id": head["id"], "kind": head["kind"],
                     "sender": head["title"], "preview": preview(head["body"], 256),
                     "body": head["body"], **({"expires_at": head["expires_at"]} if head["kind"] == "calendar" else {})}
@@ -410,6 +523,9 @@ class Companion:
         lines.append("Gadget reminders: " + str(len(reminders)))
         lines.extend(datetime.fromtimestamp(r["due"]).strftime("%H:%M") + " " + r["title"]
                      for r in reminders)
+        tasks = self.tasks()
+        lines.append("Open priorities: " + str(len(tasks)))
+        lines.extend("- " + task["title"] for task in tasks[:6])
         event_count = None
         if settings["calendars_enabled"]:
             try:
@@ -433,6 +549,8 @@ class Companion:
         if not summary:
             summary = [datetime.fromtimestamp(r["due"]).strftime("%H:%M") + " " + r["title"]
                        for r in reminders[:2]]
+        if not summary and tasks:
+            summary = [task["title"] for task in tasks[:2]]
         body = "\n".join(lines)
         if len(body.encode()) > 2047:
             body = preview(body, 1960) + "\nAgenda truncated; open Calendar for all events."
@@ -450,6 +568,90 @@ class Companion:
                 self.alert("briefing", "Partial morning briefing" if errors else "Morning briefing", body)
             except (RuntimeError, sqlite3.Error):
                 logging.error("Morning briefing notification could not be queued; digest retained in status.")
+
+    def evening(self, *, scheduled: bool = False) -> dict:
+        with self.lock:
+            previous = self.get("evening")
+            if previous.get("state") == "building":
+                return previous
+            self.put("evening", {"state": "building", "body": "Building local evening summary..."})
+            self.evening_thread = threading.Thread(target=self.build_evening, args=(scheduled,),
+                                                   name="evening-summary", daemon=True)
+            try:
+                self.evening_thread.start()
+            except RuntimeError:
+                self.put("evening", {"state": "failed", "body": "Could not start evening worker."})
+                raise
+            return self.get("evening")
+
+    def build_evening(self, scheduled: bool) -> None:
+        try:
+            self._build_evening(scheduled)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error):
+            logging.error("Evening summary failed; inspect companion state and source availability.")
+            self.put("evening", {"state": "failed", "body": "Evening summary failed; check Mac bridge logs."})
+
+    def _build_evening(self, scheduled: bool) -> None:
+        now = datetime.now().astimezone()
+        tomorrow = datetime.combine(now.date() + timedelta(days=1), datetime.min.time()).astimezone()
+        end = datetime.combine(now.date() + timedelta(days=2), datetime.min.time()).astimezone()
+        settings = self.get("settings")
+        tasks = self.tasks()
+        reminders = [r for r in self.reminders() if r["due"] < end.timestamp()]
+        lines = ["Evening summary - " + now.strftime("%a %d %b"), "Times use the Mac's local timezone.",
+                 f"Unfinished priorities: {len(tasks)}"]
+        lines.extend("- " + task["title"] for task in tasks[:8])
+        lines.append(f"Reminders through tomorrow: {len(reminders)}")
+        lines.extend(datetime.fromtimestamp(r["due"]).strftime("%a %H:%M") + " " + r["title"]
+                     for r in reminders[:8])
+        errors = []
+        if settings["calendars_enabled"]:
+            try:
+                events = self.calendar_query("events", {"ids": settings["calendar_ids"],
+                    "start": tomorrow.timestamp(), "end": end.timestamp()}).get("events")
+                if not isinstance(events, list):
+                    raise ValueError("Invalid tomorrow agenda.")
+                lines.append("Tomorrow's calendar: " + str(len(events)))
+                for event in events[:12]:
+                    stamp = "All day" if event["all_day"] else datetime.fromtimestamp(event["start"]).strftime("%H:%M")
+                    lines.append(stamp + " " + event["title"])
+            except (OSError, ValueError, RuntimeError, KeyError, TypeError, subprocess.TimeoutExpired):
+                errors.append("Tomorrow's calendar unavailable; check reader access.")
+                logging.error("Evening calendar unavailable; inspect reader permissions.")
+        else:
+            lines.append("Calendars disabled.")
+        lines.extend(errors)
+        body = preview("\n".join(lines), 2047)
+        result = {"state": "partial" if errors else "ready", "body": body, "date": now.isoformat(),
+                  "summary": preview(f"{len(tasks)} open priorities / {len(reminders)} reminders through tomorrow.", 256)}
+        self.put("evening", result)
+        if scheduled:
+            try:
+                self.alert("briefing", "Evening summary", body)
+            except (RuntimeError, sqlite3.Error):
+                logging.error("Evening notification could not be queued; digest retained in status.")
+
+    def fire_routines(self, now: float) -> None:
+        settings = self.get("settings")
+        if self.quiet_time(now, settings):
+            return
+        local = datetime.fromtimestamp(now).astimezone()
+        today = local.strftime("%Y-%m-%d")
+        minute = local.hour * 60 + local.minute
+        for key, enabled, hour, minutes in (
+                ("briefing", "briefing_enabled", "hour", "minute"),
+                ("evening", "evening_enabled", "evening_hour", "evening_minute")):
+            due = settings[hour] * 60 + settings[minutes]
+            if not settings[enabled] or not due <= minute < due + 60:
+                continue
+            with self.lock:
+                if self.get(key + "_date") == today or self.get(key).get("state") == "building":
+                    continue
+                if key == "briefing":
+                    self.briefing(scheduled=True)
+                else:
+                    self.evening(scheduled=True)
+                self.put(key + "_date", today)
 
     def refresh_weather(self) -> dict:
         # Share one fetch with briefings; status reads never perform network I/O.
@@ -517,6 +719,16 @@ class Companion:
         reminders = self.reminders()
         with self.connect() as db:
             row = db.execute("SELECT id,recipient,text,state,detail FROM drafts ORDER BY rowid DESC LIMIT 1").fetchone()
+            total_tasks = db.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            offset = min(self.get("task_offset"), max(0, (total_tasks - 1) // 12 * 12))
+            tasks = [dict(item) for item in db.execute("SELECT * FROM tasks ORDER BY state DESC,created,id LIMIT 12 OFFSET ?",
+                                                      (offset,))]
+            task_count = db.execute("SELECT COUNT(*) FROM tasks WHERE state='open'").fetchone()[0]
+            saved = db.execute("SELECT id,kind,text,created,state FROM saved_items ORDER BY stamp DESC LIMIT 1").fetchone()
+            meetings = [dict(item) for item in db.execute(
+                "SELECT e.key,e.title,e.start,COALESCE(n.text,'') AS note FROM calendar_events e "
+                "LEFT JOIN meeting_notes n ON n.key=e.key WHERE e.start>? AND e.state!='cancelled' "
+                "ORDER BY e.start LIMIT 6", (time.time(),))]
         draft = dict(row) if row else None
         if draft:
             draft["preview"] = preview(draft["text"], 256)
@@ -528,6 +740,9 @@ class Companion:
              "enabled": c["id"] in settings["calendar_ids"]} for c in self.calendars],
             "reminders": reminders[:12], "reminder_count": len(reminders),
             "briefing": self.get("briefing"), "draft": draft,
+            "evening": self.get("evening"), "tasks": tasks, "task_count": task_count,
+            "task_offset": offset, "task_more": offset + len(tasks) < total_tasks,
+            "saved_item": dict(saved) if saved else None, "meetings": meetings,
             "calendar_alerts": self.calendar_alert_status(settings)}
 
     def prepare_reply(self, inbox, notification: object, text: object) -> dict:
@@ -596,6 +811,40 @@ class Companion:
             return self.status()
         if action == "briefing_status" and set(body) == {"action"}:
             return {"briefing": self.get("briefing")}
+        if action == "evening" and set(body) == {"action"}:
+            return {"evening": self.evening()}
+        if action == "task_add" and set(body) == {"action", "title"}:
+            self.add_task(body["title"])
+            return self.status()
+        if action == "task_page" and set(body) == {"action", "offset"}:
+            offset = body["offset"]
+            if type(offset) is not int or not 0 <= offset <= 192 or offset % 12:
+                raise ValueError("Invalid task page.")
+            self.put("task_offset", offset)
+            return self.status()
+        if action in ("task_done", "task_reopen", "task_delete") and set(body) == {"action", "id"}:
+            task_id = identifier(body["id"])
+            with self.lock, self.connect() as db:
+                if action == "task_delete":
+                    changed = db.execute("DELETE FROM tasks WHERE id=?", (task_id,)).rowcount
+                else:
+                    changed = db.execute("UPDATE tasks SET state=? WHERE id=?",
+                        ("done" if action == "task_done" else "open", task_id)).rowcount
+                if changed != 1:
+                    raise ValueError("Task is no longer available.")
+            return self.status()
+        if action == "meeting_note" and set(body) == {"action", "key", "text"}:
+            key, note = body["key"], body["text"]
+            if not isinstance(key, str) or len(key) != 64 or any(c not in "0123456789abcdef" for c in key):
+                raise ValueError("Invalid calendar occurrence.")
+            if not isinstance(note, str) or len(note.encode()) > 512 or any(ord(c) < 32 and c != "\n" for c in note):
+                raise ValueError("Preparation note must contain at most 512 UTF-8 bytes.")
+            with self.lock, self.connect() as db:
+                if not db.execute("SELECT 1 FROM calendar_events WHERE key=? AND start>? AND state!='cancelled'",
+                                  (key, time.time())).fetchone():
+                    raise ValueError("This calendar occurrence changed; refresh before saving.")
+                db.execute("INSERT OR REPLACE INTO meeting_notes VALUES (?,?)", (key, note.strip()))
+            return self.status()
         if action == "reminders" and set(body) == {"action"}:
             return {"reminders": self.reminders()}
         if action == "settings" and set(body) == {"action", "settings"}:
@@ -696,19 +945,15 @@ class Companion:
                     self.weather_thread = threading.Thread(target=self.refresh_weather,
                                                            name="gadget-weather", daemon=True)
                     self.weather_thread.start()
-                now = datetime.now().astimezone()
-                today = now.strftime("%Y-%m-%d")
-                if settings["briefing_enabled"] and (now.hour, now.minute) >= (
-                        settings["hour"], settings["minute"]) and self.get("briefing_date") != today:
-                    self.put("briefing_date", today)
-                    self.briefing(scheduled=True)
+                self.fire_routines(time.time())
             except (OSError, ValueError, RuntimeError, sqlite3.Error):
                 logging.error("Companion scheduler unavailable; inspect private state and permissions.")
             self.stop.wait(5)
 
     def close(self) -> None:
         self.stop.set()
-        for thread in (self.thread, self.brief_thread, self.reply_thread, self.weather_thread, self.calendar_thread):
+        for thread in (self.thread, self.brief_thread, self.reply_thread, self.weather_thread, self.calendar_thread,
+                       self.evening_thread):
             if thread:
                 thread.join(timeout=30)
                 if thread.is_alive():

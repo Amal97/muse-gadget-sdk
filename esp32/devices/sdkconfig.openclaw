@@ -1,3 +1,4 @@
 # Load after sdkconfig.openai and before your ignored local CA-path overlay.
 CONFIG_MUSE_OPENCLAW=y
 CONFIG_LV_FONT_MONTSERRAT_48=y
+CONFIG_LWIP_DNS_SUPPORT_MDNS_QUERIES=y

@@ -22,6 +22,8 @@ typedef struct {
     char weather[112], weather_detail[160];
     char reminder[176], reminder_detail[80];
     char briefing[272], footer[96];
+    char copilot[272];
+    bool task_visible, evening;
 } muse_home_view_t;
 
 void muse_home_format(muse_home_view_t *view, const cJSON *root, time_t now,

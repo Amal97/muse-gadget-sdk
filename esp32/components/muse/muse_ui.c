@@ -157,7 +157,7 @@ static muse_mode_t s_last_mode = MUSE_MODE_COUNT;
 #if CONFIG_MUSE_OPENCLAW
 static lv_obj_t *s_home, *s_home_time, *s_home_date, *s_home_weather_title;
 static lv_obj_t *s_home_weather, *s_home_weather_detail, *s_home_reminder, *s_home_reminder_detail;
-static lv_obj_t *s_home_briefing, *s_home_footer;
+static lv_obj_t *s_home_briefing, *s_home_briefing_title, *s_home_footer;
 static char *s_home_json;
 static cJSON *s_home_data;
 static unsigned s_home_version;
@@ -832,11 +832,14 @@ static void home_detail(lv_event_t *event)
         muse_settings_ui_open_companion(detail);
     } else if (card == 1) {
         muse_settings_ui_open_companion_reminders();
+    } else if (view.task_visible) {
+        muse_settings_ui_open_copilot();
     } else {
         const cJSON *briefing = cJSON_GetObjectItemCaseSensitive(s_home_data, "briefing");
+        if (view.evening) briefing = cJSON_GetObjectItemCaseSensitive(s_home_data, "evening");
         const char *body = muse_home_text(briefing, "body");
         if (!*body || !strncmp(view.briefing, "Previous briefing.", 18)) {
-            if (!muse_openai_companion_command("{\"action\":\"briefing\"}")) {
+            if (!muse_openai_companion_command(view.evening ? "{\"action\":\"evening\"}" : "{\"action\":\"briefing\"}")) {
                 muse_state_set_caption("BRIEFING NOT QUEUED - MAC MAY BE BUSY");
             }
             muse_settings_ui_open_companion_briefing("Your refreshed briefing appears here when ready.");
@@ -898,7 +901,7 @@ static void build_home(void)
     lv_obj_align(s_home_date, LV_ALIGN_TOP_MID, 0, s_h * 25 / 100);
     home_card(39, 0, "WEATHER", &s_home_weather_title, &s_home_weather, &s_home_weather_detail);
     home_card(59, 1, "REMINDERS", NULL, &s_home_reminder, &s_home_reminder_detail);
-    home_card(78, 2, "DAILY BRIEFING", NULL, &s_home_briefing, NULL);
+    home_card(78, 2, "DAILY BRIEFING", &s_home_briefing_title, &s_home_briefing, NULL);
     s_home_footer = make_label(s_home, &lv_font_montserrat_14, COLOR_DIM);
     lv_obj_set_style_text_align(s_home_footer, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_width(s_home_footer, s_w * 56 / 100);
@@ -991,17 +994,18 @@ static void update_home(float now)
     }
     home_set_text(s_home_reminder, view.reminder);
     home_set_text(s_home_reminder_detail, view.reminder_detail);
-    home_set_text(s_home_briefing, view.briefing);
-    muse_hatch_status_t backend;
-    muse_hatch_status(&backend);
-    if (backend.state == MUSE_HATCH_UNREACHABLE)
+    home_set_text(s_home_briefing, view.task_visible ? view.copilot : view.briefing);
+    home_set_text(s_home_briefing_title, view.task_visible ? "COPILOT TASK" :
+                  view.evening ? "EVENING SUMMARY" : "DAILY BRIEFING");
+    if (!strcmp(muse_openai_bridge_status(), "Unreachable - reconnecting") ||
+        !strcmp(muse_openai_bridge_status(), "Authentication failed"))
         snprintf(view.footer, sizeof(view.footer), "Mac unavailable / cached info");
     if (!muse_settings_openclaw_token_set()) snprintf(view.footer, sizeof(view.footer), "Set up OpenClaw in Settings");
     home_set_text(s_home_footer, view.footer);
     if (s_home_json && connected && lv_tileview_get_tile_active(s_tv) == s_home &&
         muse_settings_openclaw_token_set() && now >= s_home_refresh && !muse_openai_companion_busy()) {
         muse_openai_companion_command("{\"action\":\"status\"}");
-        s_home_refresh = now + 30;
+        s_home_refresh = now + 10;
     }
 }
 #endif
@@ -1381,7 +1385,9 @@ static void notification_content(void)
                        "Tap here to collapse") : !strcmp(s_shown_notification.kind, "reply_wait") ?
                       "Hold talk to dictate; not sent" : "Tap text to read details");
     if (!strncmp(s_shown_notification.kind, "copilot_", 8)) {
-        lv_label_set_text(s_notification_hint, !s_shown_notification.respondable ? "Review on computer" :
+        lv_label_set_text(s_notification_hint,
+            !strcmp(s_shown_notification.kind, "copilot_done") || !strcmp(s_shown_notification.kind, "copilot_fail") ?
+            "Tap Review for task details" : !s_shown_notification.respondable ? "Review on computer" :
             !strcmp(s_shown_notification.kind, "copilot_allow") ? "Hold Talk: approve / deny" : "Tap an option / hold Talk to answer");
     }
     notification_choices();
@@ -1402,7 +1408,11 @@ static void notification_action(lv_event_t *e)
         muse_voice_copilot_finish(true);
         return;
     }
-    if (!strncmp(s_shown_notification.kind, "copilot_", 8)) {
+    if (!strcmp(s_shown_notification.kind, "copilot_done") || !strcmp(s_shown_notification.kind, "copilot_fail")) {
+        muse_settings_ui_open_copilot();
+    } else if (!strcmp(s_shown_notification.kind, "job")) {
+        muse_settings_ui_open_conversation();
+    } else if (!strncmp(s_shown_notification.kind, "copilot_", 8)) {
         notification_layout(true);
         muse_state_poke();
     } else if (!strcmp(s_shown_notification.kind, "imessage")) {
@@ -1456,7 +1466,8 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
     bool available = muse_openai_notification(&notification);
     bool timer = available && !strcmp(notification.kind, "timer");
     bool copilot = available && !strncmp(notification.kind, "copilot_", 8);
-    bool focused = copilot && mode == MUSE_MODE_IDLE && !timer;
+    bool interactive = available && (!strcmp(notification.kind, "copilot_allow") || !strcmp(notification.kind, "copilot_ask"));
+    bool focused = interactive && mode == MUSE_MODE_IDLE && !timer;
     muse_openai_copilot_focus(focused ? notification.id : NULL);
     if (!available || (!timer && ((!visible && !copilot) || mode != MUSE_MODE_IDLE))) {
         if (s_notification_expanded) notification_layout(false);
@@ -1476,8 +1487,9 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
     const char *action = !strcmp(notification.kind, "imessage") ? "Reply" :
         (!strcmp(notification.kind, "timer") || !strcmp(notification.kind, "reminder") ||
          !strcmp(notification.kind, "calendar")) ? "Snooze 5m" :
-        (copilot || !strcmp(notification.kind, "reply") || !strcmp(notification.kind, "timer_replace")) ? "Review" : NULL;
-    lv_label_set_text(s_notification_dismiss_label, copilot ?
+        (copilot || !strcmp(notification.kind, "reply") || !strcmp(notification.kind, "timer_replace")) ? "Review" :
+        !strcmp(notification.kind, "job") ? "Save..." : NULL;
+    lv_label_set_text(s_notification_dismiss_label, interactive ?
         (!strcmp(notification.kind, "copilot_allow") ? "Deny" : "Skip") : "Dismiss");
     if (action) {
         lv_label_set_text(s_notification_action_label, action);
@@ -1491,7 +1503,9 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
         elapsed = 0;
         if (muse_settings_speaker_on() && (mode == MUSE_MODE_IDLE || (timer && mode == MUSE_MODE_THINKING))) {
             if (!copilot || strcmp(notification.id, s_copilot_chimed)) {
-                muse_voice_request_chirp();
+                if (!strcmp(notification.kind, "copilot_done") || !strcmp(notification.kind, "copilot_fail"))
+                    muse_voice_request_copilot_chirp(!strcmp(notification.kind, "copilot_fail"));
+                else muse_voice_request_chirp();
                 if (copilot) strlcpy(s_copilot_chimed, notification.id, sizeof(s_copilot_chimed));
             }
             s_alarm_chirp = now;

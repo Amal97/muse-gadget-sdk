@@ -74,9 +74,17 @@ static const char *TAG = "muse_voice";
 static QueueHandle_t s_queue;
 static volatile bool s_monitor;
 static volatile float s_monitor_db = -100.0f;
-static volatile bool s_chirp;
+static volatile int s_chirp;
 static volatile bool s_loopback;
 static volatile bool s_mp3test;
+
+static void play_notice_chirp(void)
+{
+    int kind = s_chirp;
+    s_chirp = 0;
+    muse_audio_chirp(kind == 1);
+    if (kind == 2) muse_audio_chirp(0);
+}
 #if CONFIG_MUSE_OPENCLAW
 enum { DICTATION_OFF, DICTATION_RESERVING, DICTATION_START, DICTATION_ACTIVE, DICTATION_SEND, DICTATION_CANCEL };
 static atomic_int s_dictation;
@@ -441,8 +449,7 @@ static bool hatch_reply(bool *delivered)
     for (;;) {
 #if CONFIG_MUSE_OPENCLAW
         if (s_chirp && !speaking && !replied) {
-            s_chirp = false;
-            muse_audio_chirp(1);
+            play_notice_chirp();
         }
 #endif
         muse_hatch_ev_t ev;
@@ -934,8 +941,7 @@ static void voice_task(void *arg)
                 continue;
             }
             if (s_chirp) {
-                s_chirp = false;
-                muse_audio_chirp(1);
+                play_notice_chirp();
                 pre_reset();
             }
             if (s_mp3test) {
@@ -1051,7 +1057,12 @@ float muse_voice_monitor_db(void)
 
 void muse_voice_request_chirp(void)
 {
-    s_chirp = true;
+    s_chirp = 1;
+}
+
+void muse_voice_request_copilot_chirp(bool failed)
+{
+    s_chirp = failed ? 2 : -1;
     muse_state_nudge();
 }
 

@@ -24,14 +24,22 @@ function displayable(value: string): boolean {
     return /^[\x20-\x7e\n]+$/.test(value) && Buffer.byteLength(value, "utf8") <= 2047;
 }
 
+export function boundedText(value: string, bytes: number): string {
+    let result = value.replace(/[\p{Cc}\p{Cf}]/gu, (c) => c === "\n" ? c : " ").trim();
+    if (Buffer.byteLength(result, "utf8") <= bytes) return result || "No additional details.";
+    result = Buffer.from(result).subarray(0, bytes - 3).toString("utf8").replace(/\ufffd$/, "");
+    return result + "...";
+}
+
 export class Controller {
-    readonly id = randomBytes(16).toString("hex");
+    id = randomBytes(16).toString("hex");
     readonly pending = new Map<string, PendingRequest>();
     private generation = 0;
     private alive = false;
     private accepting = true;
     private heartbeat?: NodeJS.Timeout;
     private heartbeating = false;
+    private closing = false;
 
     constructor(
         private readonly transport: Transport,
@@ -39,23 +47,86 @@ export class Controller {
         private readonly notify: (request: PendingRequest) => void,
         private readonly log: (message: string) => void,
         private readonly pollMs = 1500,
+        private readonly events?: { disconnected: () => Promise<void>; stop: (id: string) => Promise<void>;
+            reconnected?: () => Promise<void> },
     ) {}
 
     async start(): Promise<void> {
+        if (this.closing) throw new Error("Copilot controller is closed.");
         await this.transport({ action: "open", controller: this.id, workspace: this.workspace });
+        if (this.closing) {
+            await this.transport({ action: "close", controller: this.id });
+            throw new Error("Copilot controller closed during startup.");
+        }
         this.alive = true;
         this.heartbeat = setInterval(() => {
-            if (this.heartbeating || !this.alive) return;
-            this.heartbeating = true;
-            void this.transport({ action: "heartbeat", controller: this.id })
-                .catch((error: unknown) => {
-                    this.alive = false;
-                    this.generation++;
-                    this.log(`Copilot watch disconnected; pending requests will not be approved: ${String(error)}`);
-                })
-                .finally(() => { this.heartbeating = false; });
+            void this.checkConnection();
         }, 5000);
         this.heartbeat.unref();
+    }
+
+    async checkConnection(): Promise<void> {
+        if (this.heartbeating || this.closing) return;
+        this.heartbeating = true;
+        const wasAlive = this.alive;
+        try {
+            if (!wasAlive) {
+                const key = randomBytes(16).toString("hex");
+                await this.transport({ action: "open", controller: key, workspace: this.workspace });
+                if (this.closing) {
+                    await this.transport({ action: "close", controller: key });
+                    return;
+                }
+                this.id = key;
+                try { await this.events?.reconnected?.(); }
+                catch (error) {
+                    await this.transport({ action: "close", controller: key });
+                    throw error;
+                }
+                if (this.closing) {
+                    await this.transport({ action: "close", controller: key });
+                    return;
+                }
+                this.alive = true;
+                this.accepting = true;
+                this.log("Copilot watch reconnected with a fresh lease. Interrupted work and old approvals are not resumed.");
+            } else {
+                const response = await this.transport({ action: "heartbeat", controller: this.id });
+                if (response.stop_tasks !== undefined) {
+                    if (!Array.isArray(response.stop_tasks) || response.stop_tasks.some(
+                        (id: unknown) => typeof id !== "string" || !/^[0-9a-f]{32}$/.test(id))) {
+                        throw new Error("Invalid task stop commands from bridge.");
+                    }
+                    for (const id of response.stop_tasks) await this.events?.stop(id);
+                }
+            }
+        } catch (error) {
+            if (wasAlive && this.alive) {
+                this.alive = false;
+                this.accepting = false;
+                this.generation++;
+                this.log(`Copilot watch disconnected; pending requests will not be approved: ${String(error)}`);
+                try { await this.events?.disconnected(); }
+                catch (abortError) { this.log(`SDK interruption failed; stop work on this computer: ${String(abortError)}`); }
+            } else this.log(`Copilot reconnect retry failed: ${String(error)}`);
+        } finally { this.heartbeating = false; }
+    }
+
+    async beginTask(session: string, title: string): Promise<string> {
+        this.resume();
+        const id = randomBytes(16).toString("hex");
+        const result = await this.transport({ action: "task_begin", controller: this.id, id, session,
+            title: boundedText(title, 240) });
+        if (result.id !== id || result.status !== "working") throw new Error("Copilot task was not registered.");
+        return id;
+    }
+
+    async updateTask(id: string, status: string, summary: string): Promise<void> {
+        const result = await this.transport({ action: "task_update", controller: this.id, id, status,
+            summary: boundedText(summary, 2047) });
+        if (result.id !== id || (result.status !== status && result.status !== "stopping")) {
+            throw new Error("Copilot task update was not acknowledged.");
+        }
     }
 
     async cancel(): Promise<void> {
@@ -69,11 +140,12 @@ export class Controller {
     }
 
     resume(): void {
-        if (!this.alive) throw new Error("Copilot watch is disconnected. Restart this controller.");
+        if (!this.alive) throw new Error("Copilot watch is disconnected. Wait for automatic recovery or restart this controller.");
         this.accepting = true;
     }
 
     async close(): Promise<void> {
+        this.closing = true;
         if (this.heartbeat) clearInterval(this.heartbeat);
         await this.cancel();
         if (this.alive) {
@@ -94,10 +166,11 @@ export class Controller {
     private async wait(request: PendingRequest): Promise<ObjectValue> {
         if (!this.alive || !this.accepting) throw new Error("Copilot controller is stopped or disconnected.");
         this.pending.set(request.id, request);
+        const controller = this.id;
         let received = false;
         try {
             const created = await this.transport({
-                action: "create", controller: this.id, id: request.id, session: request.session,
+                action: "create", controller, id: request.id, session: request.session,
                 kind: request.kind, body: request.respondable ? request.details :
                     `Copilot ${request.kind}\nReview on the computer: this request cannot be fully displayed on the gadget.\nSession: ${request.session}`,
                 choices: request.choices,
@@ -107,7 +180,7 @@ export class Controller {
             this.notify(request);
             const deadline = Date.now() + 600_000;
             while (this.alive && this.accepting && this.generation === request.generation && Date.now() < deadline) {
-                const value = await this.transport({ action: "take", controller: this.id, id: request.id });
+                const value = await this.transport({ action: "take", controller, id: request.id });
                 if (!this.alive || !this.accepting || this.generation !== request.generation) break;
                 if (value.id !== request.id) throw new Error("Copilot response has the wrong request ID.");
                 if (value.state === "answered" && object(value.result)) {
@@ -121,7 +194,7 @@ export class Controller {
         } finally {
             this.pending.delete(request.id);
             try {
-                await this.transport({ action: "cancel", controller: this.id, id: request.id });
+                await this.transport({ action: "cancel", controller, id: request.id });
             } catch (error) {
                 this.log(`Copilot request cleanup was not acknowledged; its lease/timeout will close it: ${String(error)}`);
                 if (received) throw new Error("Controller lease could not be verified before decision delivery.", { cause: error });

@@ -62,6 +62,7 @@ static char s_notification_text[2048],s_notification_id[33],s_copilot_chimed[33]
 static muse_notification_t s_shown_notification,incoming;
 static float s_notification_seconds,s_notification_tick,s_alarm_chirp;
 static int dismissed,pokes,navigations,chirps;
+static int copilot_pages,conversation_pages,completed_chirps,failed_chirps;
 static bool speaker;
 static void lv_obj_set_size(lv_obj_t *o,int w,int h){o->w=w;o->h=h;}
 static void lv_obj_align(lv_obj_t *o,int a,int x,int y){(void)o;(void)a;(void)x;(void)y;}
@@ -85,6 +86,7 @@ static void home_set_text(lv_obj_t *o,const char *s){lv_label_set_text(o,s);}
 static void muse_state_poke(void){pokes++;}
 static bool muse_settings_speaker_on(void){return speaker;}
 static void muse_voice_request_chirp(void){chirps++;}
+static void muse_voice_request_copilot_chirp(bool failed){chirps++;if(failed)failed_chirps++;else completed_chirps++;}
 static bool muse_voice_copilot_dictating(void){return dictating;}
 static bool muse_voice_copilot_dictate(const char *id){
     dictating=true;snprintf(dictation_id,sizeof(dictation_id),"%s",id);return true;
@@ -100,6 +102,8 @@ static size_t fake_strlcpy(char *out,const char *text,size_t cap){
 bool muse_openai_job_active(void){return false;}
 bool muse_openai_notification(muse_notification_t *out){*out=incoming;return available;}
 void muse_settings_ui_open_companion(const char *text){(void)text;navigations++;}
+static void muse_settings_ui_open_copilot(void){copilot_pages++;}
+static void muse_settings_ui_open_conversation(void){conversation_pages++;}
 bool muse_openai_reply_begin(const char *id){(void)id;return true;}
 bool muse_timer_snooze(unsigned seconds){(void)seconds;return false;}
 bool muse_openai_companion_command(const char *text){
@@ -216,6 +220,17 @@ int main(void){
     dictating=false;update_notification(MUSE_MODE_IDLE,135,false);
     assert(!strcmp(dismiss_label.text,"Skip") && !strcmp(action_label.text,"Review"));
     assert(!(choices.flags&LV_OBJ_FLAG_HIDDEN) && strstr(hint.text,"Tap an option"));
+    /* Result cards are not permission/question focus and use distinct chimes. */
+    strcpy(incoming.id,"22222222222222222222222222222222");
+    strcpy(incoming.kind,"copilot_done");incoming.respondable=false;incoming.choice_count=0;incoming.allow_freeform=false;
+    speaker=true;update_notification(MUSE_MODE_IDLE,136,false);
+    assert(!focused[0] && !strcmp(dismiss_label.text,"Dismiss") && completed_chirps==1);
+    assert(strstr(hint.text,"task details"));notification_action(NULL);assert(copilot_pages==1);
+    strcpy(incoming.id,"33333333333333333333333333333333");strcpy(incoming.kind,"copilot_fail");
+    update_notification(MUSE_MODE_IDLE,137,false);assert(failed_chirps==1 && !focused[0]);
+    strcpy(incoming.id,"44444444444444444444444444444444");strcpy(incoming.kind,"job");
+    update_notification(MUSE_MODE_IDLE,138,true);
+    assert(!strcmp(action_label.text,"Save..."));notification_action(NULL);assert(conversation_pages==1);
     s_small=true;s_w=s_h=240;
     notification_layout(false);
     assert(card.h==96 && details.h==32 && dismiss.w==56);

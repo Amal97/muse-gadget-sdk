@@ -128,7 +128,7 @@ class JobManager:
                 "SELECT value FROM personal_metadata WHERE key='conversation'").fetchone()[0]
             count = db.execute("SELECT COUNT(*) FROM jobs WHERE conversation=? "
                                "AND status='completed' AND request!=''", (conversation,)).fetchone()[0]
-            latest = db.execute("SELECT request,reply FROM jobs WHERE conversation=? "
+            latest = db.execute("SELECT id,request,reply FROM jobs WHERE conversation=? "
                                 "AND status='completed' AND request!='' ORDER BY started DESC LIMIT 1",
                                 (conversation,)).fetchone()
             memory_count = db.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
@@ -141,7 +141,35 @@ class JobManager:
                                  "turn_count": count, "user": preview(latest["request"], 160) if latest else "",
                                  "reply": preview(latest["reply"], 160) if latest else ""},
                 "memories": memories, "memory_count": memory_count, "memory_offset": offset,
-                "memory_more": offset + len(memories) < memory_count}
+                "memory_more": offset + len(memories) < memory_count,
+                "save_source": {"id": latest["id"], "text": preview(latest["request"], 240)}
+                               if latest else None}
+
+    def validate_save_source(self, turn_id: object) -> None:
+        turn_id = identifier(turn_id)
+        with self.lock, self.connect() as db:
+            row = db.execute("SELECT 1 FROM jobs WHERE id=? AND status='completed' AND request!='' "
+                             "AND conversation=(SELECT value FROM personal_metadata WHERE key='conversation')",
+                             (turn_id,)).fetchone()
+            if row is None:
+                raise ValueError("That conversation turn is no longer available. Refresh before saving.")
+
+    @contextmanager
+    def reviewed_transaction(self, db: sqlite3.Connection, turn_id: object = None) -> Iterator[None]:
+        with self.lock:
+            db.execute("ATTACH DATABASE ? AS personal", (str(self.path),))
+            # Both rollback-journal databases commit the target and its receipt together.
+            with db:
+                db.execute("BEGIN IMMEDIATE")
+                if turn_id is not None:
+                    turn_id = identifier(turn_id)
+                    row = db.execute(
+                        "SELECT 1 FROM personal.jobs WHERE id=? AND status='completed' AND request!='' "
+                        "AND conversation=(SELECT value FROM personal.personal_metadata WHERE key='conversation')",
+                        (turn_id,)).fetchone()
+                    if row is None:
+                        raise ValueError("That conversation turn is no longer available. Refresh before saving.")
+                yield
 
     def reset_conversation(self) -> dict:
         with self.lock, self.connect() as db:
@@ -149,30 +177,43 @@ class JobManager:
         return self.personal_status()
 
     def memory_add(self, text: object) -> dict:
+        with self.lock, self.connect() as db:
+            saved, created = self._memory_add(db, text)
+        return {**self.personal_status(), "memory": saved, "memory_created": created}
+
+    def reviewed_memory(self, db: sqlite3.Connection, text: object) -> tuple[dict, bool]:
+        return self._memory_add(db, text, "personal.")
+
+    @staticmethod
+    def _memory_add(db: sqlite3.Connection, text: object, prefix: str = "") -> tuple[dict, bool]:
         if not isinstance(text, str) or not 0 < len(text.strip().encode()) <= 240 or any(
                 ord(character) < 32 and character not in "\n\t" for character in text):
             raise ValueError("A memory must contain 1 to 240 UTF-8 bytes without control characters.")
         text = text.strip()
-        with self.lock, self.connect() as db:
-            previous = db.execute("SELECT id,text FROM memories WHERE text=?", (text,)).fetchone()
-            if previous is not None:
-                saved = dict(previous)
-            else:
-                if db.execute("SELECT COUNT(*) FROM memories").fetchone()[0] >= 50:
-                    raise RuntimeError("Personal memory is full; forget a saved item before adding another.")
-                saved = {"id": uuid.uuid4().hex, "text": text}
-                db.execute("INSERT INTO memories VALUES (?,?,?)", (saved["id"], text, time.time()))
-        return {**self.personal_status(), "memory": saved}
+        previous = db.execute(f"SELECT id,text FROM {prefix}memories WHERE text=?", (text,)).fetchone()
+        if previous is not None:
+            return dict(previous), False
+        if db.execute(f"SELECT COUNT(*) FROM {prefix}memories").fetchone()[0] >= 50:
+            raise RuntimeError("Personal memory is full; forget a saved item before adding another.")
+        saved = {"id": uuid.uuid4().hex, "text": text}
+        db.execute(f"INSERT INTO {prefix}memories VALUES (?,?,?)", (saved["id"], text, time.time()))
+        return saved, True
 
     def memory_forget(self, memory_id: object) -> dict:
-        memory_id = identifier(memory_id)
         with self.lock, self.connect() as db:
-            if db.execute("DELETE FROM memories WHERE id=?", (memory_id,)).rowcount != 1:
-                raise ValueError("Unknown saved memory.")
-            # Old completed turns may repeat the forgotten fact; exclude them from future prompts.
-            db.execute("UPDATE personal_metadata SET value=? WHERE key='conversation'", (uuid.uuid4().hex,))
+            self._memory_forget(db, memory_id)
         return self.personal_status()
 
+    def undo_reviewed_memory(self, db: sqlite3.Connection, memory_id: object) -> None:
+        self._memory_forget(db, memory_id, "personal.")
+
+    @staticmethod
+    def _memory_forget(db: sqlite3.Connection, memory_id: object, prefix: str = "") -> None:
+        memory_id = identifier(memory_id)
+        if db.execute(f"DELETE FROM {prefix}memories WHERE id=?", (memory_id,)).rowcount != 1:
+            raise ValueError("Unknown saved memory.")
+        # Old completed turns may repeat the forgotten fact; exclude them from future prompts.
+        db.execute(f"UPDATE {prefix}personal_metadata SET value=? WHERE key='conversation'", (uuid.uuid4().hex,))
     def memory_page(self, offset: object) -> dict:
         if type(offset) is not int or not 0 <= offset <= 48 or offset % 6:
             raise ValueError("Invalid memory page offset.")

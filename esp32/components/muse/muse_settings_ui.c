@@ -23,6 +23,7 @@
 #include "esp_app_desc.h"
 #include "esp_mac.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 
 #include "muse_audio.h"
 #include "muse_battery.h"
@@ -100,7 +101,8 @@ static lv_obj_t *s_openclaw_url, *s_openclaw_token;
 typedef enum {
     COMPANION_MENU, COMPANION_CONVERSATION, COMPANION_MEMORY, COMPANION_TIMERS,
     COMPANION_REMINDERS, COMPANION_REPLIES, COMPANION_BRIEFING, COMPANION_CALENDARS,
-    COMPANION_FAVOURITES, COMPANION_STATUS, COMPANION_DETAILS, COMPANION_SECTION_COUNT
+    COMPANION_FAVOURITES, COMPANION_STATUS, COMPANION_DETAILS, COMPANION_COPILOT,
+    COMPANION_TASKS, COMPANION_ROUTINES, COMPANION_SECTION_COUNT
 } companion_section_t;
 static companion_section_t s_companion_section;
 static int32_t s_companion_scroll[COMPANION_SECTION_COUNT];
@@ -108,7 +110,7 @@ static bool s_companion_restore_scroll;
 static lv_obj_t *s_companion_title;
 static const char *const COMPANION_TITLES[] = {
     "COMPANION", "CHAT", "MEMORY", "TIMERS", "REMINDERS", "REPLIES", "BRIEFING",
-    "CALENDARS", "FAVOURITES", "STATUS", "DETAILS"
+    "CALENDARS", "FAVOURITES", "STATUS", "DETAILS", "COPILOT", "TASKS", "ROUTINES"
 };
 static void fill_companion(void);
 static void companion_select(companion_section_t section);
@@ -117,6 +119,13 @@ static lv_obj_t *s_replace_timer, *s_cancel_replace, *s_replace_timer_text;
 static unsigned s_shown_replace_seconds;
 static char *s_companion_view;
 static char s_companion_detail[2048], s_reminder_title[161], s_draft_id[33], s_latest_job[33];
+static char s_copilot_task_ids[6][33], s_task_ids[12][33], s_meeting_keys[6][65], s_edit_meeting[65];
+static int s_task_offset;
+static char s_delete_task[33];
+static int64_t s_delete_task_us;
+static char s_save_turn[33], s_save_action[33], s_save_text[241], s_undo_save[33];
+static const char *s_save_kind;
+static bool s_edit_evening;
 /* LVGL callbacks are serialized; keep their large conversion scratch off the task stack. */
 static char s_companion_shown[2048];
 static char s_calendar_ids[32][257];
@@ -1597,6 +1606,207 @@ static void on_copilot_watch(lv_event_t *e)
     muse_settings_set_copilot_watch(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
+static void on_stop_copilot(lv_event_t *e)
+{
+    unsigned index = (uintptr_t)lv_event_get_user_data(e);
+    if (index >= 6 || !s_copilot_task_ids[index][0]) {
+        muse_state_set_caption("COPILOT TASK CHANGED - REFRESH");
+        return;
+    }
+    cJSON *body = action_body("copilot_stop");
+    if (body) cJSON_AddStringToObject(body, "id", s_copilot_task_ids[index]);
+    send_companion(body);
+}
+
+static void on_task_page(lv_event_t *e)
+{
+    int offset = s_task_offset + (intptr_t)lv_event_get_user_data(e);
+    if (offset < 0 || offset > 192) {
+        muse_state_set_caption("TASK PAGE CHANGED - REFRESH");
+        return;
+    }
+    cJSON *body = action_body("task_page");
+    if (body) cJSON_AddNumberToObject(body, "offset", offset);
+    send_companion(body);
+}
+
+static void on_task_delete(lv_event_t *e)
+{
+    unsigned index = (uintptr_t)lv_event_get_user_data(e);
+    if (index >= 12 || !s_task_ids[index][0]) {
+        muse_state_set_caption("TASK CHANGED - REFRESH");
+        return;
+    }
+    int64_t now = esp_timer_get_time();
+    if (strcmp(s_delete_task, s_task_ids[index]) || now - s_delete_task_us > 15000000) {
+        strlcpy(s_delete_task, s_task_ids[index], sizeof(s_delete_task));
+        s_delete_task_us = now;
+        muse_state_set_caption("TAP SAME DELETE AGAIN TO CONFIRM");
+        return;
+    }
+    cJSON *body = action_body("task_delete");
+    if (body) cJSON_AddStringToObject(body, "id", s_delete_task);
+    s_delete_task[0] = '\0';
+    send_companion(body);
+}
+
+static void on_task_state(lv_event_t *e)
+{
+    unsigned index = (uintptr_t)lv_event_get_user_data(e);
+    if (index >= 12 || !s_task_ids[index][0]) {
+        muse_state_set_caption("TASK CHANGED - REFRESH");
+        return;
+    }
+    cJSON *root = cJSON_Parse(s_companion_view);
+    cJSON *task = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "tasks"), index);
+    cJSON *body = action_body(!strcmp(json_text(task, "state"), "open") ? "task_done" : "task_reopen");
+    if (body) cJSON_AddStringToObject(body, "id", s_task_ids[index]);
+    cJSON_Delete(root);
+    send_companion(body);
+}
+
+static void task_title_done(const char *text)
+{
+    cJSON *body = action_body("task_add");
+    if (body) cJSON_AddStringToObject(body, "title", text);
+    send_companion(body);
+}
+
+static void on_task_add(lv_event_t *e)
+{
+    (void)e;
+    open_text("New priority", "", false, 160, "Saved locally; not started automatically", task_title_done, s_companion);
+}
+
+static void save_shortcut(unsigned seconds)
+{
+    cJSON *body = action_body("save_shortcut");
+    if (body) {
+        cJSON_AddStringToObject(body, "id", s_save_action);
+        cJSON_AddStringToObject(body, "turn", s_save_turn);
+        cJSON_AddStringToObject(body, "kind", s_save_kind);
+        cJSON_AddStringToObject(body, "text", s_save_text);
+        if (!strcmp(s_save_kind, "reminder")) cJSON_AddNumberToObject(body, "after_seconds", seconds);
+    }
+    send_companion(body);
+}
+
+static void save_minutes_done(const char *text)
+{
+    unsigned minutes = minutes_value(text);
+    if (!minutes) {
+        muse_state_set_caption("ENTER 1 TO 10080 MINUTES");
+        return;
+    }
+    save_shortcut(minutes * 60);
+}
+
+static void shortcut_text_done(const char *text)
+{
+    size_t limit = !strcmp(s_save_kind, "memory") ? 240 : 160;
+    if (!text || !text[0] || strlen(text) > limit) {
+        muse_state_set_caption("SAVE TEXT EMPTY OR TOO LONG");
+        return;
+    }
+    strlcpy(s_save_text, text, sizeof(s_save_text));
+    if (!strcmp(s_save_kind, "reminder"))
+        open_text("Remind after minutes", "10", false, 5, "1 to 10080; save after reviewing", save_minutes_done, s_companion);
+    else save_shortcut(0);
+}
+
+static void on_save_shortcut(lv_event_t *e)
+{
+    s_save_kind = lv_event_get_user_data(e);
+    cJSON *root = cJSON_Parse(s_companion_view);
+    cJSON *source = cJSON_GetObjectItemCaseSensitive(root, "save_source");
+    strlcpy(s_save_turn, json_text(source, "id"), sizeof(s_save_turn));
+    if (strlen(s_save_turn) != 32) {
+        cJSON_Delete(root);
+        muse_state_set_caption("NO COMPLETED CONVERSATION TO SAVE");
+        return;
+    }
+    uint8_t random[16];
+    esp_fill_random(random, sizeof(random));
+    for (unsigned i = 0; i < sizeof(random); i++) snprintf(s_save_action + i * 2, 3, "%02x", random[i]);
+    open_text(!strcmp(s_save_kind, "memory") ? "Review preference to remember" :
+              !strcmp(s_save_kind, "task") ? "Review task title" : "Review reminder title",
+              json_text(source, "text"), false, !strcmp(s_save_kind, "memory") ? 240 : 160,
+              "Edit the suggestion; nothing saved until confirmed", shortcut_text_done, s_companion);
+    cJSON_Delete(root);
+}
+
+static void on_undo_save(lv_event_t *e)
+{
+    (void)e;
+    cJSON *body = action_body("undo_save");
+    if (body) cJSON_AddStringToObject(body, "id", s_undo_save);
+    send_companion(body);
+}
+
+static void routine_time_done(const char *text)
+{
+    unsigned hour, minute;
+    char extra;
+    if (!text || strlen(text) != 5 || text[2] != ':' ||
+        text[0] < '0' || text[0] > '9' || text[1] < '0' || text[1] > '9' ||
+        text[3] < '0' || text[3] > '9' || text[4] < '0' || text[4] > '9' ||
+        sscanf(text, "%u:%u%c", &hour, &minute, &extra) != 2 || hour > 23 || minute > 59) {
+        muse_state_set_caption("ENTER TIME AS HH:MM");
+        return;
+    }
+    cJSON *body = action_body("settings");
+    cJSON *changes = body ? cJSON_AddObjectToObject(body, "settings") : NULL;
+    if (changes) {
+        cJSON_AddNumberToObject(changes, s_edit_evening ? "evening_hour" : "hour", hour);
+        cJSON_AddNumberToObject(changes, s_edit_evening ? "evening_minute" : "minute", minute);
+    }
+    send_companion(body);
+}
+
+static void on_routine_time(lv_event_t *e)
+{
+    s_edit_evening = (uintptr_t)lv_event_get_user_data(e) != 0;
+    cJSON *root = cJSON_Parse(s_companion_view);
+    cJSON *settings = cJSON_GetObjectItemCaseSensitive(root, "settings");
+    cJSON *hour = cJSON_GetObjectItemCaseSensitive(settings, s_edit_evening ? "evening_hour" : "hour");
+    cJSON *minute = cJSON_GetObjectItemCaseSensitive(settings, s_edit_evening ? "evening_minute" : "minute");
+    if (!cJSON_IsNumber(hour) || !cJSON_IsNumber(minute)) {
+        cJSON_Delete(root);
+        muse_state_set_caption("ROUTINE SETTINGS UNAVAILABLE - REFRESH");
+        return;
+    }
+    char initial[16];
+    snprintf(initial, sizeof(initial), "%02.0f:%02.0f", hour->valuedouble, minute->valuedouble);
+    open_text("Routine time", initial, false, 5,
+              "HH:MM in your Mac's local timezone", routine_time_done, s_companion);
+    cJSON_Delete(root);
+}
+
+static void meeting_note_done(const char *text)
+{
+    cJSON *body = action_body("meeting_note");
+    if (body) {
+        cJSON_AddStringToObject(body, "key", s_edit_meeting);
+        cJSON_AddStringToObject(body, "text", text);
+    }
+    send_companion(body);
+}
+
+static void on_meeting_note(lv_event_t *e)
+{
+    unsigned index = (uintptr_t)lv_event_get_user_data(e);
+    if (index >= 6 || strlen(s_meeting_keys[index]) != 64) {
+        muse_state_set_caption("MEETING CHANGED - REFRESH");
+        return;
+    }
+    strlcpy(s_edit_meeting, s_meeting_keys[index], sizeof(s_edit_meeting));
+    cJSON *root = cJSON_Parse(s_companion_view);
+    cJSON *meeting = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "meetings"), index);
+    open_text("Meeting preparation", json_text(meeting, "note"), false, 512,
+              "For this occurrence only; empty removes the note", meeting_note_done, s_companion);
+    cJSON_Delete(root);
+}
+
 static void memory_save_done(const char *text)
 {
     cJSON *body = action_body("memory_add");
@@ -1681,6 +1891,22 @@ static void fill_personal(cJSON *root)
         note(s_companion_list, "CONVERSATION");
         companion_note(s_companion_list, json_text(conversation, "user"));
         companion_note(s_companion_list, json_text(conversation, "reply"));
+        cJSON *source = cJSON_GetObjectItemCaseSensitive(root, "save_source");
+        if (json_text(source, "id")[0]) {
+            row(s_companion_list, NULL, "Remember this preference", NULL, on_save_shortcut, "memory");
+            row(s_companion_list, NULL, "Make a reminder", NULL, on_save_shortcut, "reminder");
+            row(s_companion_list, NULL, "Save as a task", NULL, on_save_shortcut, "task");
+            note(s_companion_list, "Review and edit your last request before saving. Never saves a preference automatically.");
+        }
+        cJSON *saved = cJSON_GetObjectItemCaseSensitive(root, "saved_item");
+        if (!strcmp(json_text(saved, "state"), "saved")) {
+            companion_note(s_companion_list, json_text(saved, "text"));
+            strlcpy(s_undo_save, json_text(saved, "id"), sizeof(s_undo_save));
+            if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(saved, "created")) ||
+                cJSON_GetNumberValue(cJSON_GetObjectItemCaseSensitive(saved, "created")) == 1)
+                row(s_companion_list, NULL, "Undo last save", NULL, on_undo_save, NULL);
+            else note(s_companion_list, "Already saved previously; Undo will not delete an existing memory.");
+        }
         note(s_companion_list, cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(conversation, "persistent")) ?
              "Hold Talk to follow up. Recent completed turns survive restarts on your Mac." :
              "Personal conversation status is awaiting the Mac bridge.");
@@ -1784,10 +2010,13 @@ static void fill_companion(void)
         note(s_companion_list, "PERSONAL AI");
         companion_menu_row("Conversation", COMPANION_CONVERSATION);
         companion_menu_row("Personal memory", COMPANION_MEMORY);
+        companion_menu_row("Copilot tasks", COMPANION_COPILOT);
         note(s_companion_list, "DAILY TOOLS");
         companion_menu_row("Timers", COMPANION_TIMERS);
         companion_menu_row("Reminders", COMPANION_REMINDERS);
         companion_menu_row("Daily briefing", COMPANION_BRIEFING);
+        companion_menu_row("Personal routines", COMPANION_ROUTINES);
+        companion_menu_row("Priorities & tasks", COMPANION_TASKS);
         companion_menu_row("Calendars & alerts", COMPANION_CALENDARS);
         note(s_companion_list, "DEVICE");
         cJSON *draft = cJSON_GetObjectItemCaseSensitive(root, "draft");
@@ -1799,6 +2028,83 @@ static void fill_companion(void)
     fill_personal(root);
     cJSON *settings = cJSON_GetObjectItemCaseSensitive(root, "settings");
     cJSON *favourites = cJSON_GetObjectItemCaseSensitive(settings, "favourites");
+    if (s_companion_section == COMPANION_COPILOT) {
+        cJSON *copilot = cJSON_GetObjectItemCaseSensitive(root, "copilot");
+        companion_note(s_companion_list, json_text(copilot, "state"));
+        note(s_companion_list, "Dedicated Gadget Copilot session only. Progress describes activity, not percentage completion.");
+        cJSON *tasks = cJSON_GetObjectItemCaseSensitive(copilot, "tasks");
+        unsigned index = 0;
+        memset(s_copilot_task_ids, 0, sizeof(s_copilot_task_ids));
+        for (cJSON *task = tasks ? tasks->child : NULL; task && index < 6; task = task->next, index++) {
+            companion_note(s_companion_list, json_text(task, "project"));
+            companion_note(s_companion_list, json_text(task, "title"));
+            companion_note(s_companion_list, json_text(task, "status"));
+            companion_note(s_companion_list, json_text(task, "summary"));
+            const char *state = json_text(task, "status");
+            if (!strcmp(state, "working") || !strcmp(state, "waiting") || !strcmp(state, "stopping")) {
+                strlcpy(s_copilot_task_ids[index], json_text(task, "id"), sizeof(s_copilot_task_ids[index]));
+                if (strcmp(state, "stopping")) button(s_companion_list, "Stop this Copilot task", COLOR_DANGER,
+                                                    on_stop_copilot, (void *)(uintptr_t)index);
+            }
+        }
+        if (!cJSON_GetArraySize(tasks)) note(s_companion_list, "Enter work in the Gadget Copilot terminal.");
+        row(s_companion_list, NULL, "Refresh tasks", NULL, on_companion_action, "status");
+    }
+    if (s_companion_section == COMPANION_TASKS) {
+        row(s_companion_list, NULL, "Add priority", NULL, on_task_add, NULL);
+        cJSON *tasks = cJSON_GetObjectItemCaseSensitive(root, "tasks");
+        unsigned index = 0;
+        memset(s_task_ids, 0, sizeof(s_task_ids));
+        for (cJSON *task = tasks ? tasks->child : NULL; task && index < 12; task = task->next, index++) {
+            companion_note(s_companion_list, json_text(task, "title"));
+            strlcpy(s_task_ids[index], json_text(task, "id"), sizeof(s_task_ids[index]));
+            row(s_companion_list, NULL, !strcmp(json_text(task, "state"), "open") ? "Mark completed" : "Reopen task",
+                NULL, on_task_state, (void *)(uintptr_t)index);
+            row(s_companion_list, NULL, "Delete task (tap twice)", NULL, on_task_delete, (void *)(uintptr_t)index);
+        }
+        cJSON *offset = cJSON_GetObjectItemCaseSensitive(root, "task_offset");
+        s_task_offset = cJSON_IsNumber(offset) && offset->valuedouble >= 0 && offset->valuedouble <= 192 ?
+                        (int)offset->valuedouble : 0;
+        if (s_task_offset) row(s_companion_list, NULL, "Previous tasks", NULL, on_task_page, (void *)(intptr_t)-12);
+        if (cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "task_more")))
+            row(s_companion_list, NULL, "More tasks", NULL, on_task_page, (void *)(intptr_t)12);
+        note(s_companion_list, "Local priorities are included in routines; saving does not start computer work.");
+    }
+    if (s_companion_section == COMPANION_ROUTINES) {
+        switch_row_data(s_companion_list, "Morning summary", cJSON_IsTrue(
+            cJSON_GetObjectItemCaseSensitive(settings, "briefing_enabled")), on_companion_switch, "briefing_enabled");
+        switch_row_data(s_companion_list, "Evening summary", cJSON_IsTrue(
+            cJSON_GetObjectItemCaseSensitive(settings, "evening_enabled")), on_companion_switch, "evening_enabled");
+        char time_text[80];
+        cJSON *hour = cJSON_GetObjectItemCaseSensitive(settings, "hour");
+        cJSON *minute = cJSON_GetObjectItemCaseSensitive(settings, "minute");
+        if (cJSON_IsNumber(hour) && cJSON_IsNumber(minute))
+            snprintf(time_text, sizeof(time_text), "Morning %02.0f:%02.0f - edit",
+                     hour->valuedouble, minute->valuedouble);
+        else strlcpy(time_text, "Morning --:-- - refresh", sizeof(time_text));
+        row(s_companion_list, NULL, time_text, NULL, on_routine_time, NULL);
+        hour = cJSON_GetObjectItemCaseSensitive(settings, "evening_hour");
+        minute = cJSON_GetObjectItemCaseSensitive(settings, "evening_minute");
+        if (cJSON_IsNumber(hour) && cJSON_IsNumber(minute))
+            snprintf(time_text, sizeof(time_text), "Evening %02.0f:%02.0f - edit",
+                     hour->valuedouble, minute->valuedouble);
+        else strlcpy(time_text, "Evening --:-- - refresh", sizeof(time_text));
+        row(s_companion_list, NULL, time_text, NULL, on_routine_time, (void *)1);
+        row(s_companion_list, NULL, "Build morning now", NULL, on_companion_action, "briefing");
+        row(s_companion_list, NULL, "Build evening now", NULL, on_companion_action, "evening");
+        companion_note(s_companion_list, json_text(cJSON_GetObjectItemCaseSensitive(root, "evening"), "body"));
+        switch_row_data(s_companion_list, "Meeting preparation notes", cJSON_IsTrue(
+            cJSON_GetObjectItemCaseSensitive(settings, "meeting_prep_enabled")), on_companion_switch, "meeting_prep_enabled");
+        cJSON *meetings = cJSON_GetObjectItemCaseSensitive(root, "meetings");
+        unsigned index = 0;
+        for (cJSON *meeting = meetings ? meetings->child : NULL; meeting && index < 6; meeting = meeting->next, index++) {
+            strlcpy(s_meeting_keys[index], json_text(meeting, "key"), sizeof(s_meeting_keys[index]));
+            companion_note(s_companion_list, json_text(meeting, "title"));
+            row(s_companion_list, NULL, "Edit preparation note", NULL, on_meeting_note, (void *)(uintptr_t)index);
+        }
+        note(s_companion_list, "Mac-local time; shared calendar quiet hours. Catch-up is limited to one hour. "
+             "Meeting notes use existing selected-calendar alerts and expire at event start.");
+    }
     if (s_companion_section == COMPANION_DETAILS && s_companion_detail[0]) {
         companion_note(s_companion_list, s_companion_detail);
     }
@@ -1872,6 +2178,10 @@ static void fill_companion(void)
              "Copilot requests wake and chime once. Hold Talk to respond; no always-listening voice commands.");
         note(s_companion_list, "DASHBOARD");
         note(s_companion_list, muse_wifi_connected() ? "Wi-Fi: connected" : "Wi-Fi: offline");
+        companion_note(s_companion_list, muse_openai_bridge_status());
+        cJSON *copilot = cJSON_GetObjectItemCaseSensitive(root, "copilot");
+        companion_note(s_companion_list, json_text(copilot, "state"));
+        note(s_companion_list, "Bonjour follows Mac address changes. Controller recovery starts a fresh lease; old decisions are never replayed.");
         cJSON *connectivity = cJSON_GetObjectItemCaseSensitive(root, "connectivity");
         char text[160];
         snprintf(text, sizeof(text), "Gateway: %s\nNormal Chrome: %s\nChecks cached for up to 60 seconds.",
@@ -2017,6 +2327,16 @@ void muse_settings_ui_open_companion(const char *detail)
 void muse_settings_ui_open_companion_reminders(void)
 {
     open_companion_section(COMPANION_REMINDERS, NULL);
+}
+
+void muse_settings_ui_open_copilot(void)
+{
+    open_companion_section(COMPANION_COPILOT, NULL);
+}
+
+void muse_settings_ui_open_conversation(void)
+{
+    open_companion_section(COMPANION_CONVERSATION, NULL);
 }
 
 void muse_settings_ui_open_companion_briefing(const char *detail)

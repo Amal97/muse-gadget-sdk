@@ -36,3 +36,5 @@ bool muse_settings_ui_in_subpage(void);
 void muse_settings_ui_open_companion(const char *detail);
 void muse_settings_ui_open_companion_reminders(void);
 void muse_settings_ui_open_companion_briefing(const char *detail);
+void muse_settings_ui_open_copilot(void);
+void muse_settings_ui_open_conversation(void);

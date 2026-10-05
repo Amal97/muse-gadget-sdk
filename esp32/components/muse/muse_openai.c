@@ -66,6 +66,7 @@ static unsigned s_companion_version;
 static char s_reply_arm[33], s_record_reply[33];
 static char s_copilot_focus[33], s_record_copilot[33];
 static muse_notification_t s_draft_notice;
+static atomic_int s_bridge_state;
 #endif
 
 typedef enum { JOB_VOICE, JOB_TEXT, JOB_TEST, JOB_NOTIFICATION, JOB_COMPANION } job_kind_t;
@@ -221,6 +222,7 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
                     char *json, size_t json_cap, bool speech, bool openclaw, char *why, size_t why_cap)
 {
     bool ok = false;
+    int status = 0;
     char url[MUSE_OPENCLAW_URL_MAX + 1];
     snprintf(url, sizeof(url), "https://api.openai.com/v1/%s", path);
     char *auth = malloc(MUSE_TOKEN_MAX + 8);
@@ -304,11 +306,11 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
         request_error(openclaw, "RESPONSE TIMEOUT", why, why_cap);
         goto cleanup;
     }
-    int status = esp_http_client_get_status_code(client);
+    status = esp_http_client_get_status_code(client);
     if (status < 200 || status >= 300) {
         http_error(status, openclaw, why, why_cap);
 #if CONFIG_MUSE_OPENCLAW
-        if (openclaw && job->copilot_target[0]) copilot_http_error(client, why, why_cap);
+        if (openclaw && !strcmp(path, "companion")) copilot_http_error(client, why, why_cap);
 #endif
         goto cleanup;
     }
@@ -364,6 +366,11 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
     if (!speech) json[used] = '\0';
     ok = current(job->generation);
 cleanup:
+#if CONFIG_MUSE_OPENCLAW
+    if (openclaw && current(job->generation))
+        atomic_store(&s_bridge_state, status == 401 || status == 403 ? 2 :
+                     status >= 200 && status < 500 ? 1 : -1);
+#endif
     if (client) {
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
@@ -643,6 +650,15 @@ bool muse_openai_companion_command(const char *json)
 bool muse_openai_companion_busy(void)
 {
     return atomic_load(&s_busy);
+}
+
+const char *muse_openai_bridge_status(void)
+{
+    if (!muse_wifi_connected()) return "Wi-Fi offline";
+    if (!muse_settings_openclaw_token_set()) return "Not configured";
+    int state = atomic_load(&s_bridge_state);
+    return state == 1 ? "HTTPS reachable" : state == 2 ? "Authentication failed" :
+           state < 0 ? "Unreachable - reconnecting" : "Not checked";
 }
 
 bool muse_openai_reply_begin(const char *notification_id)
@@ -1022,7 +1038,8 @@ static void poll_notifications(void)
                 (!strcmp(kind->valuestring, "imessage") || !strcmp(kind->valuestring, "reminder")
                  || !strcmp(kind->valuestring, "briefing") || !strcmp(kind->valuestring, "job")
                  || !strcmp(kind->valuestring, "calendar") || !strcmp(kind->valuestring, "copilot_allow")
-                 || !strcmp(kind->valuestring, "copilot_ask"))))
+                 || !strcmp(kind->valuestring, "copilot_ask") || !strcmp(kind->valuestring, "copilot_done")
+                 || !strcmp(kind->valuestring, "copilot_fail"))))
             && (!full || (cJSON_IsString(full) && strlen(full->valuestring) < sizeof(next.body)))
             && (!copilot || (cJSON_IsBool(respondable) && cJSON_IsString(full) && full->valuestring[0]))
             && (!(copilot || (cJSON_IsString(kind) && !strcmp(kind->valuestring, "calendar"))) ||

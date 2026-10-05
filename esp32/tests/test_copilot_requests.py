@@ -40,6 +40,47 @@ class CopilotRequestsTest(unittest.TestCase):
     def take(self, request_id="b" * 32):
         return self.store.controller({"action": "take", "controller": self.controller, "id": request_id})
 
+    def task(self, task_id="9" * 32):
+        return self.store.controller({"action": "task_begin", "controller": self.controller,
+                                     "id": task_id, "session": "test-session", "title": "Review a harmless fixture"})
+
+    def test_task_lifecycle_waiting_stop_and_completion_are_request_bound(self):
+        self.task()
+        self.assertEqual(self.store.status()["tasks"][0]["status"], "working")
+        self.create()
+        self.assertEqual(self.store.status()["tasks"][0]["status"], "waiting")
+        self.store.stop_task("9" * 32)
+        heartbeat = self.store.controller({"action": "heartbeat", "controller": self.controller})
+        self.assertEqual(heartbeat["stop_tasks"], ["9" * 32])
+        self.assertEqual(self.take()["state"], "cancelled")
+        self.store.controller({"action": "task_update", "controller": self.controller,
+                               "id": "9" * 32, "status": "cancelled", "summary": "SDK abort acknowledged"})
+        self.assertEqual(self.store.status()["tasks"][0]["status"], "cancelled")
+        with self.assertRaises(ValueError):
+            self.store.stop_task("9" * 32)
+        self.task("8" * 32)
+        self.store.controller({"action": "task_update", "controller": self.controller,
+                               "id": "8" * 32, "status": "completed", "summary": "Fixture reviewed"})
+        notice = self.store.poll()["notification"]
+        self.assertEqual(notice["kind"], "copilot_done")
+        self.assertFalse(notice["respondable"])
+        self.assertTrue(self.store.owns_ack(notice["id"]))
+        self.assertIsNone(self.store.poll(notice["id"])["notification"])
+
+    def test_task_disconnect_is_interrupted_not_replayed_and_ids_are_unique(self):
+        self.task()
+        with self.assertRaises(ValueError):
+            self.task()
+        with self.assertRaises(ValueError):
+            self.create("9" * 32)
+        self.now += copilot.LEASE_SECONDS
+        status = self.store.status()
+        self.assertEqual(status["state"], "offline")
+        self.assertEqual(status["tasks"][0]["status"], "interrupted")
+        self.assertEqual(self.store.poll()["notification"]["kind"], "copilot_fail")
+        self.store.controller({"action": "open", "controller": "7" * 32, "workspace": "/safe/project"})
+        self.assertEqual(self.store.status()["tasks"][0]["status"], "interrupted")
+
     def test_notification_shape_complete_body_and_preview_byte_budget(self):
         content = "x" * 2047
         self.create(body=content)

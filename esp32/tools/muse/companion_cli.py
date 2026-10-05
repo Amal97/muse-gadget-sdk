@@ -26,12 +26,16 @@ def call(body: dict, state: Path = STATE, *, controller: bool = False) -> dict:
     endpoint = urlsplit(json.loads(row[0]))
     if endpoint.scheme != "https" or endpoint.path != "/v1/companion" or endpoint.query or (
             endpoint.username or endpoint.password or not endpoint.hostname
-            or not ipaddress.ip_address(endpoint.hostname).is_private):
+            or not endpoint.hostname.lower().endswith(".local") and
+            not ipaddress.ip_address(endpoint.hostname).is_private):
         raise ValueError("Invalid private companion endpoint.")
     path = "/v1/copilot/controller" if controller else endpoint.path
     token = json.loads((state / "copilot-controller.json").read_text())["token"] if controller else config["device_token"]
     context = ssl.create_default_context(cafile=str(state / "ca.pem"))
-    raw = socket.create_connection((endpoint.hostname, endpoint.port or 8765), timeout=30)
+    addresses = socket.getaddrinfo(endpoint.hostname, endpoint.port or 8765, socket.AF_INET, socket.SOCK_STREAM)
+    if not addresses or any(not ipaddress.ip_address(address[4][0]).is_private for address in addresses):
+        raise ValueError("Companion hostname did not resolve to a private address.")
+    raw = socket.create_connection(addresses[0][4], timeout=30)
     try:
         tls = context.wrap_socket(raw, server_hostname="muse-openclaw.local")
     except (OSError, ValueError):

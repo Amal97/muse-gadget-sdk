@@ -75,10 +75,12 @@ void muse_home_format(muse_home_view_t *view, const cJSON *root, time_t now,
     memset(view, 0, sizeof(*view));
     bool clock_ready = now >= 1700000000 && offset != INT32_MAX;
     struct tm local;
+    int local_hour = -1;
     time_t shifted = clock_ready ? now + offset : 0;
     if (clock_ready && gmtime_r(&shifted, &local)) {
         strftime(view->time, sizeof(view->time), "%H:%M", &local);
         strftime(view->date, sizeof(view->date), "%a, %d %b", &local);
+        local_hour = local.tm_hour;
     } else {
         snprintf(view->time, sizeof(view->time), "--:--");
         snprintf(view->date, sizeof(view->date), "Waiting for local time");
@@ -128,6 +130,11 @@ void muse_home_format(muse_home_view_t *view, const cJSON *root, time_t now,
         snprintf(view->reminder_detail, sizeof(view->reminder_detail), "Tap to view reminders and timers");
     }
     const cJSON *briefing = cJSON_GetObjectItemCaseSensitive(root, "briefing");
+    const cJSON *evening = cJSON_GetObjectItemCaseSensitive(root, "evening");
+    if (*muse_home_text(evening, "summary") && clock_ready && local_hour >= 17) {
+        briefing = evening;
+        view->evening = true;
+    }
     const char *summary = muse_home_text(briefing, "summary");
     if (*summary) preview(view->briefing, sizeof(view->briefing), summary);
     else snprintf(view->briefing, sizeof(view->briefing), "%s",
@@ -144,9 +151,20 @@ void muse_home_format(muse_home_view_t *view, const cJSON *root, time_t now,
         }
     }
     const cJSON *served = cJSON_GetObjectItemCaseSensitive(root, "served_at");
+    const cJSON *copilot = cJSON_GetObjectItemCaseSensitive(root, "copilot");
+    const cJSON *task = cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(copilot, "tasks"), 0);
+    const char *task_state = muse_home_text(task, "status");
+    const cJSON *task_updated = cJSON_GetObjectItemCaseSensitive(task, "updated_at");
+    bool active = !strcmp(task_state, "working") || !strcmp(task_state, "waiting") || !strcmp(task_state, "stopping");
+    view->task_visible = cJSON_IsObject(task) && (active || (cJSON_IsNumber(task_updated) &&
+        now >= task_updated->valuedouble && now - task_updated->valuedouble < 600));
+    if (view->task_visible) snprintf(view->copilot, sizeof(view->copilot), "%s / %s\n%.160s",
+        muse_home_text(task, "project"), task_state, muse_home_text(task, "summary"));
     if (!wifi_connected) snprintf(view->footer, sizeof(view->footer), "Wi-Fi offline / cached info");
     else if (!cJSON_IsNumber(served)) snprintf(view->footer, sizeof(view->footer), "Connecting to your Mac...");
     else if (now >= 1700000000 && now - served->valuedouble > 90)
         snprintf(view->footer, sizeof(view->footer), "Mac offline / cached info");
+    else if (cJSON_IsObject(copilot)) snprintf(view->footer, sizeof(view->footer), "Mac live / Copilot %s",
+                                             muse_home_text(copilot, "state"));
     else snprintf(view->footer, sizeof(view->footer), "Live from your Mac");
 }

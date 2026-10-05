@@ -15,6 +15,7 @@ from collections.abc import Iterator
 
 from openclaw_jobs import identifier
 from openclaw_messages import preview
+import copilot_tasks
 
 LEASE_SECONDS = 20
 REQUEST_SECONDS = 600
@@ -60,6 +61,7 @@ class CopilotRequests:
                        "session TEXT NOT NULL,kind TEXT NOT NULL,body TEXT NOT NULL,choices TEXT NOT NULL,"
                        "freeform INTEGER NOT NULL,respondable INTEGER NOT NULL,expires REAL NOT NULL,"
                        "state TEXT NOT NULL,result TEXT)")
+            copilot_tasks.initialize(db)
             self._interrupt(db)
 
     @contextmanager
@@ -70,6 +72,7 @@ class CopilotRequests:
                 yield db
 
     def _interrupt(self, db: sqlite3.Connection) -> None:
+        copilot_tasks.interrupt(db, all_controllers=True)
         db.execute("UPDATE requests SET state='interrupted',result=NULL "
                    "WHERE state IN ('pending','answered')")
         db.execute("DELETE FROM controllers")
@@ -84,6 +87,7 @@ class CopilotRequests:
                    "WHERE state IN ('pending','answered') AND (expires<=? OR controller NOT IN "
                    "(SELECT id FROM controllers WHERE lease>?))", (now, now))
         db.execute("DELETE FROM controllers WHERE lease<=?", (now,))
+        copilot_tasks.interrupt(db)
         db.execute("DELETE FROM requests WHERE expires<? AND state NOT IN ('pending','answered')",
                    (now - 7 * 86400,))
 
@@ -113,16 +117,22 @@ class CopilotRequests:
             key = self._controller(db, body.get("controller"))
             if action == "heartbeat" and set(body) == {"action", "controller"}:
                 db.execute("UPDATE controllers SET lease=? WHERE id=?", (time.time() + LEASE_SECONDS, key))
-                return {"controller": key}
+                return {"controller": key, "stop_tasks": [row[0] for row in db.execute(
+                    "SELECT id FROM copilot_tasks WHERE controller=? AND status='stopping'", (key,))]}
+            if action in ("task_begin", "task_update"):
+                return copilot_tasks.producer(db, key, body, text)
             if action == "close" and set(body) == {"action", "controller"}:
                 db.execute("UPDATE requests SET state='cancelled',result=NULL "
                            "WHERE controller=? AND state IN ('pending','answered')", (key,))
                 db.execute("DELETE FROM controllers WHERE id=?", (key,))
+                copilot_tasks.interrupt(db)
                 return {"closed": True}
             if action == "create" and set(body) == {
                     "action", "controller", "id", "session", "kind", "body",
                     "choices", "allow_freeform", "respondable"}:
                 request_id = identifier(body["id"])
+                if db.execute("SELECT 1 FROM copilot_tasks WHERE id=?", (request_id,)).fetchone():
+                    raise ValueError("Copilot identifier already belongs to a task.")
                 session = text(body["session"], 128)
                 kind = body["kind"]
                 if kind not in ("permission", "question"):
@@ -250,11 +260,26 @@ class CopilotRequests:
 
     def owns_ack(self, ack: str) -> bool:
         with self.lock, self.connect() as db:
-            return bool(ack and db.execute("SELECT 1 FROM requests WHERE id=?", (ack,)).fetchone())
+            return bool(ack and (db.execute("SELECT 1 FROM requests WHERE id=?", (ack,)).fetchone() or
+                                db.execute("SELECT 1 FROM copilot_tasks WHERE id=?", (ack,)).fetchone()))
+
+    def status(self) -> dict:
+        with self.lock, self.connect() as db:
+            self._expire(db)
+            return copilot_tasks.snapshot(db)
+
+    def stop_task(self, task_id: object) -> dict:
+        with self.lock, self.connect() as db:
+            self._expire(db)
+            return copilot_tasks.stop(db, task_id)
 
     def poll(self, ack: str = "") -> dict:
         with self.lock, self.connect() as db:
             self._expire(db)
+            if ack:
+                if db.execute("SELECT 1 FROM copilot_tasks WHERE id=?", (identifier(ack),)).fetchone():
+                    db.execute("UPDATE copilot_tasks SET ack=1 WHERE id=?", (ack,))
+                    ack = ""
             if ack:
                 row = db.execute("SELECT * FROM requests WHERE id=?", (identifier(ack),)).fetchone()
                 if row is None:
@@ -268,7 +293,7 @@ class CopilotRequests:
             row = db.execute("SELECT requests.*,controllers.workspace FROM requests JOIN controllers "
                              "ON controllers.id=requests.controller WHERE state='pending' ORDER BY seq LIMIT 1").fetchone()
             if row is None:
-                return {"notification": None}
+                return copilot_tasks.notification(db)
             return {"notification": {
                 "id": row["id"], "kind": "copilot_allow" if row["kind"] == "permission" else "copilot_ask",
                 "sender": "Copilot approval" if row["kind"] == "permission" else "Copilot question",
