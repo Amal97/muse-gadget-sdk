@@ -557,8 +557,11 @@ Glyph rendering depends on the board's fonts.
 
 Hybrid touch displays at least 320x320 start on a **Home** information screen:
 local time/date, current weather, the next gadget reminder or active local
-timer, and a daily briefing preview. The black, lavender and pixel-heading
-theme matches Muse. Swipe left for **Muse**, then left again for **Settings**;
+timer, and a daily briefing preview. The website's illustrated dark/lavender
+design is adapted to live data: a large clock, subdued date, minimal weather
+row, and rounded reminder and briefing/Copilot cards. Smaller screens use
+shorter previews, with full details available by tapping. Swipe left for
+**Muse**, then left again for **Settings**;
 swipe right to return. Manually selecting Home or Muse remembers that screen
 across reboots. Settings is not saved as the default. Voice temporarily shows
 Muse and returns to your selection when idle; manually swiping during a turn

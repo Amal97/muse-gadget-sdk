@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def function(source, name):
-    match = re.search(r"static (?:unsigned|void|int) " + name + r"\([^)]*\)\n\{", source)
+    match = re.search(r"static (?:unsigned |void |int |lv_obj_t \*)" + name + r"\([^)]*\)\n\{", source)
     start = match.start()
     brace = source.index("{", start)
     depth = 1

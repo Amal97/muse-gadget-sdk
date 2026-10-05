@@ -155,6 +155,11 @@ static int s_shown_page = -1;
 static int s_shown_speaker = -1;
 static muse_mode_t s_last_mode = MUSE_MODE_COUNT;
 #if CONFIG_MUSE_OPENCLAW
+#define HOME_BACKGROUND 0x080810
+#define HOME_PANEL 0x14101e
+#define HOME_BORDER 0x30273f
+#define HOME_ACCENT 0xc4adff
+#define HOME_MUTED 0xa79daf
 static lv_obj_t *s_home, *s_home_time, *s_home_date, *s_home_weather_title;
 static lv_obj_t *s_home_weather, *s_home_weather_detail, *s_home_reminder, *s_home_reminder_detail;
 static lv_obj_t *s_home_briefing, *s_home_briefing_title, *s_home_footer;
@@ -847,37 +852,51 @@ static void home_detail(lv_event_t *event)
     }
 }
 
-static lv_obj_t *home_card(int center_percent, intptr_t index, const char *heading,
+static lv_obj_t *home_card(int center_percent, int height_percent, intptr_t index, const char *heading,
                            lv_obj_t **title, lv_obj_t **primary, lv_obj_t **secondary)
 {
     lv_obj_t *card = lv_button_create(s_home);
-    int width = s_w * 73 / 100;
-    int height = s_h * 17 / 100;
+    bool weather = index == 0;
+    int width = s_w * 70 / 100;
+    int height = s_h * height_percent / 100;
+    bool compact = height < 72;
+    int inset = weather ? (compact ? 38 : 58) : 14;
     lv_obj_set_size(card, width, height);
     lv_obj_align(card, LV_ALIGN_TOP_MID, 0, s_h * center_percent / 100 - height / 2);
-    lv_obj_set_style_bg_color(card, lv_color_hex(COLOR_RING_BG), 0);
-    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_color(card, lv_color_hex(COLOR_DOT_OFF), 0);
-    lv_obj_set_style_border_width(card, 1, 0);
-    lv_obj_set_style_radius(card, 18, 0);
+    lv_obj_set_style_bg_color(card, lv_color_hex(HOME_PANEL), 0);
+    lv_obj_set_style_bg_opa(card, weather ? LV_OPA_TRANSP : LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(HOME_BORDER), 0);
+    lv_obj_set_style_border_width(card, weather ? 0 : 1, 0);
+    lv_obj_set_style_radius(card, 16, 0);
     lv_obj_set_style_pad_all(card, 0, 0);
     lv_obj_set_style_shadow_width(card, 0, 0);
     lv_obj_add_event_cb(card, home_detail, LV_EVENT_CLICKED, (void *)index);
-    lv_obj_t *label = make_label(card, &lv_font_montserrat_14, COLOR_ACCENT);
-    lv_obj_set_width(label, width - 28);
+    if (weather) {
+        lv_obj_t *icon = make_label(card, &lv_font_montserrat_28, HOME_ACCENT);
+        lv_label_set_text(icon, "+");
+        lv_obj_align(icon, LV_ALIGN_LEFT_MID, compact ? 12 : 20, 0);
+    }
+    lv_obj_t *label = make_label(card, &lv_font_montserrat_14, weather ? HOME_MUTED : HOME_ACCENT);
+    lv_obj_set_width(label, width - inset - 14);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_LEFT, 0);
     lv_label_set_long_mode(label, LV_LABEL_LONG_DOT);
     lv_label_set_text(label, heading);
-    lv_obj_align(label, LV_ALIGN_TOP_LEFT, 14, 7);
+    lv_obj_align(label, LV_ALIGN_TOP_LEFT, inset, compact ? 3 : 7);
     if (title) *title = label;
-    *primary = make_label(card, secondary ? &lv_font_montserrat_20 : &lv_font_montserrat_14, COLOR_LIT);
-    lv_obj_set_size(*primary, width - 28, secondary ? 25 : 38);
+    *primary = make_label(card, compact ? &lv_font_montserrat_14 : weather ? &lv_font_montserrat_16 :
+                          secondary ? &lv_font_montserrat_20 : &lv_font_montserrat_14, COLOR_LIT);
+    int primary_height = compact ? (secondary ? lv_font_montserrat_14.line_height : height - 25) :
+                         secondary ? 25 : 38;
+    lv_obj_set_size(*primary, width - inset - 14, primary_height);
+    lv_obj_set_style_text_align(*primary, LV_TEXT_ALIGN_LEFT, 0);
     lv_label_set_long_mode(*primary, LV_LABEL_LONG_DOT);
-    lv_obj_align(*primary, LV_ALIGN_TOP_LEFT, 14, 28);
+    lv_obj_align(*primary, LV_ALIGN_TOP_LEFT, inset, compact ? 21 : 28);
     if (secondary) {
-        *secondary = make_label(card, &lv_font_montserrat_14, COLOR_DIM);
-        lv_obj_set_width(*secondary, width - 28);
+        *secondary = make_label(card, &lv_font_montserrat_14, HOME_MUTED);
+        lv_obj_set_width(*secondary, width - inset - 14);
+        lv_obj_set_style_text_align(*secondary, LV_TEXT_ALIGN_LEFT, 0);
         lv_label_set_long_mode(*secondary, LV_LABEL_LONG_DOT);
-        lv_obj_align(*secondary, LV_ALIGN_TOP_LEFT, 14, 54);
+        lv_obj_align(*secondary, LV_ALIGN_TOP_LEFT, inset, compact ? 39 : 54);
     }
     return card;
 }
@@ -885,9 +904,14 @@ static lv_obj_t *home_card(int center_percent, intptr_t index, const char *headi
 static void build_home(void)
 {
     lv_obj_remove_flag(s_home, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t *heading = make_label(s_home, &lv_font_unscii_16, COLOR_ACCENT);
-    lv_label_set_text(heading, "TODAY");
-    lv_obj_align(heading, LV_ALIGN_TOP_MID, 0, s_h * 6 / 100);
+    lv_obj_set_style_bg_color(s_home, lv_color_hex(HOME_BACKGROUND), 0);
+    lv_obj_set_style_bg_opa(s_home, LV_OPA_COVER, 0);
+    s_home_date = make_label(s_home, &lv_font_montserrat_14, HOME_MUTED);
+    lv_label_set_text(s_home_date, "Waiting for local time");
+    lv_obj_set_size(s_home_date, s_w * 50 / 100, lv_font_montserrat_14.line_height);
+    lv_label_set_long_mode(s_home_date, LV_LABEL_LONG_DOT);
+    lv_obj_set_style_text_letter_space(s_home_date, 1, 0);
+    lv_obj_align(s_home_date, LV_ALIGN_TOP_MID, 0, s_h * 7 / 100);
 #if LV_FONT_MONTSERRAT_48
     const lv_font_t *clock_font = &lv_font_montserrat_48;
 #else
@@ -895,18 +919,38 @@ static void build_home(void)
 #endif
     s_home_time = make_label(s_home, clock_font, COLOR_LIT);
     lv_label_set_text(s_home_time, "--:--");
-    lv_obj_align(s_home_time, LV_ALIGN_TOP_MID, 0, s_h * 12 / 100);
-    s_home_date = make_label(s_home, &lv_font_montserrat_14, COLOR_CAPTION);
-    lv_label_set_text(s_home_date, "Waiting for local time");
-    lv_obj_align(s_home_date, LV_ALIGN_TOP_MID, 0, s_h * 25 / 100);
-    home_card(39, 0, "WEATHER", &s_home_weather_title, &s_home_weather, &s_home_weather_detail);
-    home_card(59, 1, "REMINDERS", NULL, &s_home_reminder, &s_home_reminder_detail);
-    home_card(78, 2, "DAILY BRIEFING", &s_home_briefing_title, &s_home_briefing, NULL);
-    s_home_footer = make_label(s_home, &lv_font_montserrat_14, COLOR_DIM);
+    lv_obj_set_style_transform_pivot_x(s_home_time, lv_pct(50), 0);
+    lv_obj_set_style_transform_pivot_y(s_home_time, 0, 0);
+    lv_obj_set_style_transform_scale(s_home_time, s_h * 384 / 466, 0); /* 150% on the 466 px display. */
+    lv_obj_align(s_home_time, LV_ALIGN_TOP_MID, 0, s_h * 13 / 100);
+    lv_obj_t *divider = lv_obj_create(s_home);
+    lv_obj_remove_flag(divider, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(divider, s_w * 52 / 100, 1);
+    lv_obj_set_style_bg_color(divider, lv_color_hex(HOME_BORDER), 0);
+    lv_obj_set_style_bg_opa(divider, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(divider, 0, 0);
+    lv_obj_align(divider, LV_ALIGN_TOP_MID, 0, s_h * 34 / 100);
+    home_card(44, 18, 0, "WEATHER", &s_home_weather_title, &s_home_weather, &s_home_weather_detail);
+    bool compact = s_h < 400;
+    home_card(compact ? 63 : 62, compact ? 18 : 16, 1, "REMINDERS",
+              NULL, &s_home_reminder, &s_home_reminder_detail);
+    home_card(compact ? 81 : 79, compact ? 15 : 17, 2, "DAILY BRIEFING",
+              &s_home_briefing_title, &s_home_briefing, NULL);
+    s_home_footer = make_label(s_home, &lv_font_montserrat_14, HOME_MUTED);
     lv_obj_set_style_text_align(s_home_footer, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_width(s_home_footer, s_w * 56 / 100);
+    lv_obj_set_size(s_home_footer, s_w * (compact ? 46 : 48) / 100, lv_font_montserrat_14.line_height);
     lv_label_set_long_mode(s_home_footer, LV_LABEL_LONG_DOT);
     lv_obj_align(s_home_footer, LV_ALIGN_TOP_MID, 0, s_h * 89 / 100);
+    for (int i = 0; i < 3; i++) {
+        lv_obj_t *dot = lv_obj_create(s_home);
+        lv_obj_remove_flag(dot, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_size(dot, 4, 4);
+        lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(dot, 0, 0);
+        lv_obj_set_style_bg_color(dot, lv_color_hex(i ? COLOR_DOT_OFF : HOME_ACCENT), 0);
+        lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        lv_obj_align(dot, LV_ALIGN_TOP_MID, (i - 1) * 10, s_h * 95 / 100);
+    }
     s_home_json = malloc(MUSE_COMPANION_SNAPSHOT_CAP);
     if (!s_home_json) {
         ESP_LOGE(TAG, "Home status buffer allocation failed");

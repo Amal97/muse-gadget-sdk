@@ -906,6 +906,12 @@ On supported hybrid touchscreens:
 - Tap Home cards for their detailed companion sections.
 - Tap notifications to expand details in place; expansion is not a Settings shortcut.
 
+Home follows the website's illustrated round-screen design: a large clock,
+subdued date, lavender weather accents, and compact rounded reminder and
+briefing/Copilot cards. These display real companion data, not the website's
+demonstration values. Cached/offline status remains visible, and smaller
+screens use shorter previews; tapping still opens the full details.
+
 **Settings > Companion** groups the following pages:
 
 | Page | Purpose |
@@ -1152,10 +1158,16 @@ Focused personal-companion regressions, from the repository root:
 PYTHONPATH=esp32/tests python3 -m unittest \
   test_personal_upgrades test_copilot_requests test_muse_copilot \
   test_muse_openclaw test_muse_openai test_muse_notifications \
-  test_muse_calendar_notifications test_companion_ui_stack test_muse_home \
+  test_muse_calendar_notifications test_companion_ui_stack test_muse_home test_muse_home_render \
   test_muse_companion test_openclaw_companion test_openclaw_jobs test_calendar_alerts
 npm --prefix esp32/tools/muse/copilot test
 ```
+
+The Home rendering regression requires CMake and a native C/C++ compiler,
+and uses the LVGL sources populated by ESP-IDF configuration. It checks
+320, 412, and 466 pixel round layouts, transformed clock bounds, card/text
+clipping and overlap, and touch callbacks. It does not emulate ESP32 memory,
+audio, or power behavior.
 
 Some host-native tests compile actual production source with fake dependencies
 and use downloaded IDF components, so build the firmware first. A passing host
