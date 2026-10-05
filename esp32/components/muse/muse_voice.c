@@ -248,13 +248,14 @@ static void take(rec_stats_t *st, const int16_t *pcm)
  */
 static bool record(bool barge_in, size_t *held, char *why, size_t cap)
 {
-    muse_state_set_mode(MUSE_MODE_LISTENING);
-    muse_state_set_progress(0);
     s_rec_n = s_sent = 0;
     s_live = s_tried = false;
+    /* Capture the displayed response target before LISTENING hides its card. */
     if (!s_rec || (muse_hatch_ready() && !s_held_count)) {
         go_live();
     }
+    muse_state_set_mode(MUSE_MODE_LISTENING);
+    muse_state_set_progress(0);
     muse_state_set_caption(s_live ? "LISTENING..." : "RECORDING...");
     bool heard = false, ok = true;
     bool gave_up = false;   /* Hatch failed this note: it's kept, and goes later */
@@ -837,7 +838,12 @@ static void voice_task(void *arg)
             set_resting(rest);
             /* On battery Wi-Fi rests with the codecs, and between turns dozes
              * between beacons as xiaozhi's idle does; a press wakes it fully. */
-            muse_wifi_power(rest ? MUSE_WIFI_REST : battery ? MUSE_WIFI_DOZE : MUSE_WIFI_FULL);
+            bool wifi_rest = rest;
+#if CONFIG_MUSE_OPENCLAW
+            if (muse_settings_copilot_watch() && muse_settings_openclaw_enabled() &&
+                muse_settings_openclaw_token_set()) wifi_rest = false;
+#endif
+            muse_wifi_power(wifi_rest ? MUSE_WIFI_REST : battery ? MUSE_WIFI_DOZE : MUSE_WIFI_FULL);
             if (rest) {
                 /* Wait for waking, USB power or a bench request without
                  * polling (the timeout is only a backstop, or a look for

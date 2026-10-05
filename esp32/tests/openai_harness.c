@@ -108,6 +108,8 @@ static void mbedtls_platform_zeroize(void *ptr, size_t size) { memset(ptr, 0, si
 static bool wifi_on = true, speaker_on = true;
 static bool asleep;
 bool muse_state_asleep(void) { return asleep; }
+bool muse_state_on_battery(void) { return true; }
+void muse_state_set_asleep(bool value) { asleep = value; }
 void muse_state_set_caption(const char *format, ...) { (void)format; }
 void muse_companion_start(void) {}
 static muse_timer_state_t timer_phase;
@@ -122,6 +124,7 @@ bool muse_timer_start(unsigned seconds) { timer_seconds = seconds; return true; 
 unsigned muse_timer_pending(void) { return timer_pending; }
 bool muse_wifi_connected(void) { return wifi_on; }
 bool muse_settings_speaker_on(void) { return speaker_on; }
+bool muse_settings_copilot_watch(void) { return false; }
 size_t muse_settings_openai_key_len(void) { return 8; }
 void muse_settings_openai_key(char *out) { strcpy(out, "test-key"); }
 static bool use_openclaw, bridge_token_set = true, bridge_changed;
@@ -579,26 +582,27 @@ static void incoming_notifications(void)
     assert(clients[0].config.timeout_ms == 2000);
     assert(clients[0].config.cert_pem == openclaw_test_root);
     assert(!strcmp(clients[0].upload, "{\"ack\":\"\"}"));
+    fixture(message, strlen(message), 200, "application/json");
     poll_notifications();
-    assert(client_count == 1);
+    assert(client_count == 2);
     muse_openai_notification_dismiss();
     assert(!muse_openai_notification(&notification));
     asleep = true;
     poll_notifications();
-    assert(client_count == 1);
+    assert(client_count == 2);
     asleep = false;
     atomic_store(&s_busy, true);
     poll_notifications();
-    assert(client_count == 1);
+    assert(client_count == 2);
     atomic_store(&s_busy, false);
     fixture("{}", 2, 503, "application/json");
     poll_notifications();
-    assert(s_notification_ack[0] && client_count == 2);
+    assert(s_notification_ack[0] && client_count == 3);
     const char empty[] = "{\"notification\":null}";
     fixture(empty, strlen(empty), 200, "application/json");
     poll_notifications();
     assert(!s_notification_ack[0] && !muse_openai_notification(&notification));
-    assert(strstr(clients[2].upload, "0123456789abcdef0123456789abcdef"));
+    assert(strstr(clients[3].upload, "0123456789abcdef0123456789abcdef"));
     const char invalid[] = "{\"notification\":{\"id\":\"bad\",\"sender\":\"x\",\"preview\":\"y\"}}";
     fixture(invalid, strlen(invalid), 200, "application/json");
     poll_notifications();
@@ -610,7 +614,7 @@ static void incoming_notifications(void)
     assert(!muse_openai_notification(&notification) && !s_notification_ack[0]);
     use_openclaw = false;
     poll_notifications();
-    assert(client_count == 5);
+    assert(client_count == 6);
 }
 static void local_timer_shortcut(void)
 {

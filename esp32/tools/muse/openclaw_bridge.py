@@ -21,6 +21,7 @@ import time
 from openclaw_messages import MessageInbox
 from openclaw_jobs import GatewayRPC, JobManager
 from openclaw_companion import Companion
+from copilot_requests import CopilotRequests
 import normal_chrome
 
 STATE = Path.home() / ".openclaw/muse-esp32"
@@ -30,6 +31,7 @@ CHAT_PATH = "/v1/chat/completions"
 NOTIFICATION_PATH = "/v1/notifications"
 JOB_PATHS = ("/v1/jobs/start", "/v1/jobs/status", "/v1/jobs/cancel")
 COMPANION_PATH = "/v1/companion"
+COPILOT_CONTROLLER_PATH = "/v1/copilot/controller"
 JSON_CAP = 32768
 TEXT_CAP = 2048
 
@@ -154,6 +156,7 @@ class BridgeServer(ThreadingHTTPServer):
         self.inbox = MessageInbox(state) if imessages else None
         self.jobs = None
         self.companion = None
+        self.copilot = None
         self.monitor_stop = threading.Event()
         self.monitor_thread = None
         self.connectivity = {"gateway": "Not checked", "browser": "Not checked", "checked_at": None}
@@ -166,6 +169,7 @@ class BridgeServer(ThreadingHTTPServer):
         if companion:
             try:
                 self.companion = Companion(state)
+                self.copilot = CopilotRequests(state)
                 host = f"[{address[0]}]" if ":" in address[0] else address[0]
                 self.companion.put("endpoint", f"https://{host}:{self.server_address[1]}{COMPANION_PATH}")
                 self.jobs = JobManager(
@@ -183,6 +187,8 @@ class BridgeServer(ThreadingHTTPServer):
                     self.jobs.close()
                 if self.companion is not None:
                     self.companion.close()
+                if self.copilot is not None:
+                    self.copilot.close()
                 super().server_close()
                 raise
         if self.inbox is not None:
@@ -201,6 +207,8 @@ class BridgeServer(ThreadingHTTPServer):
 
     def server_close(self) -> None:
         self.monitor_stop.set()
+        if self.copilot is not None:
+            self.copilot.close()
         if self.jobs is not None:
             self.jobs.close()
         if self.companion is not None:
@@ -288,11 +296,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
         server = self.server
         if not isinstance(server, BridgeServer):
             raise RuntimeError("Invalid bridge server.")
-        if self.path not in (CHAT_PATH, NOTIFICATION_PATH, COMPANION_PATH, *JOB_PATHS):
+        if self.path not in (CHAT_PATH, NOTIFICATION_PATH, COMPANION_PATH, COPILOT_CONTROLLER_PATH, *JOB_PATHS):
             self.reject(404, "Unknown bridge endpoint.")
             return
         authorization = self.headers.get("Authorization", "").encode("utf-8")
-        if not secrets.compare_digest(authorization, ("Bearer " + server.device_token).encode()):
+        controller = self.path == COPILOT_CONTROLLER_PATH
+        expected = server.copilot.token if controller and server.copilot else server.device_token
+        if controller and server.copilot is None:
+            self.reject(404, "Copilot companion is not enabled.")
+            return
+        if not secrets.compare_digest(authorization, ("Bearer " + expected).encode()):
             self.reject(401, "Invalid device token.")
             return
         if self.headers.get("Transfer-Encoding") is not None:
@@ -301,6 +314,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if self.headers.get("Content-Type", "").split(";", 1)[0].strip() != "application/json":
             self.reject(415, "Expected application/json.")
             return
+        body = None
         try:
             size = int(self.headers.get("Content-Length", "0"))
             if not 0 < size < JSON_CAP:
@@ -310,11 +324,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if len(data) != size:
                 raise ValueError("Incomplete request.")
             body = json.loads(data)
+            if controller:
+                result = server.copilot.controller(body)
+                self.send_json(200, json.dumps(result, ensure_ascii=False).encode())
+                return
             if self.path == COMPANION_PATH:
                 if server.companion is None:
                     self.reject(404, "Device companion features are not enabled.")
                     return
-                if isinstance(body, dict) and body.get("action") == "job_cancel":
+                if isinstance(body, dict) and body.get("action") == "copilot_voice":
+                    if server.copilot is None:
+                        raise RuntimeError("Copilot companion is not enabled.")
+                    result = server.copilot.device(body)
+                elif isinstance(body, dict) and body.get("action") == "job_cancel":
                     if set(body) != {"action", "id"} or server.jobs is None:
                         raise ValueError("Invalid job cancellation request.")
                     result = {"last_job": server.jobs.cancel(body["id"])}
@@ -376,14 +398,19 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if ack:
                     from openclaw_jobs import identifier
                     identifier(ack)
+                copilot_ack = bool(server.copilot and server.copilot.owns_ack(ack))
+                if copilot_ack:
+                    server.copilot.poll(ack)
                 local_ack = bool(server.companion and server.companion.owns_ack(ack))
                 if local_ack:
                     server.companion.poll(ack)
-                if ack and not local_ack:
+                if ack and not local_ack and not copilot_ack:
                     if server.inbox is None:
                         raise ValueError("Unknown notification acknowledgment.")
                     server.inbox.poll(ack)
-                result = server.companion.poll() if server.companion else {"notification": None}
+                result = server.copilot.poll() if server.copilot else {"notification": None}
+                if result["notification"] is None and server.companion:
+                    result = server.companion.poll()
                 if result["notification"] is None and server.inbox is not None:
                     result = server.inbox.poll("")
                     if server.companion and result["notification"]:
@@ -391,7 +418,11 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.send_json(200, json.dumps(result, ensure_ascii=False).encode())
                 return
             messages = validate_messages(body)
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError) as error:
+            if controller or (isinstance(body, dict) and body.get("action") == "copilot_voice"):
+                logging.warning("Invalid or stale Copilot request: %s", error)
+                self.reject(400, str(error))
+                return
             self.reject(400, "Invalid bridge request.")
             return
         except (OSError, RuntimeError, sqlite3.Error, subprocess.TimeoutExpired):

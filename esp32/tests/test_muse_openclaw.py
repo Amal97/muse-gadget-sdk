@@ -131,6 +131,46 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.request({}, path=bridge.CHAT_PATH + "?model=main")[0], 404)
         self.assertEqual(Upstream.records, [])
 
+    def test_copilot_requests_use_separate_producer_auth_and_device_response_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = bridge.CopilotRequests(Path(folder))
+            companion = Mock()
+            companion.owns_ack.return_value = False
+            companion.poll.return_value = {"notification": None}
+            controller = "c" * 32
+            with patch.object(self.server, "copilot", store), patch.object(self.server, "companion", companion):
+                opened = {"action": "open", "controller": controller, "workspace": "/safe/project"}
+                self.assertEqual(self.request(opened, path=bridge.COPILOT_CONTROLLER_PATH)[0], 401)
+                self.assertEqual(self.request(opened, path=bridge.COPILOT_CONTROLLER_PATH, token=store.token)[0], 200)
+                request = {"action": "create", "controller": controller, "id": "d" * 32, "session": "safe-session",
+                           "kind": "permission", "body": "Workspace: /safe/project\nprintf harmless",
+                           "choices": [], "allow_freeform": False, "respondable": True}
+                self.assertEqual(self.request(request, path=bridge.COPILOT_CONTROLLER_PATH, token=store.token)[0], 200)
+                code, notice = self.request({"ack": ""}, path=bridge.NOTIFICATION_PATH)
+                self.assertEqual(code, 200)
+                self.assertEqual(notice["notification"]["kind"], "copilot_allow")
+                self.assertNotIn(store.token, json.dumps(notice))
+                companion.poll.assert_not_called()
+                response = {"action": "copilot_voice", "id": "d" * 32, "text": "approve"}
+                self.assertEqual(self.request(response, path=bridge.COMPANION_PATH, token=store.token)[0], 401)
+                self.assertEqual(self.request(response, path=bridge.COMPANION_PATH)[0], 200)
+                take = {"action": "take", "controller": controller, "id": "d" * 32}
+                self.assertEqual(self.request(take, path=bridge.COPILOT_CONTROLLER_PATH, token=store.token)[1]["result"],
+                                 {"kind": "approve-once"})
+                with self.assertLogs(level="WARNING"):
+                    code, result = self.request(response, path=bridge.COMPANION_PATH)
+                self.assertEqual(code, 400)
+                self.assertIn("no longer waiting", result["error"]["message"])
+                self.assertEqual(Upstream.records, [])
+
+    def test_invalid_copilot_producer_payload_returns_an_explicit_error_not_a_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            store = bridge.CopilotRequests(Path(folder))
+            with patch.object(self.server, "copilot", store), self.assertLogs(level="WARNING"):
+                code, body = self.request("not an object", path=bridge.COPILOT_CONTROLLER_PATH, token=store.token)
+                self.assertEqual(code, 400)
+                self.assertIn("controller request", body["error"]["message"])
+
     def test_response_limit_is_enforced_at_exact_byte_boundary(self) -> None:
         companion = Mock()
         overhead = len(json.dumps({"payload": ""}).encode())

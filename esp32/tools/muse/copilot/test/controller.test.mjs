@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: Apache-2.0
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { Controller } from "../dist/controller.js";
+
+function fixture(result = { kind: "approve-once" }, customize) {
+    const records = [], logs = [], notices = [];
+    let controller;
+    const transport = async (body) => {
+        records.push(body);
+        const override = await customize?.(body, controller);
+        if (override) return override;
+        if (body.action === "create") return { id: body.id, state: "pending" };
+        if (body.action === "take") return { id: body.id, state: "answered", result };
+        return {};
+    };
+    controller = new Controller(transport, "/safe/project", (value) => notices.push(value), (value) => logs.push(value), 1);
+    return { controller, records, logs, notices };
+}
+
+test("permission callback returns only SDK approve-once, with complete scope", async () => {
+    const f = fixture();
+    await f.controller.start();
+    try {
+        const result = await f.controller.permission({ kind: "shell", fullCommandText: "printf harmless" }, "session-one");
+        assert.deepEqual(result, { kind: "approve-once" });
+        const created = f.records.find((record) => record.action === "create");
+        assert.match(created.body, /Workspace: \/safe\/project\nSession: session-one/);
+        assert.ok(created.body.indexOf("printf harmless") < created.body.indexOf("Workspace:"));
+        assert.match(created.body, /printf harmless/);
+        assert.equal(created.respondable, true);
+        assert.equal(f.notices.length, 1);
+        assert.equal(f.controller.pending.size, 0);
+    } finally { await f.controller.close(); }
+});
+
+for (const result of [{ kind: "approve-all" }, { kind: "approve-once", extra: true }, {}, { kind: "reject" }]) {
+    test(`invalid decision ${JSON.stringify(result)} fails closed`, async () => {
+        const f = fixture(result);
+        await f.controller.start();
+        try {
+            assert.equal((await f.controller.permission({ kind: "shell" }, "session")).kind, "reject");
+            assert.match(f.logs.join("\n"), /denied/);
+        } finally { await f.controller.close(); }
+    });
+}
+
+test("a bridge failure denies and cancels the request rather than leaving a ghost approval", async () => {
+    const f = fixture(undefined, (body) => { if (body.action === "take") throw new Error("Disconnected"); });
+    await f.controller.start();
+    try {
+        assert.equal((await f.controller.permission({ kind: "shell" }, "session")).kind, "reject");
+        assert.ok(f.records.some((body) => body.action === "cancel"));
+        assert.match(f.logs.join("\n"), /Disconnected/);
+    } finally { await f.controller.close(); }
+});
+
+test("losing the controller lease after take but before delivery still rejects", async () => {
+    const f = fixture(undefined, (body) => {
+        if (body.action === "cancel") throw new Error("Controller expired after bridge restart");
+    });
+    await f.controller.start();
+    try {
+        assert.equal((await f.controller.permission({ kind: "shell" }, "session")).kind, "reject");
+    } finally { await f.controller.close(); }
+});
+
+for (const state of ["expired", "cancelled", "interrupted", "consumed"]) {
+    test(`${state} request never approves`, async () => {
+        const f = fixture(undefined, (body) => body.action === "take" ? { id: body.id, state } : undefined);
+        await f.controller.start();
+        try {
+            assert.equal((await f.controller.permission({ kind: "shell" }, "session")).kind, "reject");
+        } finally { await f.controller.close(); }
+    });
+}
+
+test("wrong response ID fails closed", async () => {
+    const f = fixture(undefined, (body) => body.action === "take" ?
+        { id: "wrong", state: "answered", result: { kind: "approve-once" } } : undefined);
+    await f.controller.start();
+    try {
+        assert.equal((await f.controller.permission({ kind: "shell" }, "session")).kind, "reject");
+    } finally { await f.controller.close(); }
+});
+
+test("stopping after take but before callback delivery still rejects approval", async () => {
+    let stop = true;
+    const f = fixture(undefined, async (body, controller) => {
+        if (body.action === "cancel" && stop) {
+            stop = false;
+            await controller.cancel();
+        }
+    });
+    await f.controller.start();
+    try {
+        assert.equal((await f.controller.permission({ kind: "shell" }, "session")).kind, "reject");
+        assert.match(f.logs.join("\n"), /stopped before authorization/);
+    } finally { await f.controller.close(); }
+});
+
+test("question callback preserves exact choice and wasFreeform", async () => {
+    const f = fixture({ answer: "Detailed", wasFreeform: false });
+    await f.controller.start();
+    try {
+        assert.deepEqual(await f.controller.question({ question: "Which format?", choices: ["Short", "Detailed"], allowFreeform: false }, "session"),
+            { answer: "Detailed", wasFreeform: false });
+        assert.match(f.records.find((body) => body.action === "create").body, /1. Short\n2. Detailed/);
+        const body = f.records.find((body) => body.action === "create").body;
+        assert.ok(body.indexOf("Which format?") < body.indexOf("Workspace:"));
+    } finally { await f.controller.close(); }
+});
+
+test("freeform question callback returns human answer without an agent decision", async () => {
+    const f = fixture({ answer: "Keep the current theme", wasFreeform: true });
+    await f.controller.start();
+    try {
+        assert.deepEqual(await f.controller.question({ question: "Your preference?" }, "session"),
+            { answer: "Keep the current theme", wasFreeform: true });
+    } finally { await f.controller.close(); }
+});
+
+test("fabricated choice cannot answer the SDK's question", async () => {
+    const f = fixture({ answer: "Invented", wasFreeform: false });
+    await f.controller.start();
+    try {
+        await assert.rejects(f.controller.question({ question: "Which?", choices: ["Short"], allowFreeform: false }, "session"), /Invalid answer/);
+    } finally { await f.controller.close(); }
+});
+
+test("large or Unicode permissions are opaque, never truncated reviewable work", async () => {
+    for (const fullCommandText of ["x".repeat(3000), "echo \u202e"]) {
+        const f = fixture({ kind: "reject", feedback: "Denied" });
+        await f.controller.start();
+        try {
+            await f.controller.permission({ kind: "shell", fullCommandText }, "session");
+            const created = f.records.find((body) => body.action === "create");
+            assert.equal(created.respondable, false);
+            assert.match(created.body, /Review on the computer/);
+            assert.ok(!created.body.includes(fullCommandText));
+            assert.ok(f.notices[0].details.includes(fullCommandText));
+        } finally { await f.controller.close(); }
+    }
+});
+
+test("desktop choices survive an opaque gadget preview", async () => {
+    const choices = Array.from({ length: 20 }, (_, i) => `Option ${i}`);
+    const f = fixture({ answer: choices[19], wasFreeform: false });
+    await f.controller.start();
+    try {
+        await f.controller.question({ question: "Which?", choices, allowFreeform: false }, "session");
+        const created = f.records.find((body) => body.action === "create");
+        assert.equal(created.respondable, false);
+        assert.deepEqual(created.choices, choices);
+    } finally { await f.controller.close(); }
+});

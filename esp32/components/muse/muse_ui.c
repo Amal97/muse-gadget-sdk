@@ -168,6 +168,8 @@ static lv_obj_t *s_notification_backdrop, *s_notification_card, *s_notification_
 static lv_obj_t *s_stop_job;
 static lv_obj_t *s_notification_action, *s_notification_action_label, *s_notification_hint;
 static lv_obj_t *s_notification_details, *s_notification_dismiss;
+static lv_obj_t *s_notification_dismiss_label;
+static char s_copilot_chimed[33];
 static bool s_notification_expanded;
 static char s_notification_text[2048];
 static muse_notification_t s_shown_notification;
@@ -1308,6 +1310,10 @@ static void notification_content(void)
                       (!strcmp(s_shown_notification.kind, "reply_wait") ? "Collapse / hold Talk to reply" :
                        "Tap here to collapse") : !strcmp(s_shown_notification.kind, "reply_wait") ?
                       "Hold talk to dictate; not sent" : "Tap text to read details");
+    if (!strncmp(s_shown_notification.kind, "copilot_", 8)) {
+        lv_label_set_text(s_notification_hint, !s_shown_notification.respondable ? "Review on computer" :
+            !strcmp(s_shown_notification.kind, "copilot_allow") ? "Hold Talk: approve / deny" : "Hold Talk: answer / option number");
+    }
 }
 
 static void open_notification(lv_event_t *e)
@@ -1320,7 +1326,10 @@ static void open_notification(lv_event_t *e)
 static void notification_action(lv_event_t *e)
 {
     (void)e;
-    if (!strcmp(s_shown_notification.kind, "imessage")) {
+    if (!strncmp(s_shown_notification.kind, "copilot_", 8)) {
+        notification_layout(true);
+        muse_state_poke();
+    } else if (!strcmp(s_shown_notification.kind, "imessage")) {
         muse_openai_reply_begin(s_shown_notification.id);
         s_notification_seconds = 0;
     } else if (!strcmp(s_shown_notification.kind, "timer")) {
@@ -1360,7 +1369,10 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
     s_notification_tick = now;
     bool available = muse_openai_notification(&notification);
     bool timer = available && !strcmp(notification.kind, "timer");
-    if (!available || (!timer && (!visible || mode != MUSE_MODE_IDLE))) {
+    bool copilot = available && !strncmp(notification.kind, "copilot_", 8);
+    bool focused = copilot && mode == MUSE_MODE_IDLE && !timer;
+    muse_openai_copilot_focus(focused ? notification.id : NULL);
+    if (!available || (!timer && ((!visible && !copilot) || mode != MUSE_MODE_IDLE))) {
         if (s_notification_expanded) notification_layout(false);
         lv_obj_add_flag(s_notification_card, LV_OBJ_FLAG_HIDDEN);
         return;
@@ -1374,19 +1386,24 @@ static void update_notification(muse_mode_t mode, float now, bool visible)
     const char *action = !strcmp(notification.kind, "imessage") ? "Reply" :
         (!strcmp(notification.kind, "timer") || !strcmp(notification.kind, "reminder") ||
          !strcmp(notification.kind, "calendar")) ? "Snooze 5m" :
-        (!strcmp(notification.kind, "reply") || !strcmp(notification.kind, "timer_replace")) ? "Review" : NULL;
+        (copilot || !strcmp(notification.kind, "reply") || !strcmp(notification.kind, "timer_replace")) ? "Review" : NULL;
+    lv_label_set_text(s_notification_dismiss_label, copilot ?
+        (!strcmp(notification.kind, "copilot_allow") ? "Deny" : "Skip") : "Dismiss");
     if (action) {
         lv_label_set_text(s_notification_action_label, action);
         lv_obj_remove_flag(s_notification_action, LV_OBJ_FLAG_HIDDEN);
     } else lv_obj_add_flag(s_notification_action, LV_OBJ_FLAG_HIDDEN);
     if (strcmp(notification.id, s_notification_id)) {
-        notification_layout(false);
+        notification_layout(copilot);
         strlcpy(s_notification_id, notification.id, sizeof(s_notification_id));
         home_set_text(s_notification_sender, notification.sender);
         s_notification_seconds = 0;
         elapsed = 0;
         if (muse_settings_speaker_on() && (mode == MUSE_MODE_IDLE || (timer && mode == MUSE_MODE_THINKING))) {
-            muse_voice_request_chirp();
+            if (!copilot || strcmp(notification.id, s_copilot_chimed)) {
+                muse_voice_request_chirp();
+                if (copilot) strlcpy(s_copilot_chimed, notification.id, sizeof(s_copilot_chimed));
+            }
             s_alarm_chirp = now;
         }
         ESP_LOGI(TAG, "iMessage notification displayed");
@@ -1463,6 +1480,7 @@ static void build_notification(lv_obj_t *parent)
     lv_obj_set_ext_click_area(dismiss, s_small ? 0 : 16);
     lv_obj_add_event_cb(dismiss, dismiss_notification, LV_EVENT_CLICKED, NULL);
     lv_obj_t *dismiss_label = make_label(dismiss, FONT_COMPACT, COLOR_CAPTION);
+    s_notification_dismiss_label = dismiss_label;
     lv_label_set_text(dismiss_label, "Dismiss");
     lv_obj_center(dismiss_label);
     s_notification_action = lv_button_create(s_notification_card);

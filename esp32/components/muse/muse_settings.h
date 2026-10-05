@@ -57,6 +57,7 @@ void muse_settings_set_listener(muse_setting_cb_t cb);
 
 int muse_settings_volume(void);         /* 0..100 */
 bool muse_settings_speaker_on(void);    /* off: replies are shown, not played */
+bool muse_settings_copilot_watch(void);
 int muse_settings_mic_gain(void);       /* dB, 0..MUSE_MIC_GAIN_MAX */
 int muse_settings_brightness(void);     /* 10..100 */
 int muse_settings_sleep_s(void);        /* 0 = never */
@@ -85,6 +86,7 @@ esp_err_t muse_settings_set_openclaw_token(const char *token);
 
 void muse_settings_set_volume(int pct);
 void muse_settings_set_speaker_on(bool on);
+void muse_settings_set_copilot_watch(bool on);
 void muse_settings_set_mic_gain(int db);
 void muse_settings_set_brightness(int pct);
 void muse_settings_set_sleep_s(int secs);

@@ -107,6 +107,7 @@ static atomic_bool s_busy;
 static muse_notification_t s_notification,s_draft_notice;
 static char s_notification_ack[33],s_reply_arm[33],sent_ack[33];
 static bool asleep,online=true,dismiss_during_request;
+static bool watch;
 static unsigned replacement;
 static muse_timer_state_t timer_state;
 static time_t clock_time=1700000000;
@@ -119,8 +120,11 @@ unsigned muse_timer_pending(void){return replacement;}
 muse_timer_state_t muse_timer_status(unsigned *out){if(out)*out=0;return timer_state;}
 static bool openclaw_chat(void){return true;}
 static bool muse_settings_openclaw_token_set(void){return true;}
+static bool muse_settings_copilot_watch(void){return watch;}
+static void muse_state_set_asleep(bool value){asleep=value;}
 static bool muse_wifi_connected(void){return online;}
 static bool muse_state_asleep(void){return asleep;}
+static bool muse_state_on_battery(void){return true;}
 static int muse_state_mode(float *out){(void)out;return MUSE_MODE_IDLE;}
 static bool current(unsigned generation){return generation==atomic_load(&s_generation);}
 static size_t fake_strlcpy(char *out,const char *text,size_t cap){
@@ -148,6 +152,24 @@ int main(void){
     online=true;poll_notifications();assert(requests==1);
     assert(muse_openai_notification(&out) && !strcmp(out.kind,"calendar"));
     assert(out.expires_at==1700000600 && !strcmp(out.body,"Full event"));
+    response="{\"notification\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+        "\"kind\":\"copilot_allow\",\"sender\":\"Copilot approval\",\"preview\":\"Review work\","
+        "\"body\":\"Workspace: /safe/project\\nprintf harmless\","
+        "\"expires_at\":1700000600,\"respondable\":true}}";
+    strlcpy(s_reply_arm,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",sizeof(s_reply_arm));
+    watch=true;asleep=true;poll_notifications();
+    assert(!asleep && !s_reply_arm[0]);
+    assert(muse_openai_notification(&out) && !strcmp(out.kind,"copilot_allow") && out.respondable);
+    int before=requests;poll_notifications();assert(requests==before+1);
+    response="{\"notification\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+        "\"kind\":\"copilot_ask\",\"sender\":\"Copilot question\",\"preview\":\"Question\","
+        "\"body\":\"Full question\",\"expires_at\":1700000600}}";
+    int old_warnings=warnings;poll_notifications();assert(warnings==old_warnings+1);
+    response="{\"notification\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+        "\"kind\":\"copilot_allow\",\"sender\":\"Copilot approval\",\"preview\":\"Review work\","
+        "\"body\":\"hidden \\u202ecommand\",\"expires_at\":1700000600,\"respondable\":true}}";
+    old_warnings=warnings;poll_notifications();assert(warnings==old_warnings+1);
+    watch=false;
     response="{\"notification\":null}";poll_notifications();
     assert(!muse_openai_notification(&out));
     response="{\"notification\":{\"id\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
@@ -170,6 +192,7 @@ int main(void){
     assert(!strcmp(s_notification_ack,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
     response="{\"notification\":null}";poll_notifications();
     assert(!strcmp(sent_ack,"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa") && !s_notification_ack[0]);
+    old_warnings=warnings;
     const char *invalid[]={
         "{\"notification\":{\"id\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"kind\":\"calendar\","
         "\"sender\":\"Calendar\",\"preview\":\"Upcoming\"}}",
@@ -181,7 +204,7 @@ int main(void){
     for(unsigned i=0;i<sizeof(invalid)/sizeof(invalid[0]);i++){
         response=invalid[i];poll_notifications();assert(!s_notification.id[0]);
     }
-    assert(warnings==3);
+    assert(warnings==old_warnings+3);
     response="{\"notification\":{\"id\":\"cccccccccccccccccccccccccccccccc\","
         "\"kind\":\"imessage\",\"sender\":\"Test\",\"preview\":\"Unchanged message behavior\"}}";
     poll_notifications();assert(muse_openai_notification(&out) && out.expires_at==0);

@@ -502,9 +502,10 @@ Expanded popups block taps on the underlying screen. On larger touch displays,
 actions use 48-pixel-high buttons with separated, padded touch targets.
 Incoming message previews dismiss after 15 seconds of visible, collapsed
 time; expanding pauses that timeout, and collapsing starts a fresh 15 seconds.
-Alerts pause during voice turns,
+Ordinary alerts pause during voice turns,
 menus, images, and settings. They do not wake the sleeping display or keep
-Wi-Fi awake on battery; queued alerts appear when the device wakes. The
+Wi-Fi awake on battery; queued alerts appear when the device wakes. Copilot watch
+mode below is an explicit exception that keeps Wi-Fi connected. The
 Mac must remain awake and reachable. Previews are not automatically read
 aloud or used as a voice reply's recipient context.
 
@@ -616,6 +617,87 @@ Install `tools/muse/companion-skill/SKILL.md` as
 `tools/muse/companion_cli.py` to the private bridge state directory.
 The authenticated local helper supports reminders and briefing requests;
 do not substitute OpenClaw cron or a Mac sleep command for local timers.
+
+### Copilot approvals and questions from VS Code
+
+The hybrid firmware can supervise a **dedicated GitHub Copilot SDK session**
+launched in a VS Code terminal. It does **not** attach to an existing Copilot
+Chat/Agent Host conversation or approve that panel's prompts. The SDK controller
+owns the session's actual `onPermissionRequest` and legacy `onUserInputRequest`
+callbacks; a queued chat message saying "approve" is not an authorization.
+This uses your authenticated Copilot account, not OpenClaw for coding decisions.
+Copilot subscription/usage limits apply. Gadget speech still uses the existing
+paid OpenAI transcription and generic response speech.
+
+Requirements: Node.js 22+, an authenticated Copilot CLI/SDK runtime, the
+HTTPS Mac bridge running with `--companion`, and the updated hybrid firmware.
+The SDK supplies its runtime. Authenticate its CLI if the controller reports
+that login is required; never paste GitHub or bridge tokens into chat.
+After updating the bridge source, restart its LaunchAgent. No TLS trust reset
+or NVS erase is needed. From the **repository root**:
+
+```sh
+npm --prefix esp32/tools/muse/copilot ci
+npm --prefix esp32/tools/muse/copilot run build
+node esp32/tools/muse/copilot/dist/cli.js --cwd .
+```
+
+Enter coding tasks in that terminal. `--cwd /absolute/path/to/project` selects
+another workspace; `--model` selects a Copilot model and `--python` selects the
+Python interpreter used by the existing verified-TLS helper. `/stop` cancels
+pending authorizations and aborts the turn; `/quit` closes the controller.
+For a VS Code task, run the same Node command with the workspace folder as its
+working directory. Name it **Gadget Copilot** and launch it through
+**Terminal > Run Task**. Keep the Mac awake and on the same network as the gadget.
+
+Each waiting request puts the project name and question or exact command first
+on the gadget card. The full operation, workspace and session remain available
+in the expanded scrollable card, with one chime per request.
+Copilot cards also appear over Settings. Review it, **hold Talk**, then say
+**"approve"** or **"deny"** for a permission. Approval is **once-only**, never
+"always allow". For a question, speak the exact offered choice, **"option two"**,
+or a freeform answer when allowed. Ambiguous permission speech (including an
+unqualified "yes") never approves work. Question answers retain their original
+choice labels. **Deny** rejects the displayed operation; **Skip** declines a
+question without fabricating an answer. Desktop fallback commands are shown
+with the exact request ID: `/approve ID`, `/deny ID`, `/answer ID YOUR ANSWER`.
+The first valid desktop/device response wins.
+
+**Settings > Companion > Connection & costs > Copilot watch on battery** is on
+by default in this deployment, as requested. It keeps Wi-Fi connected while
+the screen sleeps, using more battery, but leaves the sleeping audio codecs
+off. It does not enable hands-free recording or automatic voice commands.
+Disable it for normal battery sleep; plugged-in or already-awake devices can
+still receive Copilot alerts. Copilot attention wakes the screen and respects
+speaker mute/volume. Calendar quiet hours apply only to calendar heads-ups.
+Local timer alarms and confirmed message replies retain priority, and active
+recording/speech is not interrupted by a new Copilot alert.
+
+The authorization path is deterministic and request-bound: transcription is
+sent directly to the waiting request, **not to the general OpenClaw chat**.
+Questions/command details are not automatically sent to OpenAI for read-aloud;
+only the user's recorded speech and generic acknowledgment use voice APIs.
+Full permission previews must fit 2,047 bytes and be displayable ASCII. Larger,
+non-displayable or otherwise unsupported requests explicitly require desktop
+review; they cannot be approved from a shortened gadget preview.
+
+Requests expire after ten minutes. The desktop heartbeat is five seconds with
+a twenty-second lease. Disconnects, controller/bridge restarts, `/stop`, stale
+IDs and invalid responses fail closed; old approvals are never resumed.
+"Approval submitted" confirms transport, not completion of the coding work.
+Cancelling a voice turn cannot revoke a decision already delivered; stop the
+Copilot session if you need to interrupt work that has already been approved.
+A separate private desktop producer credential prevents the device token from
+creating work requests. Both use the existing verified local HTTPS channel.
+Private `copilot.sqlite` stores request previews and responses; terminal records
+older than seven days are pruned on subsequent API activity. SDK/provider
+conversation history is separate. Anyone able to operate the unlocked gadget
+can submit its decisions; this is not speaker authentication or isolation from
+an agent that already has full access to your Mac.
+
+Controller validation: `npm --prefix esp32/tools/muse/copilot test`. Application
+TypeScript is strict; transitive SDK declaration checking is skipped for the
+SDK's older JSON-RPC iterator declarations with current TypeScript/Node types.
 
 ### Personal memory and durable conversations
 

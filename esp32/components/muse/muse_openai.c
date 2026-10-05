@@ -64,6 +64,7 @@ static char s_mac_job[33];
 static char *s_companion_json;
 static unsigned s_companion_version;
 static char s_reply_arm[33], s_record_reply[33];
+static char s_copilot_focus[33], s_record_copilot[33];
 static muse_notification_t s_draft_notice;
 #endif
 
@@ -75,6 +76,7 @@ typedef struct {
     size_t frames;
     char *text;
     char reply_target[33];
+    char copilot_target[33];
     const char *bridge_url, *bridge_token;
 } job_t;
 
@@ -189,6 +191,30 @@ static esp_err_t on_http_event(esp_http_client_event_t *event)
     return ESP_OK;
 }
 
+#if CONFIG_MUSE_OPENCLAW
+static void copilot_http_error(esp_http_client_handle_t client, char *why, size_t cap)
+{
+    char *body = malloc(512);
+    if (!body) return;
+    size_t used = 0;
+    int64_t deadline = esp_timer_get_time() + 2000000;
+    while (used < 511 && esp_timer_get_time() < deadline) {
+        int n = esp_http_client_read(client, body + used, 511 - used);
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    body[used] = '\0';
+    cJSON *root = cJSON_Parse(body);
+    cJSON *error = cJSON_GetObjectItemCaseSensitive(root, "error");
+    cJSON *message = cJSON_GetObjectItemCaseSensitive(error, "message");
+    if (cJSON_IsString(message) && message->valuestring[0]) {
+        snprintf(why, cap, "COPILOT: %.82s", message->valuestring);
+    }
+    cJSON_Delete(root);
+    free(body);
+}
+#endif
+
 /* Redirects are disabled so credentials never leave their intended endpoint. */
 static bool request(const job_t *job, const char *path, esp_http_client_method_t method,
                     const char *content_type, const part_t *parts, size_t part_count,
@@ -281,6 +307,9 @@ static bool request(const job_t *job, const char *path, esp_http_client_method_t
     int status = esp_http_client_get_status_code(client);
     if (status < 200 || status >= 300) {
         http_error(status, openclaw, why, why_cap);
+#if CONFIG_MUSE_OPENCLAW
+        if (openclaw && job->copilot_target[0]) copilot_http_error(client, why, why_cap);
+#endif
         goto cleanup;
     }
     if (speech && strncasecmp(response_type, "audio/pcm", 9)
@@ -890,11 +919,12 @@ bool muse_openai_notification(muse_notification_t *out)
         return true;
     }
     xSemaphoreTake(s_data, portMAX_DELAY);
-    if (!strcmp(s_notification.kind, "calendar") && s_notification.expires_at &&
+    if ((!strcmp(s_notification.kind, "calendar") || !strncmp(s_notification.kind, "copilot_", 8))
+        && s_notification.expires_at &&
         time(NULL) >= s_notification.expires_at) {
         strlcpy(s_notification_ack, s_notification.id, sizeof(s_notification_ack));
         memset(&s_notification, 0, sizeof(s_notification));
-        ESP_LOGI(TAG, "expired calendar reminder dismissed locally");
+        ESP_LOGI(TAG, "expired attention notification dismissed locally");
     }
     bool draft = s_draft_notice.id[0] != '\0' &&
         (!s_notification.id[0] || !strcmp(s_notification.kind, "imessage"));
@@ -915,6 +945,7 @@ void muse_openai_notification_dismiss(void)
     }
     if (!s_data) return;
     xSemaphoreTake(s_data, portMAX_DELAY);
+    s_copilot_focus[0] = '\0';
     if (s_notification.id[0]) {
         s_reply_arm[0] = '\0';
         strlcpy(s_notification_ack, s_notification.id, sizeof(s_notification_ack));
@@ -923,20 +954,25 @@ void muse_openai_notification_dismiss(void)
     xSemaphoreGive(s_data);
 }
 
+void muse_openai_copilot_focus(const char *id)
+{
+    if (!s_data) return;
+    xSemaphoreTake(s_data, portMAX_DELAY);
+    strlcpy(s_copilot_focus, id ? id : "", sizeof(s_copilot_focus));
+    xSemaphoreGive(s_data);
+}
+
 static void poll_notifications(void)
 {
     if (!openclaw_chat() || !muse_settings_openclaw_token_set() || !muse_wifi_connected()
-        || muse_state_asleep() || muse_state_mode(NULL) != MUSE_MODE_IDLE
+        || (muse_state_asleep() && muse_state_on_battery() && !muse_settings_copilot_watch())
+        || muse_state_mode(NULL) != MUSE_MODE_IDLE
         || atomic_load(&s_busy) || time(NULL) < 1700000000) return;
     char acknowledgment[33], cached[33];
     xSemaphoreTake(s_data, portMAX_DELAY);
-    bool pending = s_notification.id[0] &&
-        !(s_draft_notice.id[0] && !strcmp(s_notification.kind, "imessage"));
     strlcpy(acknowledgment, s_notification_ack, sizeof(acknowledgment));
     strlcpy(cached, s_notification.id, sizeof(cached));
-    bool calendar = !strcmp(s_notification.kind, "calendar");
     xSemaphoreGive(s_data);
-    if (pending && !calendar) return;
     job_t job = { .kind = JOB_NOTIFICATION, .generation = atomic_load(&s_generation) };
     cJSON *body = cJSON_CreateObject();
     char why[96] = "OPENCLAW NOTIFICATION FAILED";
@@ -958,6 +994,8 @@ static void poll_notifications(void)
         cJSON *kind = cJSON_GetObjectItemCaseSensitive(notification, "kind");
         cJSON *full = cJSON_GetObjectItemCaseSensitive(notification, "body");
         cJSON *expires = cJSON_GetObjectItemCaseSensitive(notification, "expires_at");
+        cJSON *respondable = cJSON_GetObjectItemCaseSensitive(notification, "respondable");
+        bool copilot = cJSON_IsString(kind) && !strncmp(kind->valuestring, "copilot_", 8);
         valid = cJSON_IsString(id) && strlen(id->valuestring) == 32
             && strspn(id->valuestring, "0123456789abcdef") == 32
             && cJSON_IsString(sender) && sender->valuestring[0]
@@ -967,9 +1005,11 @@ static void poll_notifications(void)
             && (!kind || (cJSON_IsString(kind) &&
                 (!strcmp(kind->valuestring, "imessage") || !strcmp(kind->valuestring, "reminder")
                  || !strcmp(kind->valuestring, "briefing") || !strcmp(kind->valuestring, "job")
-                 || !strcmp(kind->valuestring, "calendar"))))
+                 || !strcmp(kind->valuestring, "calendar") || !strcmp(kind->valuestring, "copilot_allow")
+                 || !strcmp(kind->valuestring, "copilot_ask"))))
             && (!full || (cJSON_IsString(full) && strlen(full->valuestring) < sizeof(next.body)))
-            && (!(cJSON_IsString(kind) && !strcmp(kind->valuestring, "calendar")) ||
+            && (!copilot || (cJSON_IsBool(respondable) && cJSON_IsString(full) && full->valuestring[0]))
+            && (!(copilot || (cJSON_IsString(kind) && !strcmp(kind->valuestring, "calendar"))) ||
                 (cJSON_IsNumber(expires) && expires->valuedouble >= 1700000000 &&
                  expires->valuedouble <= 4102444800 &&
                  expires->valuedouble == (double)(int64_t)expires->valuedouble));
@@ -979,7 +1019,13 @@ static void poll_notifications(void)
             strlcpy(next.preview, text->valuestring, sizeof(next.preview));
             strlcpy(next.kind, kind ? kind->valuestring : "imessage", sizeof(next.kind));
             strlcpy(next.body, full ? full->valuestring : text->valuestring, sizeof(next.body));
-            if (!strcmp(next.kind, "calendar")) next.expires_at = (int64_t)expires->valuedouble;
+            if (!strcmp(next.kind, "calendar") || copilot) next.expires_at = (int64_t)expires->valuedouble;
+            next.respondable = copilot && cJSON_IsTrue(respondable);
+            if (next.respondable) {
+                for (const unsigned char *c = (const unsigned char *)next.body; *c; c++) {
+                    if ((*c < 32 && *c != '\n') || *c > 126) valid = false;
+                }
+            }
         }
     }
     cJSON_Delete(root);
@@ -988,14 +1034,53 @@ static void poll_notifications(void)
         ESP_LOGW(TAG, "incoming iMessages: invalid notification response");
         return;
     }
+    bool wake = false;
     xSemaphoreTake(s_data, portMAX_DELAY);
     if (current(job.generation) && !strcmp(cached, s_notification.id) &&
         !strcmp(acknowledgment, s_notification_ack)) {
+        wake = next.id[0] && strcmp(next.id, s_notification.id) && !strncmp(next.kind, "copilot_", 8);
+        if (strcmp(next.id, s_notification.id)) s_reply_arm[0] = '\0';
         s_notification = next;
         s_notification_ack[0] = '\0';
         if (next.id[0]) ESP_LOGI(TAG, "incoming iMessage queued for display");
     }
     xSemaphoreGive(s_data);
+    if (wake) muse_state_set_asleep(false);
+}
+
+static char *copilot_answer(const job_t *job, const char *text, char *why, size_t cap)
+{
+    cJSON *body = cJSON_CreateObject();
+    bool built = body && cJSON_AddStringToObject(body, "action", "copilot_voice") &&
+        cJSON_AddStringToObject(body, "id", job->copilot_target) &&
+        cJSON_AddStringToObject(body, "text", text);
+    char *response = built ? json_request(job, "companion", body, false, true, why, cap) : NULL;
+    cJSON_Delete(body);
+    if (!response) {
+        if (!built) strlcpy(why, "COPILOT RESPONSE NOT QUEUED - NO MEMORY", cap);
+        return NULL;
+    }
+    cJSON *root = cJSON_Parse(response);
+    cJSON *result = cJSON_GetObjectItemCaseSensitive(root, "copilot");
+    cJSON *id = cJSON_GetObjectItemCaseSensitive(result, "id");
+    cJSON *state = cJSON_GetObjectItemCaseSensitive(result, "state");
+    cJSON *message = cJSON_GetObjectItemCaseSensitive(result, "message");
+    bool valid = cJSON_IsString(id) && !strcmp(id->valuestring, job->copilot_target) &&
+        cJSON_IsString(state) && !strcmp(state->valuestring, "answered") &&
+        cJSON_IsString(message) && message->valuestring[0] && strlen(message->valuestring) < 96 &&
+        !cJSON_GetObjectItemCaseSensitive(root, "error");
+    char *reply = valid && current(job->generation) ? strdup(message->valuestring) : NULL;
+    cJSON_Delete(root);
+    free(response);
+    if (!reply) {
+        strlcpy(why, "COPILOT RESPONSE UNCONFIRMED - CHECK COMPUTER", cap);
+        return NULL;
+    }
+    xSemaphoreTake(s_data, portMAX_DELAY);
+    if (!strcmp(s_notification.id, job->copilot_target)) memset(&s_notification, 0, sizeof(s_notification));
+    if (!strcmp(s_copilot_focus, job->copilot_target)) s_copilot_focus[0] = '\0';
+    xSemaphoreGive(s_data);
+    return reply;
 }
 #endif
 
@@ -1069,7 +1154,7 @@ static void worker(void *arg)
             ESP_LOGI(TAG, "OpenAI API key test passed");
             goto finished;
         }
-        if (!history) {
+        if (!history && !job.copilot_target[0]) {
             strlcpy(why, "NO MEMORY FOR CONVERSATION", sizeof(why));
             goto failed;
         }
@@ -1077,6 +1162,11 @@ static void worker(void *arg)
         if (!text) goto failed;
         emit(&job, MUSE_HATCH_EV_HEARD, text);
 #if CONFIG_MUSE_OPENCLAW
+        if (job.copilot_target[0]) {
+            reply = copilot_answer(&job, text, why, sizeof(why));
+            if (!reply) goto failed;
+            goto deliver;
+        }
         if (job.reply_target[0]) {
             cJSON *body = cJSON_CreateObject();
             bool ok = body && cJSON_AddStringToObject(body, "action", "reply_prepare")
@@ -1116,6 +1206,9 @@ static void worker(void *arg)
             cJSON_DeleteItemFromArray(history, 0);
             cJSON_DeleteItemFromArray(history, 0);
         }
+#if CONFIG_MUSE_OPENCLAW
+deliver:
+#endif
         xSemaphoreTake(s_data, portMAX_DELAY);
         if (current(job.generation)) strlcpy(s_reply, reply, sizeof(s_reply));
         xSemaphoreGive(s_data);
@@ -1250,6 +1343,11 @@ void muse_hatch_turn_begin(void)
 #if CONFIG_MUSE_OPENCLAW
     strlcpy(s_record_reply, s_reply_arm, sizeof(s_record_reply));
     s_reply_arm[0] = '\0';
+    s_record_copilot[0] = '\0';
+    if (s_copilot_focus[0] && !s_record_reply[0] &&
+        muse_timer_status(NULL) != MUSE_TIMER_RINGING && !muse_timer_pending()) {
+        strlcpy(s_record_copilot, s_copilot_focus, sizeof(s_record_copilot));
+    }
 #endif
     xSemaphoreGive(s_data);
     if (!s_record) {
@@ -1292,6 +1390,8 @@ void muse_hatch_turn_end(void)
 #if CONFIG_MUSE_OPENCLAW
     strlcpy(job.reply_target, s_record_reply, sizeof(job.reply_target));
     s_record_reply[0] = '\0';
+    strlcpy(job.copilot_target, s_record_copilot, sizeof(job.copilot_target));
+    s_record_copilot[0] = '\0';
 #endif
     xSemaphoreGive(s_data);
     if (!job.pcm || !job.frames || xQueueSend(s_jobs, &job, 0) != pdTRUE) {
@@ -1314,6 +1414,7 @@ void muse_hatch_turn_cancel(void)
     s_reply[0] = '\0';
 #if CONFIG_MUSE_OPENCLAW
     s_reply_arm[0] = s_record_reply[0] = '\0';
+    s_copilot_focus[0] = s_record_copilot[0] = '\0';
 #endif
     xSemaphoreGive(s_data);
     if (recording) atomic_store(&s_busy, false);

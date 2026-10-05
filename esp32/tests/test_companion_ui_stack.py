@@ -119,6 +119,7 @@ static size_t fake_strlcpy(char *out,const char *text,size_t cap){
 #define strlcpy fake_strlcpy
 static bool muse_wifi_connected(void){return true;}
 static bool muse_settings_speaker_on(void){return true;}
+static bool muse_settings_copilot_watch(void){return true;}
 static unsigned muse_settings_openai_key_len(void){return 1;}
 #define CALLBACK(name) static void name(lv_event_t *e){(void)e;}
 CALLBACK(on_quick_action)
@@ -128,6 +129,7 @@ CALLBACK(on_timer_dismiss)
 CALLBACK(on_draft_action)
 CALLBACK(on_edit_draft)
 CALLBACK(on_stop_latest_job)
+CALLBACK(on_copilot_watch)
 CALLBACK(on_companion_action)
 CALLBACK(on_companion_switch)
 CALLBACK(on_calendar_toggle)
@@ -151,6 +153,9 @@ static void switch_row_data(lv_obj_t *o,const char *t,bool value,
                             void (*cb)(lv_event_t *),void *arg){
     (void)o;(void)t;(void)value;(void)cb;(void)arg;
     switch_count++;
+}
+static lv_obj_t *switch_row(lv_obj_t *o,const char *t,bool value,void (*cb)(lv_event_t *)){
+    switch_row_data(o,t,value,cb,NULL);return o;
 }
 static void *lv_event_get_user_data(lv_event_t *e){return e->data;}
 static int64_t esp_timer_get_time(void){return now_us;}
@@ -225,7 +230,7 @@ int main(void){
         if(section!=COMPANION_REPLIES)assert(confirmations==0);
         const int expected_rows[]={9,1,3,6,2,0,2,1,4,1,0};
         assert(row_count==expected_rows[section]);
-        assert(switch_count==(section==COMPANION_CALENDARS?3:
+        assert(switch_count==(section==COMPANION_STATUS?1:section==COMPANION_CALENDARS?3:
                              section==COMPANION_BRIEFING?1:section==COMPANION_FAVOURITES?6:0));
         tick_companion();
     }

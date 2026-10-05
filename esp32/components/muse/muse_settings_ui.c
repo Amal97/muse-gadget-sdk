@@ -1592,6 +1592,11 @@ static void on_stop_latest_job(lv_event_t *e)
     send_companion(body);
 }
 
+static void on_copilot_watch(lv_event_t *e)
+{
+    muse_settings_set_copilot_watch(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
+}
+
 static void memory_save_done(const char *text)
 {
     cJSON *body = action_body("memory_add");
@@ -1861,6 +1866,10 @@ static void fill_companion(void)
         else note(s_companion_list, "No reply draft. Tap Reply on a message, then hold Talk to dictate.");
     }
     if (s_companion_section == COMPANION_STATUS) {
+        note(s_companion_list, "COPILOT");
+        switch_row(s_companion_list, "Copilot watch on battery", muse_settings_copilot_watch(), on_copilot_watch);
+        note(s_companion_list, "Keeps Wi-Fi connected with the screen asleep; uses more battery. "
+             "Copilot requests wake and chime once. Hold Talk to respond; no always-listening voice commands.");
         note(s_companion_list, "DASHBOARD");
         note(s_companion_list, muse_wifi_connected() ? "Wi-Fi: connected" : "Wi-Fi: offline");
         cJSON *connectivity = cJSON_GetObjectItemCaseSensitive(root, "connectivity");
