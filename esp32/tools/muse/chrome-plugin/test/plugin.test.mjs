@@ -24,7 +24,9 @@ test("tool is optional, ESP32-only, and respects the existing control opt-in", (
     assert.equal(enabledForAgent({ agents: { list: [{ id: "esp32", tools }] } }, "esp32"), false);
   }
   let factory, options;
-  register({ config, registerTool: (tool, opts) => { factory = tool; options = opts; }, on() {} });
+  register({ config, registerTool: (tool, opts) => {
+    if (opts.names.includes("normal_chrome")) { factory = tool; options = opts; }
+  }, on() {} });
   assert.equal(options.optional, true);
   assert.equal(factory({ agentId: "esp32" }).name, "normal_chrome");
   assert.equal(factory({ agentId: "main" }), null);

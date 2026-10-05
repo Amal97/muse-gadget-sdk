@@ -417,6 +417,80 @@ Restore that agent's previous exec-approval policy as well. Use the
 USB `openclaw_setup.py --port PORT --disable` command to disconnect the board
 from OpenClaw entirely; the simplified OpenClaw settings omit that switch.
 
+#### Native Mac voice controls
+
+The companion plugin's optional `mac_control` tool exposes fixed native actions
+for applications, output volume/mute, Bluetooth, and Wi-Fi. It does not accept
+arbitrary scripts or change the ESP32's own sound settings.
+
+From `esp32/`, install the updated plugin:
+
+```sh
+openclaw plugins install ./tools/muse/chrome-plugin
+```
+
+For an existing copied installation, first preserve that plugin's old directory
+outside OpenClaw's extension discovery paths. Do not overwrite another plugin
+or leave duplicate copies with the same ID active. You can then use
+`openclaw plugins install --link ./tools/muse/chrome-plugin` to load this checkout
+directly; keep its path stable when using a linked install. Do not move or erase
+bridge credentials, certificates, personal state, or other agents' files.
+
+For Bluetooth **power changes**, install the declared Homebrew dependency:
+
+```sh
+brew bundle --file tools/muse/chrome-plugin/Brewfile
+```
+
+Audio/apps/Wi-Fi do not require `blueutil`; Bluetooth status is read through
+macOS System Profiler without sending paired-device details to the model.
+Power changes may need Bluetooth permission for the actual gateway/tool host.
+If macOS blocks or times out, the tool reports the error, not successful control.
+Never use sudo or bypass the privacy permission to hide a failure.
+
+Copy `tools/muse/mac-control-skill/SKILL.md` into the dedicated agent's workspace
+at `skills/mac-control/SKILL.md`. Add **`mac_control`** to only the `esp32`
+agent's `tools.alsoAllow`, preserving existing entries, model, exec approvals,
+and denied tools. Keep its already opted-in full profile and sandbox policy.
+Existing Chrome users keep `normal_chrome` allowed as well. The plugin ID remains
+`muse-normal-chrome` for compatibility; allowing its older browser tool does not
+automatically enable the new Mac tool.
+
+Have the agent read the Mac-control skill and use `mac_control` for system actions,
+and `normal_chrome` for websites. Restart the gateway after configuration changes.
+No new firmware flash or touchscreen page is needed: use the existing Talk button.
+
+Example voice requests:
+
+- "Open Calculator on my Mac."
+- "Is Safari running?"
+- "Set my Mac volume to 30 percent."
+- "Mute my Mac." / "Unmute my Mac."
+- "Is Bluetooth on?" / "Turn Bluetooth on."
+- "Is Mac Wi-Fi on?"
+
+App launches, sound changes, and radio power changes read back the resulting state
+before returning verified success. A running app is not proof of window readiness;
+Wi-Fi power is not proof of internet connectivity. Native calls are bounded and
+cancellable, but Stop cannot undo a completed action.
+
+Bluetooth/Wi-Fi **off** is a two-request operation. The first request prepares a
+three-minute, single-use confirmation and explains the disconnection risk without
+changing power. In a separate gadget request, say "Confirm turning Bluetooth off"
+or the matching Wi-Fi confirmation. The agent retrieves the exact pending ID;
+you do not need to speak it. Same-request confirmations, wrong targets, expired
+requests, and replayed confirmations are rejected. Say to cancel instead if needed.
+Pending state persists privately under `~/.openclaw/muse-esp32/mac-control/`.
+
+Wi-Fi off can disconnect the gadget before its final reply arrives. Restoring
+connectivity may require local access. Voice is not speaker authentication, and
+the existing unrestricted exec policy can bypass tool-level instructions; this
+is not an OS security sandbox. The new tool does not provide file deletion,
+app quitting, shutdown/restart, password entry, or general UI automation.
+
+Coverage: `npm --prefix tools/muse/chrome-plugin test`. Live validation should
+read statuses and test app/sound actions without disabling connectivity.
+
 #### Optional normal signed-in Chrome (macOS, Chrome 144+)
 
 For browser-wide access to existing sessions without attaching individual

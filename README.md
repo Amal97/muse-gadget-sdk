@@ -628,6 +628,34 @@ OpenClaw approval prompts required by your chosen policy.
 
 ## Optional Mac integrations
 
+### Mac voice controls
+
+The companion control plugin includes an optional **`mac_control`** tool for:
+
+- Opening installed Mac apps and checking whether they are running.
+- Reading/setting Mac output volume and mute, with state verification.
+- Reading Bluetooth and Wi-Fi power, and requesting on/off changes.
+
+Enable only this tool for your dedicated `esp32` agent, alongside
+`normal_chrome` if you use browser control. Use the
+[native Mac-control setup guide](esp32/README.md#native-mac-voice-controls).
+It requires no new firmware flash: hold the ESP32's Talk button and say, for
+example, **"Open Calculator on my Mac"**, **"Set my Mac volume to 30 percent"**,
+or **"Is Bluetooth on?"** Browser requests continue using the Chrome tool.
+
+Turning Bluetooth or Mac Wi-Fi **off** first warns about disconnecting devices
+or the gadget and waits for a separate voice confirmation. Confirmations expire
+after three minutes and cannot run in the initiating request. Wi-Fi off may
+prevent the final reply from reaching the gadget; local Mac access may be needed
+to reconnect. Bluetooth power changes require `blueutil` and any macOS Bluetooth
+permission for the actual tool host. Failures remain explicit and unconfirmed.
+
+These are scoped app/sound/radio controls, not arbitrary UI automation, app
+quitting, shutdown, password entry, or an always-listening Mac voice assistant.
+They use the existing push-to-talk OpenClaw path and still require an awake Mac
+and working model/speech services. Voice is not identity verification, and the
+agent's separate full exec access is not restricted by these tool-level safeguards.
+
 ### Incoming iMessages and confirmed replies
 
 Install [imsg](https://github.com/openclaw/imsg), sign into Messages.app,

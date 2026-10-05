@@ -1,7 +1,7 @@
 {
   "id": "muse-normal-chrome",
   "name": "Muse normal Chrome",
-  "description": "Structured normal-Chrome controls for the dedicated ESP32 agent.",
+  "description": "Structured normal-Chrome and optional native Mac controls for the dedicated ESP32 agent.",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
