@@ -1,0 +1,16 @@
+{
+  "name": "muse-companion-documentation",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test test/*.test.mjs",
+    "dev": "npm run build && npm run preview",
+    "preview": "python3 -m http.server 4173 --bind 127.0.0.1 --directory dist"
+  },
+  "dependencies": {
+    "markdown-it": "15.0.2"
+  }
+}

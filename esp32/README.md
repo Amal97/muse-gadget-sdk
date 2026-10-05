@@ -16,6 +16,29 @@ limitations under the License.
 
 # ESP32 Device SDK
 
+For the complete installation and usage walkthrough for this fork's
+OpenAI/OpenClaw personal companion, start with the
+[project README](../README.md). This document retains the detailed firmware,
+original Muse, board, and integration reference.
+
+## Guide contents
+
+- [What you need](#what-you-need)
+- [Original Muse setup](#or-do-it-yourself)
+- [Standalone OpenAI mode](#standalone-openai-mode)
+- [OpenClaw setup](#optional-openclaw-chat-on-your-computer)
+- [Computer control](#opting-into-computer-control)
+- [Normal Chrome](#optional-normal-signed-in-chrome-macos-chrome-144)
+- [iMessage](#optional-imessage-sending-and-incoming-previews-macos)
+- [Companion/Home features](#optional-gadget-companion-features-openclaw-builds)
+- [Copilot](#copilot-approvals-and-questions-from-vs-code)
+- [Task dashboard and health](#copilot-task-dashboard-and-connection-health)
+- [Routines and priorities](#personal-routines-and-local-priorities)
+- [Memory and conversation saves](#personal-memory-and-durable-conversations)
+- [Calendar alerts](#proactive-calendar-alerts)
+- [Boards](#boards)
+- [Development](#hack-and-extend-it)
+
 Flash this open source firmware onto any ESP32-compatible board to connect
 Muse to your home Wi-Fi. On boards with the home-network tunnel, Muse can reach
 the devices you already own and anything you build with a local HTTP API.
@@ -544,7 +567,7 @@ firmware providers retain their existing navigation.
 
 Tap a Home card for details in Companion. An absent or previous-day briefing
 can be built from its card; this is deterministic and does not call an AI model.
-Home refreshes companion status every 30 seconds only while visible, awake,
+Home refreshes companion status every 10 seconds only while visible, awake,
 connected, and the backend is idle. Mac local-time offsets are cached in NVS
 without changing global timezone settings; reconnect to update them after a
 timezone or daylight-saving change. Before initial clock/timezone sync the
@@ -869,7 +892,8 @@ be edited through the helper's `settings` action. Preferences remain private
 in `~/.openclaw/muse-esp32/companion.sqlite`, not in the repository.
 
 The daily schedule uses the Mac's local timezone, runs once per local date,
-and catches up after the scheduled time if the service was asleep/offline.
+and catches up only within one hour of the scheduled time if the service
+was asleep/offline. Scheduled routines respect shared quiet hours.
 Manual briefings are also available. Unavailable sources produce an explicitly
 partial digest; an interrupted build is not silently retried.
 
