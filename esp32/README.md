@@ -435,6 +435,53 @@ Restore that agent's previous exec-approval policy as well. Use the
 USB `openclaw_setup.py --port PORT --disable` command to disconnect the board
 from OpenClaw entirely; the simplified OpenClaw settings omit that switch.
 
+#### Optional hands-free wake word
+
+The Waveshare ESP32-S3 OpenAI/OpenClaw firmware can optionally detect **Hi ESP**
+locally with ESP-SR WakeNet9. Say **"Hi ESP"**, briefly pause for the screen to
+show `LISTENING`, then speak your command. It captures one command, sends it
+after roughly a second without detected speech, and returns to wake-word
+listening after the reply. No command within five seconds cancels locally;
+commands are limited to 15 seconds. Tap Talk while hands-free recording to
+cancel without sending. Ordinary hold-and-release push-to-talk still works.
+
+Enable or disable it in **Settings > Sound > Hi ESP hands-free**, or over USB
+with `wakeword=1` / `wakeword=0`. The preference is saved in NVS. Status reports
+`wakeword.supported`, `wakeword.enabled`, and `wakeword.ready` separately, so
+an enabled preference is not mistaken for a successfully loaded model. Wake
+detection is paused while replying, during other voice operations, and on the
+Sound page while its microphone meter is active.
+
+**Privacy, battery, and permissions:** Wake-word detection and idle audio stay
+on the ESP32; only a recorded command is submitted to the configured speech
+provider. When hands-free is enabled, the mic/CPU remain active on **USB and
+battery, even with the screen off**, reducing battery life. It cannot wake a
+powered-off device. Disabling it stops automatic wake-word recording; normal
+local push-to-talk pre-roll/mic-meter behavior is unchanged. Wake words do not
+identify the speaker, and false detections can incur API usage or authorize
+computer actions. Existing action permissions and radio-off confirmations
+still apply. The model must be physically tested in your room; loud playback,
+distance, and background noise affect recognition.
+
+This feature defaults off in normal builds. For an explicitly opted-in S3
+build, append `devices/sdkconfig.wakeword` to `SDKCONFIG_DEFAULTS` after the
+board and OpenAI/OpenClaw overlays. It enables the feature/first-boot preference
+and selects `partitions_muse_wakeword.csv` and only the Hi ESP wake model.
+Use a fresh build directory or apply these values to the existing sdkconfig;
+defaults do not override already saved configuration values.
+
+Initial flash-model mapping runs on the boot task's internal stack. With the
+pinned ESP-SR 2.5.5, resets recreate WakeNet9/VAD using cached coefficients
+instead of the Hi ESP model's crashing `clean` routine.
+
+The wake-word partition table keeps **every existing Muse partition at the
+same offset and size** and adds a 2 MB `model` partition at `0x900000`. First
+installation must flash the updated partition table, the generated
+`srmodels/srmodels.bin`, and the app, preserving NVS and OTA metadata. An
+app-only flash is insufficient for the first installation. Later app-only
+updates can reuse the model image. A missing/unusable model is reported
+explicitly; it does not disable push-to-talk.
+
 #### Native Mac voice controls
 
 The companion plugin's optional `mac_control` tool exposes fixed native actions

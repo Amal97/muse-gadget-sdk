@@ -38,6 +38,10 @@
 #include "muse_settings.h"
 #include "muse_state.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_WAKEWORD
+#include "muse_wakeword.h"
+#include "muse_voice_endpoint.h"
+#endif
 #if CONFIG_MUSE_OPENCLAW
 #include "muse_openai.h"
 #endif
@@ -77,6 +81,9 @@ static volatile float s_monitor_db = -100.0f;
 static volatile int s_chirp;
 static volatile bool s_loopback;
 static volatile bool s_mp3test;
+#if CONFIG_MUSE_WAKEWORD
+static bool s_wake_listening, s_hands_free_recording;
+#endif
 
 static void play_notice_chirp(void)
 {
@@ -196,14 +203,17 @@ static void pre_reset(void)
 {
     s_pre_fill = 0;
     s_settle = SETTLE_CHUNKS;
+#if CONFIG_MUSE_WAKEWORD
+    muse_wakeword_reset();
+#endif
 }
 
 /* One 20 ms idle read: feeds the pre-roll ring and the settings mic meter. */
-static void idle_capture(void)
+static bool idle_capture(void)
 {
     if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
         vTaskDelay(pdMS_TO_TICKS(20));
-        return;
+        return false;
     }
     if (s_monitor) {
         float db = muse_audio_dbfs(s_chunk, MUSE_AUDIO_CHUNK);
@@ -211,7 +221,7 @@ static void idle_capture(void)
     }
     if (s_settle > 0) {
         s_settle--;
-        return;
+        return false;
     }
     pre_chunk_t *c = &s_pre[s_pre_next];
 #if MUSE_LOW_MEM
@@ -222,6 +232,11 @@ static void idle_capture(void)
 #endif
     s_pre_next = (s_pre_next + 1) % PRE_CHUNKS;
     s_pre_fill = s_pre_fill < PRE_CHUNKS ? s_pre_fill + 1 : PRE_CHUNKS;
+#if CONFIG_MUSE_WAKEWORD
+    return s_wake_listening && muse_wakeword_feed(s_chunk, MUSE_AUDIO_CHUNK);
+#else
+    return false;
+#endif
 }
 
 /* Non-blocking: returns true if an event of `type` arrived (others dropped). */
@@ -311,6 +326,11 @@ static bool record(bool barge_in, const char *dictation_target, size_t *held, ch
     s_live = s_tried = false;
     /* Capture the displayed response target before LISTENING hides its card. */
     bool dictating = dictation_target[0] != '\0';
+    bool hands_free = false;
+#if CONFIG_MUSE_WAKEWORD
+    hands_free = s_hands_free_recording;
+    muse_voice_endpoint_t endpoint = { 0 };
+#endif
 #if CONFIG_MUSE_OPENCLAW
     if (dictating) {
         int expected = DICTATION_START;
@@ -352,6 +372,10 @@ static bool record(bool barge_in, const char *dictation_target, size_t *held, ch
     size_t stop_at = MAX_FRAMES;
     while (n + MUSE_AUDIO_CHUNK <= stop_at) {
         if (muse_audio_read(s_chunk, MUSE_AUDIO_CHUNK) != ESP_OK) {
+            if (hands_free) {
+                ok = false;
+                strlcpy(why, "MICROPHONE READ FAILED - NOT SENT", cap);
+            }
             break;
         }
         muse_state_set_level(muse_audio_level(s_chunk, MUSE_AUDIO_CHUNK));
@@ -389,7 +413,30 @@ static bool record(bool barge_in, const char *dictation_target, size_t *held, ch
          * Capture runs 60-80 ms behind real time and people let go on their
          * last syllable, so keep going briefly after release.
          */
-        bool release = got_event(MUSE_PTT_UP);
+        bool release;
+#if CONFIG_MUSE_WAKEWORD
+        release = got_event(hands_free ? MUSE_PTT_DOWN : MUSE_PTT_UP);
+        if (hands_free) {
+            if (release || !muse_settings_wakeword_on()) {
+                ok = false;
+                strlcpy(why, "HANDS-FREE COMMAND CANCELLED - NOT SENT", cap);
+                break;
+            }
+            muse_endpoint_result_t end = muse_voice_endpoint_feed(
+                &endpoint, muse_wakeword_speech(s_chunk));
+            if (end == MUSE_ENDPOINT_EMPTY) {
+                ok = false;
+                strlcpy(why, "NO COMMAND HEARD - NOT SENT", cap);
+                break;
+            }
+            if (end == MUSE_ENDPOINT_SEND) {
+                released = true;
+                break;
+            }
+        }
+#else
+        release = got_event(MUSE_PTT_UP);
+#endif
 #if CONFIG_MUSE_OPENCLAW
         if (dictating) {
             int decision = atomic_load(&s_dictation);
@@ -410,7 +457,7 @@ static bool record(bool barge_in, const char *dictation_target, size_t *held, ch
         ok = false;
         strlcpy(why, "RECORDING LIMIT - ANSWER NOT SENT", cap);
     }
-    if (dictating && !ok) muse_hatch_turn_cancel();
+    if ((dictating || hands_free) && !ok) muse_hatch_turn_cancel();
     muse_state_set_level(0);
     *held = n - pre;
 
@@ -528,6 +575,11 @@ static void go_idle(const char *caption)
 {
     muse_state_set_progress(0);
     muse_state_set_mode(MUSE_MODE_IDLE);
+#if CONFIG_MUSE_WAKEWORD
+    if (!caption[0] && muse_settings_wakeword_on() && muse_wakeword_ready()) {
+        caption = "SAY HI ESP OR HOLD TALK";
+    }
+#endif
     muse_state_set_caption("%s", caption);
 }
 
@@ -901,14 +953,33 @@ static void voice_task(void *arg)
 {
     bool pending_down = false;
     muse_audio_selftest();
+#if CONFIG_MUSE_WAKEWORD
+    if (!muse_wakeword_ready()) {
+        muse_state_set_caption("WAKE WORD UNAVAILABLE - USE TALK");
+    } else if (muse_settings_wakeword_on()) {
+        go_idle("");
+    }
+#endif
     for (;;) {
         bool wake = false;
+#if CONFIG_MUSE_WAKEWORD
+        s_hands_free_recording = false;
+        bool listening = muse_settings_wakeword_on() && muse_wakeword_ready() &&
+            !s_monitor && muse_state_mode(NULL) == MUSE_MODE_IDLE;
+        if (listening != s_wake_listening) {
+            s_wake_listening = listening;
+            muse_wakeword_reset();
+        }
+#endif
         char dictation_target[33] = "";
         if (!pending_down) {
             muse_input_event_t ev;
             bool asleep = muse_state_asleep();
             bool battery = muse_state_on_battery();
             bool rest = asleep && battery && !s_chirp && !s_mp3test && !s_loopback;
+#if CONFIG_MUSE_WAKEWORD
+            if (s_wake_listening) rest = false;
+#endif
 #if HOLD_NOTES
             /* A press goes first: send_held() leaves it queued and returns
              * without backing off, so retrying before it's read would spin. */
@@ -960,7 +1031,7 @@ static void voice_task(void *arg)
                 pre_reset();
             }
             /* The 20 ms read paces this loop. */
-            idle_capture();
+            bool detected = idle_capture();
 #if CONFIG_MUSE_OPENCLAW
             int dictation = atomic_load(&s_dictation);
             if (dictation == DICTATION_CANCEL) {
@@ -972,14 +1043,22 @@ static void voice_task(void *arg)
             } else
 #endif
             {
-                if (xQueueReceive(s_queue, &ev, 0) != pdTRUE) {
+                if (xQueueReceive(s_queue, &ev, 0) == pdTRUE) {
+                    muse_state_poke();
+                    if (ev.type != MUSE_PTT_DOWN) continue;
+                    wake = ev.wake;
+#if CONFIG_MUSE_WAKEWORD
+                } else if (detected) {
+                    s_hands_free_recording = true;
+                    s_pre_fill = 0;   /* Do not send the wake word's pre-roll. */
+                    muse_wakeword_reset();
+                    muse_state_set_asleep(false);
+                    ESP_LOGI(TAG, "Hi ESP detected; capturing one command");
+#endif
+                } else {
+                    (void)detected;
                     continue;
                 }
-                muse_state_poke();
-                if (ev.type != MUSE_PTT_DOWN) {
-                    continue;
-                }
-                wake = ev.wake;
             }
         }
         if (wake && !held_on_waking()) {
@@ -993,6 +1072,11 @@ static void voice_task(void *arg)
             pending_down = false;
             continue;
         }
+#if CONFIG_MUSE_WAKEWORD
+        bool hands_free = s_hands_free_recording;
+#else
+        bool hands_free = false;
+#endif
         size_t held;
         char why[96];
         bool ok = record(pending_down, dictation_target, &held, why, sizeof(why));
@@ -1000,7 +1084,7 @@ static void voice_task(void *arg)
         if (dictation_target[0]) atomic_store(&s_dictation, DICTATION_OFF);
 #endif
         pending_down = false;
-        if (!ok && dictation_target[0]) {
+        if (!ok && (dictation_target[0] || hands_free)) {
             drop_rec();
             pre_reset();
             go_idle(why);
@@ -1036,8 +1120,19 @@ esp_err_t muse_voice_start(QueueHandle_t queue)
         muse_state_set_caption("AUDIO INIT FAILED");
         return ESP_FAIL;
     }
+#if CONFIG_MUSE_WAKEWORD
+    /* Flash model loading disables the cache: use the boot task's internal stack. */
+    if (muse_wakeword_init() != ESP_OK) {
+        ESP_LOGE(TAG, "wake word unavailable; manual voice remains available");
+    }
+#endif
     /* Stack in PSRAM if there is any (this task never writes flash) to spare internal RAM for Wi-Fi/BLE. */
-    if (xTaskCreatePinnedToCoreWithCaps(voice_task, "muse_voice", 6144, NULL, 6, NULL, MUSE_AUDIO_CORE,
+#if CONFIG_MUSE_WAKEWORD
+    const unsigned stack = 12288;
+#else
+    const unsigned stack = 6144;
+#endif
+    if (xTaskCreatePinnedToCoreWithCaps(voice_task, "muse_voice", stack, NULL, 6, NULL, MUSE_AUDIO_CORE,
                                         MUSE_BIG_CAPS) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }

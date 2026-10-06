@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# Optional local wake word for the OpenAI/OpenClaw Waveshare S3 firmware.
+# Load after the board and voice-provider defaults.
+CONFIG_MUSE_WAKEWORD=y
+CONFIG_MUSE_WAKEWORD_DEFAULT_ENABLED=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions_muse_wakeword.csv"
+CONFIG_SR_WN_WN9_HIESP=y
+CONFIG_SR_MN_EN_NONE=y
+CONFIG_SR_MN_CN_NONE=y
+CONFIG_SR_VADN_WEBRTC=y
+CONFIG_MODEL_IN_FLASH=y

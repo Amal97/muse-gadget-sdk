@@ -39,6 +39,9 @@
 #include "muse_ui.h"
 #include "muse_voice.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_WAKEWORD
+#include "muse_wakeword.h"
+#endif
 #if CONFIG_MUSE_OPENAI
 #include "muse_openai.h"
 #endif
@@ -153,6 +156,9 @@ static lv_obj_t *s_ble_sw, *s_ble_status;
 
 /* Sound page. */
 static lv_obj_t *s_spk_sw, *s_vol_val, *s_vol_sl, *s_gain_val, *s_gain_sl, *s_bright_val, *s_bright_sl, *s_mic_bar, *s_mic_val;
+#if CONFIG_MUSE_WAKEWORD
+static lv_obj_t *s_wake_sw, *s_wake_status;
+#endif
 
 /* Sleep page. */
 static const int SLEEP_CHOICES[] = { 0, 30, 60, 120, 300, 600 };
@@ -1170,6 +1176,14 @@ static void on_speaker_sw(lv_event_t *e)
     muse_settings_set_speaker_on(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED));
 }
 
+#if CONFIG_MUSE_WAKEWORD
+static void on_wakeword_sw(lv_event_t *e)
+{
+    if (muse_settings_set_wakeword_on(lv_obj_has_state(lv_event_get_target(e), LV_STATE_CHECKED)) != ESP_OK) {
+        muse_state_set_caption("WAKE WORD UNAVAILABLE OR SETTING NOT SAVED");
+    }
+}
+#endif
 static void on_volume(lv_event_t *e)
 {
     int v = lv_slider_get_value(s_vol_sl);
@@ -1209,6 +1223,12 @@ static void build_sound_page(lv_obj_t *tile)
     lv_obj_t *list;
     s_sound = page(tile, "SOUND", true, &list);
     s_spk_sw = switch_row(list, "Speaker", muse_settings_speaker_on(), on_speaker_sw);
+#if CONFIG_MUSE_WAKEWORD
+    s_wake_sw = switch_row(list, "Hi ESP hands-free", muse_settings_wakeword_on(), on_wakeword_sw);
+    s_wake_status = label(list, &lv_font_montserrat_16, COLOR_DIM, "");
+    note(list, "Mic stays active on battery and with the screen off. Say Hi ESP, then your command; "
+               "a pause sends it. Talk cancels hands-free capture. Voice is not identity.");
+#endif
     s_vol_sl = slider(list, "Volume", 0, 100, muse_settings_volume(), &s_vol_val, on_volume);
     s_gain_sl = slider(list, "Mic gain", 0, MUSE_MIC_GAIN_MAX / 3, muse_settings_mic_gain() / 3, &s_gain_val, on_gain);
 
@@ -1237,6 +1257,12 @@ static void build_sound_page(lv_obj_t *tile)
 
 static void tick_sound(void)
 {
+#if CONFIG_MUSE_WAKEWORD
+    lv_obj_set_state(s_wake_sw, LV_STATE_CHECKED, muse_settings_wakeword_on());
+    set_text(s_wake_status, muse_wakeword_ready() ?
+             (muse_settings_wakeword_on() ? "Hands-free on (paused on Sound page)" : "Hands-free off") :
+             "Wake model unavailable - use Talk");
+#endif
     bool on = muse_settings_speaker_on();   /* also toggled from the face */
     if (on != lv_obj_has_state(s_spk_sw, LV_STATE_CHECKED)) {
         lv_obj_set_state(s_spk_sw, LV_STATE_CHECKED, on);

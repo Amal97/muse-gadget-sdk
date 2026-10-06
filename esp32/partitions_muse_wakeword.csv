@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# Existing Muse partitions keep their offsets and sizes. Only the local model
+# partition is added, beyond the product-data partitions, on 16 MB+ boards.
+# Name,    Type, SubType, Offset,   Size,    Flags
+nvs,       data, nvs,     0x11000,  0xC000,
+otadata,   data, ota,     0x1D000,  0x2000,
+phy_init,  data, phy,     0x1F000,  0x1000,
+ota_0,     app,  ota_0,   0x20000,  4M,
+ota_1,     app,  ota_1,   0x420000, 4M,
+prod_data, data, 0x40,    0x820000, 0x1000,
+prod_bak,  data, 0x41,    0x821000, 0x1000,
+model,     data, spiffs,  0x900000, 2M,

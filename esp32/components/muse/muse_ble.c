@@ -32,6 +32,9 @@
 #include "muse_state.h"
 #include "muse_voice.h"
 #include "muse_wifi.h"
+#if CONFIG_MUSE_WAKEWORD
+#include "muse_wakeword.h"
+#endif
 #if CONFIG_MUSE_OPENAI
 #include "muse_openai.h"
 #endif
@@ -100,6 +103,11 @@ static int build_status(char *out, size_t len)
     json_str(detail_e, sizeof(detail_e), h.detail);
     bool openclaw = false;
     const char *openclaw_supported = "false";
+    const char *wake_supported = "false", *wake_ready = "false";
+#if CONFIG_MUSE_WAKEWORD
+    wake_supported = "true";
+    wake_ready = muse_wakeword_ready() ? "true" : "false";
+#endif
 #if CONFIG_MUSE_OPENCLAW
     openclaw = muse_settings_openclaw_enabled();
     openclaw_supported = "true";
@@ -107,11 +115,13 @@ static int build_status(char *out, size_t len)
     return snprintf(out, len,
                     "{\"name\":\"%s\",\"fw\":\"%s\",\"provider\":\"openai\","
                     "\"chat_provider\":\"%s\",\"openclaw\":{\"supported\":%s,\"token_set\":%s},"
+                    "\"wakeword\":{\"supported\":%s,\"enabled\":%s,\"ready\":%s,\"phrase\":\"Hi ESP\"},"
                     "\"wifi\":{\"on\":%s,\"state\":\"%s\",\"ssid\":\"%s\",\"ip\":\"%s\",\"rssi\":%d},"
                     "\"openai\":{\"key_set\":%s,\"state\":\"%s\",\"detail\":\"%s\"},\"last\":\"%s\"}",
                     s_name, esp_app_get_description()->version,
                     openclaw ? "openclaw" : "openai", openclaw_supported,
                     muse_settings_openclaw_token_set() ? "true" : "false",
+                    wake_supported, muse_settings_wakeword_on() ? "true" : "false", wake_ready,
                     muse_settings_wifi_on() ? "true" : "false", wifi_state_name(w.state), ssid_e, w.ip, w.rssi,
                     muse_settings_openai_key_len() ? "true" : "false", muse_hatch_state_name(h.state), detail_e, last_e);
 #else
@@ -205,6 +215,9 @@ static void run_command(char *cmd)
         muse_settings_set_volume(n);
     } else if (!strcmp(cmd, "speaker") && parse_int(v, 0, 1, &n)) {
         muse_settings_set_speaker_on(n);
+    } else if (!strcmp(cmd, "wakeword") && parse_int(v, 0, 1, &n)) {
+        if (muse_settings_set_wakeword_on(n) != ESP_OK)
+            res = "error: wake word unavailable or setting not saved";
     } else if (!strcmp(cmd, "mic_gain") && parse_int(v, 0, MUSE_MIC_GAIN_MAX, &n)) {
         muse_settings_set_mic_gain(n);
     } else if (!strcmp(cmd, "brightness") && parse_int(v, 10, 100, &n)) {

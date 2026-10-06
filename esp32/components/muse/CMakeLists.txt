@@ -35,6 +35,7 @@ if(CONFIG_MUSE_ENABLED)
         "muse_input.c"
         "muse_menu.c"
         "muse_voice.c"
+        "muse_wakeword.c"
         "muse_adpcm.c"
         "muse_settings.c"
         "muse_settings_ui.c"
@@ -43,6 +44,9 @@ if(CONFIG_MUSE_ENABLED)
         "muse_lv_mem.c"
         "muse_link.c"
         "muse_ble.c")
+    if(CONFIG_MUSE_WAKEWORD)
+        list(APPEND srcs "muse_voice_endpoint.c")
+    endif()
     if(CONFIG_MUSE_OPENAI)
         list(APPEND srcs "muse_openai.c" "muse_openai_codec.c")
         list(APPEND embed_text "openai_root.pem")
@@ -103,6 +107,9 @@ set(muse_priv_requires
     esp_lcd esp_adc esp_driver_i2s esp_driver_ledc esp_driver_spi esp_driver_uart esp_wifi
     esp_driver_pcnt)
 list(APPEND muse_priv_requires camera)
+if(CONFIG_MUSE_WAKEWORD)
+    list(APPEND muse_priv_requires espressif__esp-sr)
+endif()
 
 idf_component_register(
     SRCS ${srcs}

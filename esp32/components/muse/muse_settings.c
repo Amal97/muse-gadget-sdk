@@ -27,6 +27,7 @@
 
 #include "muse_link.h"
 #include "muse_state.h"
+#include "muse_wakeword.h"
 
 static const char *TAG = "muse_settings";
 
@@ -37,6 +38,7 @@ static struct {
     uint8_t volume;
     bool speaker_on;
     bool copilot_watch;
+    bool wakeword;
     uint8_t mic_gain;
     uint8_t brightness;
     uint16_t sleep_s;
@@ -56,6 +58,9 @@ static struct {
     .volume = 70,
     .speaker_on = true,
     .copilot_watch = true,
+#if CONFIG_MUSE_WAKEWORD_DEFAULT_ENABLED
+    .wakeword = true,
+#endif
     .mic_gain = 30,
     .brightness = 100,
     .sleep_s = 120,
@@ -131,6 +136,9 @@ esp_err_t muse_settings_init(void)
     if (nvs_get_u8(s_nvs, "copilot_watch", &b) == ESP_OK) {
         s.copilot_watch = b;
     }
+    if (nvs_get_u8(s_nvs, "wakeword", &b) == ESP_OK) {
+        s.wakeword = b != 0;
+    }
     load_u8("mic_gain", &s.mic_gain);
     load_u8("bright", &s.brightness);
     nvs_get_u16(s_nvs, "sleep_s", &s.sleep_s);
@@ -173,6 +181,16 @@ void muse_settings_set_listener(muse_setting_cb_t cb)
 int muse_settings_volume(void) { return s.volume; }
 bool muse_settings_speaker_on(void) { return s.speaker_on; }
 bool muse_settings_copilot_watch(void) { return s.copilot_watch; }
+bool muse_settings_wakeword_on(void)
+{
+#if CONFIG_MUSE_WAKEWORD
+    bool on;
+    LOCKED(on = s.wakeword);
+    return on;
+#else
+    return false;
+#endif
+}
 int muse_settings_mic_gain(void) { return s.mic_gain; }
 int muse_settings_brightness(void) { return s.brightness; }
 int muse_settings_sleep_s(void) { return s.sleep_s; }
@@ -385,6 +403,25 @@ void muse_settings_set_copilot_watch(bool on)
     s.copilot_watch = on;
     save_u8("copilot_watch", on);
     muse_state_nudge();
+}
+
+esp_err_t muse_settings_set_wakeword_on(bool on)
+{
+#if CONFIG_MUSE_WAKEWORD
+    if (on && !muse_wakeword_ready()) return ESP_ERR_INVALID_STATE;
+    esp_err_t err;
+    LOCKED({
+        err = nvs_set_u8(s_nvs, "wakeword", on);
+        if (err == ESP_OK) err = nvs_commit(s_nvs);
+        if (err == ESP_OK) s.wakeword = on;
+    });
+    if (err != ESP_OK) ESP_LOGE(TAG, "Wake-word setting save failed: %s", esp_err_to_name(err));
+    muse_state_nudge();
+    return err;
+#else
+    (void)on;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
 }
 
 void muse_settings_set_mic_gain(int db)

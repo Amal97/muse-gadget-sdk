@@ -652,9 +652,14 @@ permission for the actual tool host. Failures remain explicit and unconfirmed.
 
 These are scoped app/sound/radio controls, not arbitrary UI automation, app
 quitting, shutdown, password entry, or an always-listening Mac voice assistant.
-They use the existing push-to-talk OpenClaw path and still require an awake Mac
-and working model/speech services. Voice is not identity verification, and the
-agent's separate full exec access is not restricted by these tool-level safeguards.
+They use the existing OpenClaw voice-job path and still require an awake Mac
+and working model/speech services. The Waveshare ESP32-S3 firmware optionally
+supports local **Hi ESP** wake-word detection and automatic command capture;
+see [hands-free setup](esp32/README.md#optional-hands-free-wake-word). It keeps
+idle audio local but, when enabled, runs on battery and with the screen off,
+reducing battery life. Push-to-talk remains available. Voice is not identity
+verification, and the agent's separate full exec access is not restricted by
+these tool-level safeguards.
 
 ### Incoming iMessages and confirmed replies
 
@@ -1008,8 +1013,8 @@ is asleep; normal battery sleep may defer delivery until wake.
 
 Other boundaries:
 
-- Push-to-talk, not always-listening/wake-word operation.
-- No on-device LLM, local speech engine, or continuous realtime voice.
+- Push-to-talk by default; optional local Hi ESP wake word on the Waveshare S3 voice firmware.
+- No on-device LLM, general-purpose local transcription/TTS, or continuous realtime voice.
 - No remote attachment to ordinary VS Code Copilot chats.
 - No standalone/hybrid OTA update workflow; use USB to update these builds.
 - No internet-wide remote-access tunnel for the Mac bridge.

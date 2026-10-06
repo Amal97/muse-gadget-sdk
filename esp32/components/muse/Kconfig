@@ -125,6 +125,26 @@ menu "Muse"
         depends on MUSE_OPENAI
         default "gpt-4o-mini"
 
+    config MUSE_WAKEWORD
+        bool "Local Hi ESP wake word and hands-free command capture"
+        depends on MUSE_OPENAI && IDF_TARGET_ESP32S3
+        default n
+        help
+            Detect Hi ESP locally using ESP-SR WakeNet9, then capture a command
+            until speech ends. Requires the wake-word partition table and model
+            image. When enabled in Sound settings, the microphone and detector
+            remain active on USB and battery, including while the screen is off.
+            Idle audio stays local; command audio uses the configured voice API.
+            Does not authenticate the speaker. Push-to-talk remains available.
+
+    config MUSE_WAKEWORD_DEFAULT_ENABLED
+        bool "Enable hands-free listening by default on first boot"
+        depends on MUSE_WAKEWORD
+        default n
+        help
+            A saved Sound setting takes precedence. Leave off unless the user
+            explicitly opts into continuous local microphone processing.
+
     config MUSE_OPENCLAW
         bool "Optional OpenClaw chat backend (OpenAI voice)"
         depends on MUSE_OPENAI
