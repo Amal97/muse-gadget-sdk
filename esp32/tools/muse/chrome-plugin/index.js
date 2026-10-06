@@ -2,6 +2,7 @@ import childProcess from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { createMacController, createMacTool, MAC_GUIDANCE } from "./mac-control.js";
+import { createActivityWriter, trackToolActivity } from "./job-activity.js";
 
 const TOOL = "normal_chrome";
 const COMMANDS = [
@@ -144,15 +145,21 @@ export function createTool(run = invokeHelper) {
 
 export default function register(api) {
   const macController = createMacController();
+  const recordActivity = createActivityWriter({
+    directory: api.pluginConfig?.activityDirectory,
+    logger: api.logger,
+  });
+  const activityEnabled = context => enabledForAgent(api.config, context.agentId) ||
+    enabledForAgent(api.config, context.agentId, "mac_control");
   api.registerTool(
     context => enabledForAgent(context.config ?? api.config, context.agentId) &&
-      !context.sandboxed ? createTool() : null,
+      !context.sandboxed ? trackToolActivity(createTool(), context, recordActivity) : null,
     { names: [TOOL], optional: true },
   );
   api.registerTool(
     context => enabledForAgent(context.config ?? api.config, context.agentId, "mac_control") &&
       !context.sandboxed && process.platform === "darwin"
-      ? createMacTool(macController, context.sessionKey) : null,
+      ? trackToolActivity(createMacTool(macController, context.sessionKey), context, recordActivity) : null,
     { names: ["mac_control"], optional: true },
   );
   api.on("before_agent_start", (_event, context) => {
@@ -162,6 +169,7 @@ export default function register(api) {
     if (guidance.length) return { prependContext: guidance.join("\n") };
   });
   api.on("before_tool_call", (event, context) => {
+    if (activityEnabled(context)) recordActivity(event, context, "Requested");
     if (enabledForAgent(api.config, context.agentId) && event.toolName === "exec" &&
         typeof event.params.command === "string" &&
         event.params.command.includes("normal_chrome.py")) {
@@ -171,6 +179,16 @@ export default function register(api) {
         typeof event.params.command === "string" &&
         /(?:^|[;&|\n])\s*(?:sudo\s+)?["']?(?:\/[^\s;"'|&]+\/)?(?:blueutil|networksetup)["']?(?:\s|$)/.test(event.params.command)) {
       return { block: true, blockReason: MAC_GUIDANCE };
+    }
+  });
+  api.on("tool_result_persist", (event, context) => {
+    if (activityEnabled(context)) {
+      // These tools publish correlated command activity directly from their executors.
+      if (["normal_chrome", "mac_control"].includes(event.toolName ?? context.toolName) &&
+          !event.isSynthetic && event.message?.isError !== true) return;
+      recordActivity({ toolName: event.toolName ?? context.toolName }, context,
+        event.isSynthetic ? "Tool result unavailable" :
+          event.message?.isError === true ? "Tool error" : "Tool returned");
     }
   });
 }

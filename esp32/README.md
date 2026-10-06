@@ -411,6 +411,24 @@ your account's filesystem/admin permissions still apply; this does not
 grant root access or bypass macOS protections. Long actions are still
 subject to the device's existing request timeouts.
 
+While a device-owned job runs, the companion plugin records actual OpenClaw
+tool events locally and the bridge forwards the latest event to the Talk
+caption and dashboard. `Requested:` identifies a recorded tool call, not proof
+that it executed. `Tool returned:` means a result was recorded, not necessarily
+that the requested action succeeded; error results are labelled `Tool error:`.
+Tool payloads, shell commands, page contents, and private reasoning are not
+included in tool-activity captions. If an activity record cannot be read, the device
+explicitly reports that activity is unavailable while still waiting for the
+final result. Updates are polled, so quick intermediate steps may not appear;
+there are no invented stages or elapsed-time progress estimates. Older bridges
+that provide no activity detail display `No activity reported by Mac`.
+Both the updated plugin/bridge and a firmware reflash are required for these
+captions. Jobs without a tool event continue to show the request-acknowledged
+status rather than an invented action. Activity files are private, scoped to
+`agent:esp32:muse-job:<job-id>`, and removed when the job worker finishes.
+If the bridge uses a custom `--state`, set the plugin's `activityDirectory`
+to that state's absolute `job-activity` directory.
+
 To revoke computer control, restore the ESP32 agent's `tools.deny: ["*"]`,
 remove `--allow-computer-control` from the bridge service, and restart it.
 Restore that agent's previous exec-approval policy as well. Use the

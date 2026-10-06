@@ -108,6 +108,9 @@ class OpenAIBackendTest(unittest.TestCase):
     def test_failed_snooze_preserves_card_until_success(self) -> None:
         self.run_case(15)
 
+    def test_actual_bridge_activity_and_errors_replace_timer_and_missing_detail_is_explicit(self) -> None:
+        self.run_case(16)
+
 
 class FakeBoard:
     def __init__(self, device: dict) -> None:

@@ -21,6 +21,7 @@ from openclaw_messages import preview
 ACTIVE = ("starting", "running", "stopping")
 TERMINAL = ("completed", "cancelled", "failed", "interrupted")
 NATIVE_TIMEOUT_MS = 24 * 60 * 60 * 1000
+ACTIVITY_BYTES = 256
 
 
 class NativeRPCError(RuntimeError):
@@ -112,6 +113,10 @@ class JobManager:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             raise ValueError("Unknown device job. It will not be automatically replayed.")
+        if row["status"] == "running":
+            self.refresh_activity(job_id)
+            with self.connect() as db:
+                row = db.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
         return {"id": row["id"], "status": row["status"], "detail": row["detail"],
                 "elapsed_seconds": max(0, int(row["updated"] - row["started"]))
                 if row["status"] in TERMINAL else max(0, int(time.time() - row["started"])),
@@ -355,6 +360,35 @@ class JobManager:
                        "complete": unpriced_steps == 0 and len(messages) < 100,
                        "unpriced_steps": unpriced_steps} if estimates else None
 
+    def activity(self, job_id: str) -> str | None:
+        path = self.path.parent / "job-activity" / (identifier(job_id) + ".json")
+        try:
+            with path.open("rb") as source:
+                data = source.read(4097)
+        except FileNotFoundError:
+            return None
+        if len(data) > 4096:
+            raise ValueError("OpenClaw activity record is oversized.")
+        record = json.loads(data)
+        if (not isinstance(record, dict) or record.get("id") != job_id
+                or not isinstance(record.get("detail"), str) or not record["detail"].strip()
+                or len(record["detail"].encode()) > ACTIVITY_BYTES):
+            raise ValueError("Invalid OpenClaw activity record.")
+        return preview(record["detail"], ACTIVITY_BYTES)
+
+    def refresh_activity(self, job_id: str) -> None:
+        try:
+            detail = self.activity(job_id)
+        except (OSError, ValueError) as error:
+            logging.warning("Device job activity unavailable (%s); still awaiting native completion.",
+                            type(error).__name__)
+            detail = "Live activity unavailable; awaiting OpenClaw result."
+        if detail is not None:
+            with self.connect() as db:
+                # Cancellation may arrive while the activity record is being read.
+                db.execute("UPDATE jobs SET detail=?, updated=? WHERE id=? AND status='running' "
+                           "AND detail!=?", (detail, time.time(), job_id, detail))
+
     def run(self, job_id: str, messages: list[dict[str, str]]) -> None:
         phase = "registering lifecycle"
         try:
@@ -418,7 +452,7 @@ class JobManager:
                 raise ValueError("OpenClaw did not acknowledge the requested run.")
             with self.lock:
                 if self.status(job_id)["status"] != "stopping":
-                    self.update(job_id, "running", "OpenClaw working")
+                    self.update(job_id, "running", "OpenClaw accepted request; awaiting activity.")
             while True:
                 phase = "waiting for completion"
                 stopping = self.stop.is_set() or self.status(job_id)["status"] == "stopping"
@@ -455,6 +489,10 @@ class JobManager:
                         ("Native run stopped." if aborted else
                          "Native stop unconfirmed. Do not repeat uncertain actions."))
         finally:
+            try:
+                (self.path.parent / "job-activity" / (job_id + ".json")).unlink(missing_ok=True)
+            except OSError:
+                logging.warning("Completed device job activity record could not be removed.")
             self.chat_lock.release()
 
     def close(self) -> None:

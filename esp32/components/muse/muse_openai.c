@@ -765,10 +765,10 @@ static char *mac_complete(const job_t *job, cJSON *messages, char *why, size_t c
                 free(response);
                 break;
             }
-            cJSON *elapsed = cJSON_GetObjectItemCaseSensitive(root, "elapsed_seconds");
-            char detail[48];
-            snprintf(detail, sizeof(detail), "%s %.0fs", stopping ? "Stopping Mac job" : "Mac working",
-                     cJSON_IsNumber(elapsed) ? elapsed->valuedouble : 0);
+            cJSON *activity = cJSON_GetObjectItemCaseSensitive(root, "detail");
+            const char *detail = stopping ? "Stop requested; awaiting Mac" :
+                cJSON_IsString(activity) && activity->valuestring[0] ? activity->valuestring :
+                "No activity reported by Mac";
             report(MUSE_HATCH_TESTING, detail);
             if (!stopping && current(job->generation) && job->kind == JOB_VOICE) {
                 muse_state_set_caption("%s", detail);

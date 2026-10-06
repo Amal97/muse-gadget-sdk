@@ -5,6 +5,11 @@
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
-    "properties": {}
+    "properties": {
+      "activityDirectory": {
+        "type": "string",
+        "description": "Absolute local job-activity directory; defaults to ~/.openclaw/muse-esp32/job-activity. Match the bridge state directory when using --state."
+      }
+    }
   }
 }

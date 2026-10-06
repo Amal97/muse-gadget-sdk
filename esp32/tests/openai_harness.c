@@ -110,7 +110,16 @@ static bool asleep;
 bool muse_state_asleep(void) { return asleep; }
 bool muse_state_on_battery(void) { return true; }
 void muse_state_set_asleep(bool value) { asleep = value; }
-void muse_state_set_caption(const char *format, ...) { (void)format; }
+static char last_caption[1024], activity_caption[1024];
+void muse_state_set_caption(const char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    vsnprintf(last_caption, sizeof(last_caption), format, ap);
+    va_end(ap);
+    if (strstr(last_caption, "Requested:") || strstr(last_caption, "No activity reported"))
+        strlcpy(activity_caption, last_caption, sizeof(activity_caption));
+}
 void muse_companion_start(void) {}
 static muse_timer_state_t timer_phase;
 static unsigned timer_seconds, timer_pending;
@@ -271,7 +280,8 @@ static void worker(void *arg)
 static const char transcript[] = "{\"text\":\"Hello there\"}";
 static const char answer[] = "{\"choices\":[{\"message\":{\"content\":\"Hello friend.\"},\"finish_reason\":\"stop\"}]}";
 static const char job_running[] =
-    "{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"status\":\"running\",\"elapsed_seconds\":123}";
+    "{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"status\":\"running\",\"elapsed_seconds\":123,"
+    "\"detail\":\"Requested: normal_chrome / take_snapshot of the requested page\"}";
 static const char job_completed[] =
     "{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"status\":\"completed\",\"reply\":\"Hello friend.\"}";
 static const uint8_t speech[] = { 0, 0, 100, 0, 200, 0, 44, 1, 144, 1, 244, 1 };
@@ -517,6 +527,8 @@ static void hybrid_pipeline(void)
     record_note();
     worker(NULL);
     assert(client_count == 4 && closed_count == 4);
+    assert(!strcmp(activity_caption, "Requested: normal_chrome / take_snapshot of the requested page"));
+    assert(!strstr(activity_caption, "123s") && !strstr(activity_caption, "Mac working"));
     assert(clients[0].config.cert_pem == openai_test_root);
     assert(clients[1].config.cert_pem == openclaw_test_root);
     assert(clients[2].config.cert_pem == openclaw_test_root);
@@ -696,6 +708,31 @@ static void snooze_ack_only_after_success(void)
     assert(!s_notification.id[0] && !strcmp(s_notification_ack, id));
 }
 
+static void actual_job_activity(void)
+{
+    use_openclaw = true;
+    job_t job = { .kind = JOB_VOICE, .generation = atomic_load(&s_generation) };
+    const char *running[] = {
+        "{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"status\":\"running\",\"elapsed_seconds\":999}",
+        "{\"id\":\"000102030405060708090a0b0c0d0e0f\",\"status\":\"running\","
+        "\"detail\":\"Tool error: normal_chrome / fill\"}",
+    };
+    const char *expected[] = { "No activity reported by Mac", "Tool error: normal_chrome / fill" };
+    for (size_t i = 0; i < sizeof(running) / sizeof(running[0]); i++) {
+        reset_transport();
+        fixture(running[i], strlen(running[i]), 200, "application/json");
+        fixture(job_completed, strlen(job_completed), 200, "application/json");
+        char why[128] = "";
+        cJSON *messages = cJSON_CreateArray();
+        char *reply = mac_complete(&job, messages, why, sizeof(why));
+        assert(reply && !strcmp(reply, "Hello friend."));
+        assert(!strcmp(last_caption, expected[i]));
+        assert(!strstr(last_caption, "999s") && !strstr(last_caption, "Mac working"));
+        cJSON_Delete(messages);
+        free(reply);
+    }
+}
+
 int main(int argc, char **argv)
 {
     assert(argc == 2);
@@ -717,6 +754,7 @@ int main(int argc, char **argv)
     case 13: dictated_reply(false); break;
     case 14: scoped_stop_after_settings_change(); break;
     case 15: snooze_ack_only_after_success(); break;
+    case 16: actual_job_activity(); break;
     default: return 2;
     }
     muse_hatch_turn_cancel();

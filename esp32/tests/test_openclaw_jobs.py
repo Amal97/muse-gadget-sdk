@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 from pathlib import Path
+import json
 import sqlite3
 import sys
 import tempfile
@@ -244,6 +245,71 @@ class JobsTest(unittest.TestCase):
         self.assertFalse(full["complete"])
         _, complete = JobManager.result({"messages": [priced]})
         self.assertTrue(complete["complete"])
+
+    def activity_record(self, record):
+        path = Path(self.tmp.name) / "job-activity" / (JOB + ".json")
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps(record))
+        return path
+
+    def test_activity_records_are_scoped_validated_and_bounded(self):
+        self.assertIsNone(self.manager.activity(JOB))
+        self.activity_record({"id": JOB, "detail": "Requested: normal_chrome / fill"})
+        self.assertEqual(self.manager.activity(JOB), "Requested: normal_chrome / fill")
+        self.assertIsNone(self.manager.activity("b" * 32))
+        for record in (None, {}, {"id": "b" * 32, "detail": "PRIVATE_OTHER_JOB"},
+                       {"id": JOB, "detail": ""}, {"id": JOB, "detail": None},
+                       {"id": JOB, "detail": "\u00e9" * 129},
+                       {"id": JOB, "detail": "x" * 4097}):
+            self.activity_record(record)
+            with self.assertRaises(ValueError):
+                self.manager.activity(JOB)
+        self.activity_record({"id": JOB, "detail": "\u00e9" * 128})
+        self.assertEqual(len(self.manager.activity(JOB).encode()), 256)
+
+    def test_live_activity_reaches_job_status_and_final_reply_stays_separate(self):
+        path = self.activity_record({"id": JOB, "detail": "Requested: mac_control / audio_status"})
+        self.manager.start(JOB, MESSAGES)
+        deadline = time.monotonic() + 2
+        while self.manager.status(JOB)["detail"] != "Requested: mac_control / audio_status":
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        status = self.manager.status(JOB)
+        self.assertEqual(status["status"], "running")
+        self.assertEqual(status["reply"], "")
+        self.native.complete.set()
+        self.assertEqual(self.finished()["reply"], "Done.")
+        self.assertEqual([p["sessionKey"] for m, p in self.native.calls if m == "chat.history"],
+                         [self.manager.session(JOB)])
+        self.assertFalse(path.exists())
+
+    def test_activity_cannot_overwrite_a_stop_requested_during_record_read(self):
+        self.native.complete.set()
+        self.manager.start(JOB, MESSAGES)
+        self.finished()
+        self.manager.update(JOB, "running", "Existing activity")
+        def activity(job_id):
+            self.assertEqual(job_id, JOB)
+            self.manager.cancel(JOB)
+            return "Stale activity"
+        with patch.object(self.manager, "activity", side_effect=activity):
+            self.manager.refresh_activity(JOB)
+        self.assertEqual(self.manager.status(JOB)["status"], "stopping")
+        self.assertEqual(self.manager.status(JOB)["detail"], "Requesting native stop")
+        self.manager.update(JOB, "cancelled", "Stopped")
+
+    def test_unavailable_activity_is_explicit_without_replaying_or_failing_the_action(self):
+        self.native.complete.set()
+        self.manager.start(JOB, MESSAGES)
+        self.finished()
+        self.manager.update(JOB, "running", "Existing activity")
+        with patch.object(self.manager, "activity", side_effect=ValueError("Invalid activity")):
+            with self.assertLogs(level="WARNING"):
+                self.manager.refresh_activity(JOB)
+        self.assertEqual(self.manager.status(JOB)["status"], "running")
+        self.assertIn("Live activity unavailable", self.manager.status(JOB)["detail"])
+        self.assertEqual(sum(m == "chat.send" for m, _ in self.native.calls), 1)
+        self.manager.update(JOB, "completed", "Completed", "Done.")
 
     def test_rpc_keeps_credentials_out_of_arguments_and_checks_config(self):
         verified = []
